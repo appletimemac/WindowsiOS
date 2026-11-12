@@ -93,11 +93,14 @@ static void prealloc_ledger_exempt_ram(void) {
     size_t len = sizeof phys_mem;
     sysctlbyname("hw.memsize", &phys_mem, &len, NULL, 0);
     uint64_t phys_mb = phys_mem >> 20;
-    /* Size Guest RAM to fit comfortably within iOS 36-bit user VA ceiling alongside TXM JIT RX/RW + JIT tables */
-    static const uint64_t candidates_mb[] = {4608, 4096, 3584, 3072, 2560, 2048};
+    /* The largest size that leaves iOS at least 4 GiB of physical RAM, since Windows eventually
+     * touches all of its memory. Sizes above 4608 MiB are meant for the extended-virtual-addressing
+     * and increased-memory-limit entitlements; if an allocation fails the next size is tried. */
+    static const uint64_t ios_reserve_mb = 4096;
+    static const uint64_t candidates_mb[] = {8192, 7168, 6144, 5120, 4608, 4096, 3584, 3072, 2560, 2048};
     for (size_t i = 0; i < sizeof(candidates_mb) / sizeof(candidates_mb[0]); i++) {
         uint64_t mb = candidates_mb[i];
-        if (phys_mb > 0 && mb + 2560 > phys_mb) continue;
+        if (phys_mb > 0 && mb + ios_reserve_mb > phys_mb) continue;
         uint8_t *p = hv_alloc_no_footprint(mb << 20);
         if (p) {
             g_guest_ram = p;

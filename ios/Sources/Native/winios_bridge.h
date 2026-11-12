@@ -22,6 +22,8 @@ typedef void (^WinIOSStateCallback)(void);
 @property (nonatomic, readonly) uint32_t framebufferHeight;
 @property (nonatomic, readonly) uint64_t presentedFrames;
 @property (nonatomic, readonly) uint64_t availableMemoryMB;
+/// Guest RAM the VM runs with, or the ledger-exempt pre-allocation before it starts (0 if none).
+@property (nonatomic, readonly) uint64_t guestRAMMB;
 @property (nonatomic, readonly) BOOL usbKeyboardReady;
 @property (nonatomic, readonly) BOOL usbTabletReady;
 @property (nonatomic, readonly) uint64_t usbEventsDelivered;

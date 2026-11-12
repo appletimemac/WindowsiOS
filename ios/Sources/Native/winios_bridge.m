@@ -231,6 +231,13 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     return (uint64_t)(winios_available_memory_bytes() >> 20);
 }
 
+- (uint64_t)guestRAMMB {
+    if (_configuredRamMB) return _configuredRamMB;
+    uint64_t bytes = 0;
+    winios_jit_guest_ram(&bytes);
+    return bytes >> 20;
+}
+
 - (BOOL)usbKeyboardReady {
     if (!_vmRunning) return NO;
     int kr = 0;
@@ -556,7 +563,9 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         @"oauth_safari: %d\n"
         @"hinge_status: %ld\n"
         @"hinge_angle_deg: %.1f\n"
-        @"screen_pts: %.0fx%.0f @%.0fx\n",
+        @"screen_pts: %.0fx%.0f @%.0fx\n"
+        @"guest_ram_mb: %llu\n"
+        @"phys_mb: %llu\n",
         running ? @"true" : @"false",
         _vmStatus ?: @"",
         self.isJITLive ? @"true" : @"false",
@@ -578,7 +587,9 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         hv_share_url_handler_enabled(),
         (long)hingeStatus,
         hingeDeg,
-        pt.width, pt.height, scale];
+        pt.width, pt.height, scale,
+        self.guestRAMMB,
+        (unsigned long long)(NSProcessInfo.processInfo.physicalMemory >> 20)];
     [txt writeToFile:statusFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 

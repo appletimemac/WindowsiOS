@@ -53,6 +53,8 @@ targets:
       path: WindowsiOS.entitlements
       properties:
         get-task-allow: true
+        com.apple.developer.kernel.extended-virtual-addressing: true
+        com.apple.developer.kernel.increased-memory-limit: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.RRGSyndicate.WindowsiOS
