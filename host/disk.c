@@ -1,4 +1,3 @@
-#include <fcntl.h>
 #include "../core/machine.h"
 #include "disk.h"
 
@@ -65,4 +64,9 @@ int hv_disk_flush(HvDisk *d) {
 int hv_disk_sync(HvDisk *d) {
     if (d->fd < 0 || d->readonly) return 0;
     return fsync(d->fd);
+}
+
+int hv_disk_barrier(HvDisk *d) {
+    if (d->fd < 0 || d->readonly) return 0;
+    return fcntl(d->fd, F_BARRIERFSYNC) == -1 ? -1 : 0;
 }

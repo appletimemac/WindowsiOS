@@ -321,6 +321,10 @@ void hv_winvm_flush_disks(void) {
     if (disk0.fd >= 0) hv_disk_sync(&disk0);
 }
 
+void hv_winvm_checkpoint_disks(void) {
+    if (disk0.fd >= 0) hv_disk_barrier(&disk0);
+}
+
 int hv_winvm_run_cpu0(void) {
     prepare_cpu_thread();
     for (;;) {

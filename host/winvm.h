@@ -32,6 +32,8 @@ int hv_winvm_run_cpu0(void);
 void hv_winvm_stop(void);
 void hv_winvm_power_button(void);
 void hv_winvm_flush_disks(void);
+/* Periodic checkpoint while running: an ordering barrier instead of a full sync. */
+void hv_winvm_checkpoint_disks(void);
 
 /* Display & screenshot hooks (any thread) */
 void hv_winvm_set_display_layer(void *ca_metal_layer);

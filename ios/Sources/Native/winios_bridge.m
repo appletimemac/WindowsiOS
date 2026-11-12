@@ -488,8 +488,11 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     _diagTickCount++;
     [self writeDiagnosticsSnapshot];
     if (_vmRunning) {
+        // A full fsync of the multi-GB image stalls guest disk I/O while it drains; the kernel
+        // keeps dirty pages across an app kill, so a barrier is enough here. Backgrounding and
+        // stopping still do the full sync.
         if ((_diagTickCount % 4u) == 0u) {
-            hv_winvm_flush_disks();
+            hv_winvm_checkpoint_disks();
         }
         double uptime = CFAbsoluteTimeGetCurrent() - _bootStartTime;
         if (uptime <= 240.0 || getenv("WINIOS_ALWAYS_SCREENSHOT") != NULL) {
