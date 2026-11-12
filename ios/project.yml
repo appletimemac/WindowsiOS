@@ -98,6 +98,7 @@ targets:
     platform: iOS
     sources:
       - path: Sources/Posture.swift
+      - path: Sources/HeldTaps.swift
       - path: Tests
     settings:
       base:

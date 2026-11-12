@@ -50,6 +50,11 @@ void hv_winvm_key_linux(uint16_t code, int down);
 /* Normalized tablet pointer: x_norm, y_norm in [0.0, 1.0] mapped to 0..32767;
  * buttons: bit0=Left, bit1=Right, bit2=Middle; wheel: -127..127. */
 void hv_winvm_tablet(double x_norm, double y_norm, uint8_t buttons, int8_t wheel);
+/* Multi-touch frame for the USB touchscreen (see HvTouchContact in xhci.h): the full set of contacts
+ * (1..5, x and y 0..32767 across the Windows desktop), contacts lifting (tip 0) reported once. */
+void hv_winvm_touch(const HvTouchContact *contacts, int count);
+/* 1 once Windows has configured the touchscreen, so touches stop being dropped. */
+int hv_winvm_touch_ready(void);
 void hv_winvm_send_ctrl_alt_del(void);
 void hv_winvm_usb_stats(int *kbd_ready, int *tab_ready, uint64_t *delivered);
 void hv_winvm_engine_stats(uint64_t *jit_used_bytes, uint64_t *jit_cap_bytes,

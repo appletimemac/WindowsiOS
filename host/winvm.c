@@ -443,6 +443,14 @@ void hv_winvm_tablet(double x_norm, double y_norm, uint8_t buttons, int8_t wheel
     hv_xhci_tablet(board.usb, ax, ay, buttons, wheel);
 }
 
+void hv_winvm_touch(const HvTouchContact *contacts, int count) {
+    if (board.usb) hv_xhci_touch(board.usb, contacts, count);
+}
+
+int hv_winvm_touch_ready(void) {
+    return board.usb ? hv_xhci_touch_ready(board.usb) : 0;
+}
+
 void hv_winvm_send_ctrl_alt_del(void) {
     if (!board.usb) return;
     /* Left Ctrl (0xe0), Left Alt (0xe2), Delete (0x4c) */

@@ -155,6 +155,22 @@ static void *cmd_file_thread(void *arg) {
             hv_winvm_key_hid(0x28, 1);
             usleep(50000);
             hv_winvm_key_hid(0x28, 0);
+        } else if (sscanf(line, "tap %lf %lf", &xn, &yn) == 2) {
+            HvTouchContact c = {.id = 0, .tip = 1, .x = (uint16_t)(xn * 32767.0), .y = (uint16_t)(yn * 32767.0)};
+            hv_winvm_touch(&c, 1);
+            usleep(90000);
+            c.tip = 0;
+            hv_winvm_touch(&c, 1);
+        } else if (!strcmp(line, "touchready")) {
+            fprintf(stderr, "TOUCH_READY %d\n", hv_winvm_touch_ready());
+        } else if (sscanf(line, "combo %i %i", &code, &yi) == 2) {
+            hv_winvm_key_hid((uint8_t)code, 1);
+            usleep(30000);
+            hv_winvm_key_hid((uint8_t)yi, 1);
+            usleep(50000);
+            hv_winvm_key_hid((uint8_t)yi, 0);
+            usleep(30000);
+            hv_winvm_key_hid((uint8_t)code, 0);
         } else if (sscanf(line, "size %d %d", &code, &yi) == 2 && code > 0 && yi > 0) {
             hv_winvm_request_display_size((uint32_t)code, (uint32_t)yi);
         } else if (!strcmp(line, "cad")) {

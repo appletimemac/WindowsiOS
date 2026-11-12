@@ -603,6 +603,20 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     [self notifyChanged];
 }
 
+- (void)sendTouchContacts:(const WinIOSTouchContact *)contacts count:(NSInteger)count {
+    if (!_vmRunning || !contacts || count <= 0) return;
+    HvTouchContact frame[5];
+    int n = (int)MIN(count, 5);
+    for (int i = 0; i < n; i++) {
+        frame[i] = (HvTouchContact){.id = contacts[i].id, .tip = contacts[i].tip, .x = contacts[i].x, .y = contacts[i].y};
+    }
+    hv_winvm_touch(frame, n);
+}
+
+- (BOOL)touchscreenReady {
+    return _vmRunning && hv_winvm_touch_ready();
+}
+
 - (void)requestDisplayWidth:(uint32_t)width height:(uint32_t)height {
     hv_winvm_request_display_size(width, height);
 }

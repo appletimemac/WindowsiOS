@@ -18,10 +18,28 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     private var scrollAccum: CGFloat = 0
     private let tapHaptic = UIImpactFeedbackGenerator(style: .light)
 
+    /// Touch mode drives the guest's HID touchscreen with raw touches once Windows has configured
+    /// it; trackpad mode and the time before that keep the gesture-driven absolute pointer.
+    private var digitizerActive = false
+    /// Touches Windows knows about, with the HID contact id each was given.
+    private var contacts: [ObjectIdentifier: Contact] = [:]
+    /// A gesture's first fingers, not yet sent to Windows (see HeldTaps), and their touches.
+    private var held = HeldTaps()
+    private var heldTouches: [ObjectIdentifier: UITouch] = [:]
+    private var heldRelease: DispatchWorkItem?
+    /// Quick taps already pressed in Windows whose lift is still to be sent, by contact id.
+    private var tapsInFlight: [UInt8: (x: UInt16, y: UInt16)] = [:]
     private var pendingSizeRequest: DispatchWorkItem?
     private var requestedGuestSize: CGSize = .zero
     /// Guest pixels per point: on a 3x panel this is exactly 2 device pixels per Windows pixel.
     private static let guestPixelsPerPoint: CGFloat = 1.5
+    private static let maxContacts = 5
+
+    private struct Contact {
+        let touch: UITouch
+        let slot: UInt8
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         configure()
@@ -108,6 +126,173 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         }
         pendingSizeRequest = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+
+    // MARK: - Raw touches to the guest touchscreen
+
+    private func setDigitizerActive(_ active: Bool) {
+        guard active != digitizerActive else { return }
+        digitizerActive = active
+        for gr in gestureRecognizers ?? [] where !(gr is UIHoverGestureRecognizer) {
+            gr.isEnabled = !active
+        }
+    }
+
+    private func guestPoint(_ point: CGPoint) -> (x: UInt16, y: UInt16) {
+        let (nx, ny) = normalizedPoint(for: point)
+        return (UInt16(min(32767.0, max(0.0, nx * 32767.0)).rounded()),
+                UInt16(min(32767.0, max(0.0, ny * 32767.0)).rounded()))
+    }
+
+    private func freeSlot() -> UInt8? {
+        let used = Set(contacts.values.map(\.slot)).union(tapsInFlight.keys)
+        return (0..<UInt8(Self.maxContacts)).first { !used.contains($0) }
+    }
+
+    private func addContact(_ touch: UITouch) {
+        guard contacts[ObjectIdentifier(touch)] == nil, let slot = freeSlot() else { return }
+        contacts[ObjectIdentifier(touch)] = Contact(touch: touch, slot: slot)
+    }
+
+    private func send(_ frame: [WinIOSTouchContact]) {
+        guard !frame.isEmpty else { return }
+        frame.withUnsafeBufferPointer { buf in
+            WinIOSBridge.shared.sendTouchContacts(buf.baseAddress, count: buf.count)
+        }
+    }
+
+    /// Sends every contact Windows has, with the tip up for the lifting ones, which go out once.
+    private func sendTouchFrame(lifting: Set<ObjectIdentifier> = [], liftingTaps: Set<UInt8> = []) {
+        var frame: [WinIOSTouchContact] = []
+        for (id, contact) in contacts {
+            let p = guestPoint(contact.touch.location(in: self))
+            frame.append(WinIOSTouchContact(id: contact.slot, tip: lifting.contains(id) ? 0 : 1, x: p.x, y: p.y))
+        }
+        for (slot, p) in tapsInFlight {
+            frame.append(WinIOSTouchContact(id: slot, tip: liftingTaps.contains(slot) ? 0 : 1, x: p.x, y: p.y))
+        }
+        send(frame)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if contacts.isEmpty && held.isEmpty {
+            setDigitizerActive(!trackpadMode && !rightClickArmed && WinIOSBridge.shared.touchscreenReady)
+        }
+        guard digitizerActive else { return super.touchesBegan(touches, with: event) }
+        if !contacts.isEmpty {
+            // Windows already has this gesture: new fingers join it at once.
+            touches.forEach(addContact)
+            sendTouchFrame()
+            return
+        }
+        for touch in touches { heldTouches[ObjectIdentifier(touch)] = touch }
+        let landed = touches.map { (id: ObjectIdentifier($0), at: $0.location(in: self)) }
+        if let deadline = held.land(landed, time: CACurrentMediaTime()) {
+            scheduleRelease(at: deadline)
+        } else {
+            releaseHeld()
+        }
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard digitizerActive else { return super.touchesMoved(touches, with: event) }
+        if !held.isEmpty {
+            if held.movedTooFar({ self.heldTouches[$0]?.location(in: self) }) { releaseHeld() }
+            return
+        }
+        sendTouchFrame()
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard digitizerActive else { return super.touchesEnded(touches, with: event) }
+        endTouches(touches, cancelled: false)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard digitizerActive else { return super.touchesCancelled(touches, with: event) }
+        endTouches(touches, cancelled: true)
+    }
+
+    private func endTouches(_ touches: Set<UITouch>, cancelled: Bool) {
+        let ids = Set(touches.map(ObjectIdentifier.init))
+        if let outcome = held.lift(ids, cancelled: cancelled) {
+            heldRelease?.cancel()
+            heldRelease = nil
+            heldTouches.removeAll()
+            perform(outcome)
+        }
+        let lifting = ids.filter { contacts[$0] != nil }
+        if !lifting.isEmpty {
+            sendTouchFrame(lifting: lifting)
+            for id in lifting { contacts[id] = nil }
+        }
+        settleIfIdle()
+    }
+
+    private func scheduleRelease(at deadline: TimeInterval) {
+        heldRelease?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.releaseHeld() }
+        heldRelease = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, deadline - CACurrentMediaTime()), execute: work)
+    }
+
+    /// The held fingers are a real touch gesture: hand the ones still down to Windows, landing
+    /// where they first touched and then moving to where they are now.
+    private func releaseHeld() {
+        heldRelease?.cancel()
+        heldRelease = nil
+        let down = held.release()
+        let touches = heldTouches
+        heldTouches.removeAll()
+        for finger in down {
+            if let touch = touches[finger.id] { addContact(touch) }
+        }
+        var landing: [WinIOSTouchContact] = []
+        for finger in down {
+            guard let slot = contacts[finger.id]?.slot else { continue }
+            let p = guestPoint(finger.start)
+            landing.append(WinIOSTouchContact(id: slot, tip: 1, x: p.x, y: p.y))
+        }
+        for (slot, p) in tapsInFlight {
+            landing.append(WinIOSTouchContact(id: slot, tip: 1, x: p.x, y: p.y))
+        }
+        send(landing)
+        sendTouchFrame()
+        settleIfIdle()
+    }
+
+    /// Every held finger lifted before the gesture reached Windows, so it was a quick tap.
+    private func perform(_ outcome: HeldTaps.Outcome) {
+        switch outcome {
+        case .tap(let point):
+            // Still a touch for Windows: press, then lift a moment later so it registers as a tap.
+            guard let slot = freeSlot() else { return }
+            tapsInFlight[slot] = guestPoint(point)
+            sendTouchFrame()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+                guard let self, self.tapsInFlight[slot] != nil else { return }
+                self.sendTouchFrame(liftingTaps: [slot])
+                self.tapsInFlight[slot] = nil
+                self.settleIfIdle()
+            }
+        case .rightClick(let point):
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.6)
+            let (nx, ny) = normalizedPoint(for: point)
+            PointerController.shared.directTapAt(x: nx, y: ny, buttonMask: 2)
+        case .threeFingerTap:
+            UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+            onThreeFingerTap?()
+        case .nothing:
+            break
+        }
+    }
+
+    /// With no finger down, the gesture recognizers come back, so switching to trackpad or
+    /// right-click mode works from the very next touch.
+    private func settleIfIdle() {
+        if contacts.isEmpty && held.isEmpty && tapsInFlight.isEmpty {
+            setDigitizerActive(false)
+        }
     }
 
     private func updateDrawableScale() {

@@ -7,6 +7,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef void (^WinIOSStateCallback)(void);
 
+/// One contact of a guest touchscreen frame; x and y run 0...32767 across the Windows display.
+typedef struct WinIOSTouchContact {
+    uint8_t id;
+    uint8_t tip;
+    uint16_t x;
+    uint16_t y;
+} WinIOSTouchContact;
+
 @interface WinIOSBridge : NSObject
 
 @property (class, nonatomic, readonly) WinIOSBridge *shared;
@@ -45,6 +53,10 @@ typedef void (^WinIOSStateCallback)(void);
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees;
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel;
+/// The full set of contacts for one frame (at most 5), lifting contacts once with tip 0.
+- (void)sendTouchContacts:(const WinIOSTouchContact *_Nullable)contacts count:(NSInteger)count;
+/// Windows has configured the HID touchscreen, so raw touches reach it.
+@property (nonatomic, readonly) BOOL touchscreenReady;
 /// The size, in guest pixels, Windows should render at (virtio-gpu); ignored on ramfb.
 - (void)requestDisplayWidth:(uint32_t)width height:(uint32_t)height;
 - (void)sendKeyHid:(uint8_t)usage down:(BOOL)down;

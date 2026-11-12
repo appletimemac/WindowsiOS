@@ -124,6 +124,138 @@ static const uint8_t tab_config_desc[34] = {
     7, 5, 0x81, 3, 8, 0, 1,                                       /* EP1 IN, 8 bytes max, 1 ms */
 };
 
+/* ---- Port 3: USB HID multi-touch digitizer, bound by Windows' inbox HID touch stack ----
+   Windows Touchscreen collection (page 0x0D usage 0x04), parallel mode, 5 contacts, report ID 1 (34 bytes):
+     byte 0: report id
+     5 x 6 bytes per contact: bit 0 tip switch, bit 1 confidence, contact id, x (16), y (16)
+     byte 31..32: scan time (100 us units, wraps at 16 bits)
+     byte 33: contact count (contacts valid in this report)
+   Feature 2: Contact Count Maximum (touch collection). Feature 3: Device Configuration (input mode, device
+   index), its own top-level collection. The THQA certification blob is left out on purpose. */
+#define TOUCH_REPORT_ID 1
+#define TOUCH_MAXCNT_ID 2
+#define TOUCH_CONFIG_ID 3
+#define TOUCH_X_CM100 1730 /* 17.30 cm */
+#define TOUCH_Y_CM100 1220 /* 12.20 cm */
+#define TOUCH_INPUT_MULTI 2
+
+#define TOUCH_FINGER \
+    0x05, 0x0d,             /* Usage Page (Digitizer): the previous finger left Generic Desktop selected */ \
+    0x09, 0x22,             /* Usage (Finger) */ \
+    0xa1, 0x02,             /* Collection (Logical) */ \
+    0x55, 0x00,             /*   Unit Exponent (0) */ \
+    0x65, 0x00,             /*   Unit (None) */ \
+    0x35, 0x00,             /*   Physical Minimum (0) */ \
+    0x45, 0x00,             /*   Physical Maximum (0) */ \
+    0x15, 0x00,             /*   Logical Minimum (0) */ \
+    0x25, 0x01,            /*   Logical Maximum (1) */ \
+    0x75, 0x01,             /*   Report Size (1) */ \
+    0x95, 0x01,             /*   Report Count (1) */ \
+    0x09, 0x42,             /*   Usage (Tip Switch) */ \
+    0x81, 0x02,             /*   Input (Data,Var,Abs) */ \
+    0x09, 0x47,             /*   Usage (Confidence) */ \
+    0x81, 0x02,             /*   Input (Data,Var,Abs) */ \
+    0x95, 0x06,             /*   Report Count (6) */ \
+    0x81, 0x03,             /*   Input (Const,Var,Abs) */ \
+    0x09, 0x51,             /*   Usage (Contact Identifier) */ \
+    0x75, 0x08,             /*   Report Size (8) */ \
+    0x95, 0x01,             /*   Report Count (1) */ \
+    0x26, 0xff, 0x00,       /*   Logical Maximum (255) */ \
+    0x81, 0x02,             /*   Input (Data,Var,Abs) */ \
+    0x05, 0x01,             /*   Usage Page (Generic Desktop) */ \
+    0x26, 0xff, 0x7f,       /*   Logical Maximum (32767) */ \
+    0x75, 0x10,             /*   Report Size (16) */ \
+    0x55, 0x0e,             /*   Unit Exponent (-2) */ \
+    0x65, 0x11,             /*   Unit (SI Linear, centimetre) */ \
+    0x09, 0x30,             /*   Usage (X) */ \
+    0x46, TOUCH_X_CM100 & 0xff, TOUCH_X_CM100 >> 8, /* Physical Maximum */ \
+    0x81, 0x02,             /*   Input (Data,Var,Abs) */ \
+    0x09, 0x31,             /*   Usage (Y) */ \
+    0x46, TOUCH_Y_CM100 & 0xff, TOUCH_Y_CM100 >> 8, /* Physical Maximum */ \
+    0x81, 0x02,             /*   Input (Data,Var,Abs) */ \
+    0xc0,                   /* End Collection */
+
+static const uint8_t touch_report_desc[] = {
+    0x05, 0x0d,             /* Usage Page (Digitizer) */
+    0x09, 0x04,             /* Usage (Touch Screen) */
+    0xa1, 0x01,             /* Collection (Application) */
+    0x85, TOUCH_REPORT_ID,  /*   Report ID */
+    TOUCH_FINGER
+    TOUCH_FINGER
+    TOUCH_FINGER
+    TOUCH_FINGER
+    TOUCH_FINGER
+    0x05, 0x0d,             /*   Usage Page (Digitizer) */
+    0x55, 0x0c,             /*   Unit Exponent (-4) */
+    0x66, 0x01, 0x10,       /*   Unit (Seconds): 100 us per count */
+    0x35, 0x00,             /*   Physical Minimum (0) */
+    0x47, 0xff, 0xff, 0x00, 0x00, /* Physical Maximum (65535) */
+    0x15, 0x00,             /*   Logical Minimum (0) */
+    0x27, 0xff, 0xff, 0x00, 0x00, /* Logical Maximum (65535) */
+    0x75, 0x10,             /*   Report Size (16) */
+    0x95, 0x01,             /*   Report Count (1) */
+    0x09, 0x56,             /*   Usage (Scan Time) */
+    0x81, 0x02,             /*   Input (Data,Var,Abs) */
+    0x55, 0x00,             /*   Unit Exponent (0) */
+    0x65, 0x00,             /*   Unit (None) */
+    0x35, 0x00,             /*   Physical Minimum (0) */
+    0x45, 0x00,             /*   Physical Maximum (0) */
+    0x25, HV_TOUCH_MAX_CONTACTS, /* Logical Maximum */
+    0x75, 0x08,             /*   Report Size (8) */
+    0x09, 0x54,             /*   Usage (Contact Count) */
+    0x81, 0x02,             /*   Input (Data,Var,Abs) */
+    0x85, TOUCH_MAXCNT_ID,  /*   Report ID */
+    0x09, 0x55,             /*   Usage (Contact Count Maximum) */
+    0xb1, 0x02,             /*   Feature (Data,Var,Abs) */
+    0xc0,                   /* End Collection */
+    0x05, 0x0d,             /* Usage Page (Digitizer) */
+    0x09, 0x0e,             /* Usage (Device Configuration) */
+    0xa1, 0x01,             /* Collection (Application) */
+    0x85, TOUCH_CONFIG_ID,  /*   Report ID */
+    0x09, 0x23,             /*   Usage (Device Settings) */
+    0xa1, 0x02,             /*   Collection (Logical) */
+    0x09, 0x52,             /*     Usage (Input Mode) */
+    0x09, 0x53,             /*     Usage (Device Index) */
+    0x15, 0x00,             /*     Logical Minimum (0) */
+    0x25, 0x0a,             /*     Logical Maximum (10) */
+    0x75, 0x08,             /*     Report Size (8) */
+    0x95, 0x02,             /*     Report Count (2) */
+    0xb1, 0x02,             /*     Feature (Data,Var,Abs) */
+    0xc0,                   /*   End Collection */
+    0xc0,                   /* End Collection */
+};
+
+static const uint8_t touch_device_desc[18] = {
+    18, 1, 0x00, 0x02, 0, 0, 0, 64,
+    0x27, 0x06, 0x03, 0x00, /* WindowsiOS USB Touchscreen (0627:0003) */
+    0x00, 0x01, 1, 6, 7, 1,
+};
+
+static const uint8_t touch_config_desc[34] = {
+    9, 2, 34, 0, 1, 1, 0, 0xa0, 50,
+    9, 4, 0, 0, 1, 3, 0, 0, 0,                                    /* HID, non-boot report protocol */
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, sizeof touch_report_desc & 0xff, sizeof touch_report_desc >> 8,
+    7, 5, 0x81, 3, 64, 0, 1,                                      /* EP1 IN, 64 bytes max (one full report), 1 ms */
+};
+
+enum { PORT_KBD = 1, PORT_TABLET = 2, PORT_TOUCH = 3 };
+_Static_assert(HV_XHCI_PORTS == PORT_TOUCH, "usb_devices needs an entry per port");
+
+/* Descriptors of the device behind each root hub port (index = port number). */
+static const struct UsbDevice {
+    const uint8_t *dev, *cfg, *report;
+    int cfg_len, report_len;
+} usb_devices[HV_XHCI_PORTS + 1] = {
+    [PORT_KBD] = {kbd_device_desc, kbd_config_desc, kbd_report_desc, sizeof kbd_config_desc, sizeof kbd_report_desc},
+    [PORT_TABLET] = {tab_device_desc, tab_config_desc, tab_report_desc, sizeof tab_config_desc, sizeof tab_report_desc},
+    [PORT_TOUCH] = {touch_device_desc, touch_config_desc, touch_report_desc, sizeof touch_config_desc,
+                    sizeof touch_report_desc},
+};
+
+/* The EP0 reply buffer holds a whole descriptor (HID wDescriptorLength is 16 bits). */
+#define EP0_REPLY_MAX 1024
+_Static_assert(sizeof touch_report_desc <= EP0_REPLY_MAX, "report descriptor does not fit the EP0 reply buffer");
+
 static const char *const strings[] = {
     NULL,
     "WindowsiOS",
@@ -131,6 +263,8 @@ static const char *const strings[] = {
     "KBD01",
     "WindowsiOS USB Tablet",
     "TAB01",
+    "WindowsiOS USB Touchscreen",
+    "TCH01",
 };
 
 static int xlog(void) {
@@ -262,10 +396,44 @@ static void set_ep_state(HvXhci *x, int slot, int dci, uint32_t state) {
     wr(x, ctx, &dw0, 4);
 }
 
-/* ---- control requests for Port 1 (Keyboard) and Port 2 (Tablet) ---- */
+/* ---- control requests for Port 1 (Keyboard), Port 2 (Tablet) and Port 3 (Touchscreen) ---- */
+
+/* GET_REPORT on the touchscreen: Input 1 is the current state; Feature 2 and 3 are Contact Count Maximum and
+   the Device Configuration. Returns the length (report id first), or -1 to stall. */
+static int touch_get_report(HvXhci *x, uint8_t rtype, uint8_t rid, uint8_t *out) {
+    int len = -1;
+    pthread_mutex_lock(&x->mu);
+    if (rtype == 1 && rid == TOUCH_REPORT_ID) {
+        memcpy(out, x->touch_state, HV_TOUCH_REPORT_LEN);
+        len = HV_TOUCH_REPORT_LEN;
+    } else if (rtype == 3 && rid == TOUCH_MAXCNT_ID) {
+        out[0] = rid, out[1] = HV_TOUCH_MAX_CONTACTS;
+        len = 2;
+    } else if (rtype == 3 && rid == TOUCH_CONFIG_ID) {
+        out[0] = rid, out[1] = x->touch_mode, out[2] = x->touch_index;
+        len = 3;
+    }
+    pthread_mutex_unlock(&x->mu);
+    return len;
+}
+
+/* Data stage of an OUT request, once the buffer has been read (SET_REPORT Feature on the touchscreen). The
+   input mode is only recorded: the touchscreen has no mouse collection to fall back to, so frames always flow
+   as multi-touch reports. */
+static void control_out(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], const uint8_t *data, unsigned n) {
+    if (sl->port != PORT_TOUCH || setup[0] != 0x21 || setup[1] != 0x09) return;
+    uint8_t rtype = setup[3], rid = setup[2];
+    if (rtype != 3 || rid != TOUCH_CONFIG_ID || n < 3 || data[0] != rid) return;
+    pthread_mutex_lock(&x->mu);
+    x->touch_mode = data[1];
+    x->touch_index = data[2];
+    pthread_mutex_unlock(&x->mu);
+    if (xlog()) fprintf(stderr, "xhci port %d: SET_REPORT config mode %u index %u\n", sl->port, data[1], data[2]);
+}
 
 static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *out, int max) {
-    int is_tab = sl->port == 2;
+    if (sl->port < 1 || sl->port > HV_XHCI_PORTS) return -1;
+    const struct UsbDevice *ud = &usb_devices[sl->port];
     uint8_t type = setup[0], req = setup[1];
     uint16_t value = (uint16_t)(setup[2] | setup[3] << 8);
     if (xlog()) fprintf(stderr, "xhci port %d: request %02x %02x value %04x len %u\n", sl->port, type, req, value, setup[6] | setup[7] << 8);
@@ -274,15 +442,10 @@ static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *o
     int len = 0;
     uint8_t tmp[128];
 
-    const uint8_t *dev_d = is_tab ? tab_device_desc : kbd_device_desc;
-    const uint8_t *cfg_d = is_tab ? tab_config_desc : kbd_config_desc;
-    const uint8_t *rep_d = is_tab ? tab_report_desc : kbd_report_desc;
-    int rep_d_len = is_tab ? (int)sizeof(tab_report_desc) : (int)sizeof(kbd_report_desc);
-
     if (type == 0x80 && req == 6) { /* GET_DESCRIPTOR (device) */
         uint8_t dt = value >> 8, idx = value & 0xff;
-        if (dt == 1) src = dev_d, len = 18;
-        else if (dt == 2) src = cfg_d, len = 34;
+        if (dt == 1) src = ud->dev, len = 18;
+        else if (dt == 2) src = ud->cfg, len = ud->cfg_len;
         else if (dt == 3) {
             if (idx == 0) {
                 tmp[0] = 4, tmp[1] = 3, tmp[2] = 0x09, tmp[3] = 0x04;
@@ -296,8 +459,8 @@ static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *o
             } else return -1;
         } else return -1;
     } else if (type == 0x81 && req == 6) { /* GET_DESCRIPTOR (interface): HID, report */
-        if ((value >> 8) == 0x22) src = rep_d, len = rep_d_len;
-        else if ((value >> 8) == 0x21) src = cfg_d + 18, len = 9;
+        if ((value >> 8) == 0x22) src = ud->report, len = ud->report_len;
+        else if ((value >> 8) == 0x21) src = ud->cfg + 18, len = 9;
         else return -1;
     } else if ((type == 0x80 || type == 0x81 || type == 0x82) && req == 0) { /* GET_STATUS */
         tmp[0] = 0, tmp[1] = 0;
@@ -312,7 +475,11 @@ static int control(HvXhci *x, HvXhciSlot *sl, const uint8_t setup[8], uint8_t *o
         tmp[0] = 0;
         src = tmp, len = 1;
     } else if (type == 0xa1 && req == 1) { /* GET_REPORT */
-        if (is_tab) src = x->tab_state, len = 6;
+        if (sl->port == PORT_TOUCH) {
+            len = touch_get_report(x, setup[3], setup[2], tmp);
+            if (len < 0) return -1;
+            src = tmp;
+        } else if (sl->port == PORT_TABLET) src = x->tab_state, len = 6;
         else src = x->state, len = 8;
     } else if (type == 0xa1 && req == 2) { /* GET_IDLE */
         tmp[0] = sl->idle;
@@ -342,8 +509,8 @@ static void run_ep0(HvXhci *x, int slot) {
     HvXhciRing *r = &sl->ep[1];
     uint32_t trb[4];
     uint64_t at;
-    uint8_t setup[8], reply[256];
-    int reply_len = 0, reply_off = 0, stalled = 0, td_short = 0;
+    uint8_t setup[8], reply[EP0_REPLY_MAX];
+    int reply_len = 0, reply_off = 0, stalled = 0, td_short = 0, out_pending = 0;
     uint32_t edtla = 0;
     while (ring_peek(x, r, trb, &at)) {
         int type = (trb[3] >> 10) & 0x3f;
@@ -356,6 +523,7 @@ static void run_ep0(HvXhci *x, int slot) {
             reply_len = control(x, sl, setup, reply, wlen < sizeof reply ? wlen : (int)sizeof reply);
             reply_off = 0;
             stalled = reply_len < 0;
+            out_pending = !stalled && !(setup[0] & 0x80) && wlen > 0;
             edtla = 0;
             td_short = 0;
             ring_advance(r);
@@ -364,6 +532,9 @@ static void run_ep0(HvXhci *x, int slot) {
             uint64_t buf = (uint64_t)trb[1] << 32 | trb[0];
             uint32_t want = trb[2] & 0x1ffff;
             int in = (trb[3] >> 16) & 1;
+            int idt = (trb[3] >> 6) & 1;
+            uint8_t immediate[8];
+            memcpy(immediate, trb, 8);
             ring_advance(r);
             if (stalled) {
                 if (xlog()) fprintf(stderr, "xhci port %d: EP0 STALL on DATA want=%u\n", sl->port, want);
@@ -380,6 +551,18 @@ static void run_ep0(HvXhci *x, int slot) {
                 reply_off += (int)n;
             } else {
                 n = want;
+                if (out_pending) {
+                    uint8_t data[64];
+                    unsigned dn = want < sizeof data ? want : (unsigned)sizeof data;
+                    if (idt) {
+                        if (dn > 8) dn = 8;
+                        memcpy(data, immediate, dn);
+                    } else {
+                        rd(x, buf, data, dn);
+                    }
+                    control_out(x, sl, setup, data, dn);
+                    out_pending = 0;
+                }
             }
             edtla += n;
             if (n < want) td_short = 1;
@@ -471,33 +654,46 @@ static int deliver_hid_in(HvXhci *x, int slot, const uint8_t *report, uint32_t r
     return 0;
 }
 
+/* Hands queued reports (stride bytes apart, len bytes each) to the guest until it runs out of TRBs. */
+static void drain_queue(HvXhci *x, int slot, const uint8_t *base, unsigned stride, unsigned len, uint32_t *head,
+                        uint32_t tail, const char *what) {
+    while (*head != tail) {
+        const uint8_t *rep = base + (size_t)(*head % HV_XHCI_REPORTS) * stride;
+        if (!deliver_hid_in(x, slot, rep, len)) break;
+        (*head)++;
+        x->delivered++;
+        if (xlog() && x->delivered <= 24)
+            fprintf(stderr, "xhci: delivered %s report #%llu (%02x %02x %02x)\n", what, (unsigned long long)x->delivered,
+                    rep[0], rep[1], rep[2]);
+    }
+}
+
+static int ep_in_running(const HvXhci *x, int slot) {
+    return slot >= 1 && slot <= HV_XHCI_SLOTS && x->slots[slot].ep_running[HID_DCI_IN];
+}
+
 static void run_ep_in(HvXhci *x) {
     pthread_mutex_lock(&x->mu);
-    /* Port 1: Keyboard */
-    if (x->kbd_slot && x->slots[x->kbd_slot].ep_running[HID_DCI_IN]) {
-        int slot = x->kbd_slot;
-        while (x->rhead != x->rtail) {
-            const uint8_t *rep = x->reports[x->rhead % HV_XHCI_REPORTS];
-            if (!deliver_hid_in(x, slot, rep, 8)) break;
-            x->rhead++;
-            x->delivered++;
-            if (xlog() && x->delivered <= 24)
-                fprintf(stderr, "xhci: delivered kbd report #%llu (%02x %02x)\n", (unsigned long long)x->delivered, rep[0], rep[2]);
-        }
-    }
-    /* Port 2: Absolute Tablet */
-    if (x->tab_slot && x->slots[x->tab_slot].ep_running[HID_DCI_IN]) {
-        int slot = x->tab_slot;
-        while (x->thead != x->ttail) {
-            const uint8_t *rep = x->tab_reports[x->thead % HV_XHCI_REPORTS];
-            if (!deliver_hid_in(x, slot, rep, 6)) break;
-            x->thead++;
-            x->delivered++;
-            if (xlog() && x->delivered <= 24)
-                fprintf(stderr, "xhci: delivered tab report #%llu (btn=%02x)\n", (unsigned long long)x->delivered, rep[0]);
-        }
-    }
+    if (ep_in_running(x, x->kbd_slot))
+        drain_queue(x, x->kbd_slot, x->reports[0], 8, 8, &x->rhead, x->rtail, "kbd");
+    if (ep_in_running(x, x->tab_slot))
+        drain_queue(x, x->tab_slot, x->tab_reports[0], 6, 6, &x->thead, x->ttail, "tab");
+    if (ep_in_running(x, x->touch_slot))
+        drain_queue(x, x->touch_slot, x->touch_reports[0], HV_TOUCH_REPORT_LEN, HV_TOUCH_REPORT_LEN, &x->chead,
+                    x->ctail, "touch");
+    else
+        x->chead = x->ctail; /* a stale burst must not replay when the endpoint comes back */
     pthread_mutex_unlock(&x->mu);
+}
+
+/* An endpoint stops running: whatever is queued for the touchscreen is stale by the time it restarts. */
+static void ep_stop(HvXhci *x, int slot, int dci) {
+    x->slots[slot].ep_running[dci] = 0;
+    if (slot == x->touch_slot && dci == HID_DCI_IN) {
+        pthread_mutex_lock(&x->mu);
+        x->chead = x->ctail;
+        pthread_mutex_unlock(&x->mu);
+    }
 }
 
 /* ---- commands ---- */
@@ -512,12 +708,21 @@ static void init_ring_from_ctx(HvXhci *x, int slot, int dci) {
     sl->ep_running[dci] = 1;
 }
 
+/* Where the slot of the device on a root hub port (1..HV_XHCI_PORTS) is remembered. */
+static int *port_slot(HvXhci *x, int port) {
+    switch (port) {
+    case PORT_KBD: return &x->kbd_slot;
+    case PORT_TABLET: return &x->tab_slot;
+    default: return &x->touch_slot;
+    }
+}
+
 static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     uint64_t out = out_ctx(x, slot);
     uint8_t slot_ctx[32], ep0[32];
     rd(x, input + 32, slot_ctx, 32);
     rd(x, input + 64, ep0, 32);
-    int port = slot_ctx[6]; /* root hub port number (1 or 2) */
+    int port = slot_ctx[6]; /* root hub port number (1..HV_XHCI_PORTS) */
     if (port < 1 || port > HV_XHCI_PORTS) return CC_TRB_ERROR;
 
     uint32_t dw3 = (uint32_t)(bsr ? 1 : 2) << 27 | (uint32_t)(bsr ? 0 : slot);
@@ -532,23 +737,21 @@ static int address_device(HvXhci *x, int slot, uint64_t input, int bsr) {
     x->slots[slot].port = port;
     x->slots[slot].protocol = 1;
     x->slots[slot].idle = 0;
-    if (port == 1) x->kbd_slot = slot;
-    else if (port == 2) x->tab_slot = slot;
+    *port_slot(x, port) = slot;
     init_ring_from_ctx(x, slot, 1);
     return CC_SUCCESS;
 }
 
 static int configure_endpoints(HvXhci *x, int slot, uint64_t input, int deconfigure) {
-    HvXhciSlot *sl = &x->slots[slot];
     uint64_t out = out_ctx(x, slot);
     if (deconfigure) {
-        for (int dci = 2; dci < HV_XHCI_EPS; dci++) sl->ep_running[dci] = 0;
+        for (int dci = 2; dci < HV_XHCI_EPS; dci++) ep_stop(x, slot, dci);
         return CC_SUCCESS;
     }
     uint32_t drop = rd32(x, input), add = rd32(x, input + 4);
     for (int dci = 2; dci < HV_XHCI_EPS; dci++) {
         if (drop & (1u << dci)) {
-            sl->ep_running[dci] = 0;
+            ep_stop(x, slot, dci);
             uint8_t zero[32] = {0};
             wr(x, out + 32ull * dci, zero, 32);
         }
@@ -601,8 +804,10 @@ static void run_commands(HvXhci *x) {
         }
         case TRB_DISABLE_SLOT:
             if (slot >= 1 && slot <= HV_XHCI_SLOTS) {
-                if (slot == x->kbd_slot) x->kbd_slot = 0;
-                if (slot == x->tab_slot) x->tab_slot = 0;
+                ep_stop(x, slot, HID_DCI_IN);
+                for (int p = 1; p <= HV_XHCI_PORTS; p++) {
+                    if (slot == *port_slot(x, p)) *port_slot(x, p) = 0;
+                }
                 memset(&x->slots[slot], 0, sizeof x->slots[slot]);
             }
             break;
@@ -641,7 +846,7 @@ static void run_commands(HvXhci *x) {
             if (slot >= 1 && slot <= HV_XHCI_SLOTS) {
                 int dci = (trb[3] >> 16) & 0x1f;
                 if (dci >= 1 && dci < HV_XHCI_EPS) {
-                    x->slots[slot].ep_running[dci] = 0;
+                    ep_stop(x, slot, dci);
                     set_ep_state(x, slot, dci, 3);
                     uint64_t deq = x->slots[slot].ep[dci].dequeue | (uint64_t)x->slots[slot].ep[dci].ccs;
                     wr(x, out_ctx(x, slot) + 32ull * dci + 8, &deq, 8);
@@ -663,7 +868,7 @@ static void run_commands(HvXhci *x) {
         }
         case TRB_RESET_DEVICE: {
             if (slot >= 1 && slot <= HV_XHCI_SLOTS) {
-                for (int dci = 2; dci < HV_XHCI_EPS; dci++) x->slots[slot].ep_running[dci] = 0;
+                for (int dci = 2; dci < HV_XHCI_EPS; dci++) ep_stop(x, slot, dci);
                 uint32_t dw3 = (uint32_t)1 << 27;
                 wr(x, out_ctx(x, slot) + 12, &dw3, 4);
                 x->slots[slot].configured = 0;
@@ -727,6 +932,14 @@ static void reset(HvXhci *x) {
     memset(x->slots, 0, sizeof x->slots);
     x->kbd_slot = 0;
     x->tab_slot = 0;
+    x->touch_slot = 0;
+    pthread_mutex_lock(&x->mu);
+    x->chead = x->ctail = 0;
+    memset(x->touch_state, 0, sizeof x->touch_state);
+    x->touch_state[0] = TOUCH_REPORT_ID;
+    x->touch_mode = TOUCH_INPUT_MULTI;
+    x->touch_index = 0;
+    pthread_mutex_unlock(&x->mu);
     ports_connect_init(x);
     update_irq(x);
 }
@@ -951,6 +1164,75 @@ void hv_xhci_tablet(HvXhci *x, int abs_x, int abs_y, uint8_t buttons, int8_t whe
     hv_machine_wake(x->m);
 }
 
+/* Scan Time: a monotonic clock in 100 us units, wrapping at 16 bits like the report field. */
+static uint16_t touch_scan_time(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return (uint16_t)(ns / 100000ull);
+}
+
+/* 1 when b only moves the contacts of a: same count, ids and tip/confidence bits (so no contact lands or lifts). */
+static int touch_same_set(const uint8_t *a, const uint8_t *b) {
+    int n = a[HV_TOUCH_REPORT_LEN - 1];
+    if (n != b[HV_TOUCH_REPORT_LEN - 1]) return 0;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *ca = a + 1 + 6 * i, *cb = b + 1 + 6 * i;
+        if (ca[0] != cb[0] || ca[1] != cb[1]) return 0;
+    }
+    return 1;
+}
+
+void hv_xhci_touch(HvXhci *x, const HvTouchContact *contacts, int count) {
+    if (!x || !contacts || count <= 0) return;
+    if (count > HV_TOUCH_MAX_CONTACTS) count = HV_TOUCH_MAX_CONTACTS;
+
+    uint8_t rep[HV_TOUCH_REPORT_LEN] = {0};
+    rep[0] = TOUCH_REPORT_ID;
+    for (int i = 0; i < count; i++) {
+        uint8_t *c = rep + 1 + 6 * i;
+        uint16_t cx = contacts[i].x > 32767 ? 32767 : contacts[i].x;
+        uint16_t cy = contacts[i].y > 32767 ? 32767 : contacts[i].y;
+        c[0] = (uint8_t)((contacts[i].tip ? 1 : 0) | 2); /* tip switch, confidence */
+        c[1] = contacts[i].id;
+        c[2] = (uint8_t)(cx & 0xff), c[3] = (uint8_t)(cx >> 8);
+        c[4] = (uint8_t)(cy & 0xff), c[5] = (uint8_t)(cy >> 8);
+    }
+    uint16_t scan = touch_scan_time();
+    rep[31] = (uint8_t)(scan & 0xff), rep[32] = (uint8_t)(scan >> 8);
+    rep[33] = (uint8_t)count;
+
+    pthread_mutex_lock(&x->mu);
+    memcpy(x->touch_state, rep, sizeof rep);
+    if (!ep_in_running(x, x->touch_slot)) {
+        x->chead = x->ctail; /* nobody to deliver to: drop this and anything stale */
+        pthread_mutex_unlock(&x->mu);
+        return;
+    }
+    /* A backed-up queue only keeps the latest position of a frame that lands or lifts nothing. */
+    if (x->ctail != x->chead) {
+        uint8_t *prev = x->touch_reports[(x->ctail - 1) % HV_XHCI_REPORTS];
+        if (touch_same_set(prev, rep)) {
+            memcpy(prev, rep, sizeof rep);
+            pthread_mutex_unlock(&x->mu);
+            hv_machine_wake(x->m);
+            return;
+        }
+    }
+    if (x->ctail - x->chead >= HV_XHCI_REPORTS) x->chead++; /* guest stalled for good: keep the newest */
+    memcpy(x->touch_reports[x->ctail++ % HV_XHCI_REPORTS], rep, sizeof rep);
+    pthread_mutex_unlock(&x->mu);
+    hv_machine_wake(x->m);
+}
+
+int hv_xhci_touch_ready(HvXhci *x) {
+    if (!x) return 0;
+    pthread_mutex_lock(&x->mu);
+    int ready = ep_in_running(x, x->touch_slot);
+    pthread_mutex_unlock(&x->mu);
+    return ready;
+}
+
 static const uint8_t linux_to_hid[256] = {
     0x00, 0x29, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2d, 0x2e, 0x2a, 0x2b,
     0x14, 0x1a, 0x08, 0x15, 0x17, 0x1c, 0x18, 0x0c, 0x12, 0x13, 0x2f, 0x30, 0x28, 0xe0, 0x04, 0x16,
@@ -975,7 +1257,7 @@ void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down) {
 }
 
 void hv_xhci_poll(HvXhci *x) {
-    if (!x || (x->rhead == x->rtail && x->thead == x->ttail)) return;
+    if (!x || (x->rhead == x->rtail && x->thead == x->ttail && x->chead == x->ctail)) return;
     run_ep_in(x);
 }
 
