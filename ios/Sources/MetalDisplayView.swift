@@ -89,14 +89,16 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     }
 
     private func updateDrawableScale() {
-        let scale = window?.screen.scale ?? UIScreen.main.scale
+        // Off-window there is no display to match; didMoveToWindow runs this again on attach.
+        guard let window else { return }
+        let scale = window.screen.scale
         contentScaleFactor = scale
         metalLayer.contentsScale = scale
         let w = max(1.0, bounds.width * scale)
         let h = max(1.0, bounds.height * scale)
         metalLayer.drawableSize = CGSize(width: w, height: h)
-        if let winBounds = window?.bounds.size, winBounds.width > 0 {
-            WinIOSBridge.shared.updateScreenSize(winBounds, scale: scale)
+        if window.bounds.width > 0 {
+            WinIOSBridge.shared.updateScreenSize(window.bounds.size, scale: scale)
         }
     }
 

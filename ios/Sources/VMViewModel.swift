@@ -14,26 +14,10 @@ struct SafariSheet: UIViewControllerRepresentable {
     let url: URL
     func makeUIViewController(context: Context) -> SFSafariViewController {
         let vc = SFSafariViewController(url: url)
-        vc.preferredBarTintColor = UIColor(red: 0.045, green: 0.058, blue: 0.096, alpha: 1.0)
-        vc.preferredControlTintColor = UIColor(red: 0.82, green: 0.90, blue: 1.0, alpha: 1.0)
         vc.dismissButtonStyle = .done
         return vc
     }
     func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
-}
-
-enum PostureMode: String, CaseIterable {
-    case auto = "Auto"
-    case laptop = "Laptop"
-    case fullScreen = "Studio"
-
-    var iconName: String {
-        switch self {
-        case .auto: return "sparkles"
-        case .laptop: return "laptopcomputer"
-        case .fullScreen: return "ipad.landscape"
-        }
-    }
 }
 
 enum DeckLayout: String, CaseIterable {
@@ -71,6 +55,7 @@ final class VMViewModel: ObservableObject {
     @Published var fbHeight: UInt32 = 0
     @Published var presentedFrames: UInt64 = 0
     @Published var availableMemoryMB: UInt64 = 0
+    @Published var guestRAMMB: UInt64 = 0
 
     @Published var usbKeyboardReady: Bool = false
     @Published var usbTabletReady: Bool = false
@@ -82,7 +67,6 @@ final class VMViewModel: ObservableObject {
 
     @Published var postureMode: PostureMode = .auto
     @Published var deckLayout: DeckLayout = .split
-    @Published var controlBarVisible: Bool = true
     @Published var trackpadMode: Bool = false
     @Published var rightClickArmed: Bool = false
     @Published var systemKeyboardVisible: Bool = false
@@ -133,49 +117,30 @@ final class VMViewModel: ObservableObject {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
-    func isLaptopLayoutActive(for size: CGSize) -> Bool {
-        switch postureMode {
-        case .laptop:
-            return true
-        case .fullScreen:
-            return false
-        case .auto:
-            // Hardware hinge folded into laptop posture (partiallyOpen == 2, or live hinge angle 30°..166°)
-            if hingeStatusRaw == 2 {
-                return true
-            }
-            if let deg = hingeAngleDegrees {
-                return deg >= 30.0 && deg <= 166.0
-            }
-            // Fallback when UIHinge hasn't reported yet: portrait inner screen defaults to Laptop
-            let isUnfoldedInner = max(size.width, size.height) > 780 && min(size.width, size.height) > 580
-            if hingeStatusRaw == 0 && isUnfoldedInner && size.height > size.width {
-                return true
-            }
-            return false
-        }
+    var hingeStatus: HingeStatus {
+        HingeStatus(rawValue: hingeStatusRaw) ?? .unknown
     }
 
-    func updateHinge(statusRaw: Int, angleDegrees: Double?, viewportSize: CGSize) {
-        let wasPartiallyOpen = (hingeStatusRaw == 2)
+    /// Layout follows the fold's geometry (the system's division reserved region); the hinge
+    /// status only releases a manual choice and drives the haptic.
+    func isLaptopLayoutActive(fold: FoldGeometry?) -> Bool {
+        PostureResolver.isLaptop(mode: postureMode, fold: fold)
+    }
+
+    func updateHinge(statusRaw: Int, angleDegrees: Double?) {
+        let old = hingeStatus
         hingeStatusRaw = statusRaw
         hingeAngleDegrees = angleDegrees
-        if postureMode == .auto && statusRaw == 2 && !wasPartiallyOpen {
-            UIImpactFeedbackGenerator(style: .soft).impactOccurred()
-            SceneOrientationController.alignForLaptopPostureIfLandscape(size: viewportSize)
+        let new = hingeStatus
+        guard old != new else { return }
+        let resolved = PostureResolver.mode(postureMode, afterHingeChangeFrom: old, to: new)
+        if resolved != postureMode {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                postureMode = resolved
+            }
         }
-    }
-
-    func cyclePostureMode(viewportSize: CGSize) {
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        switch postureMode {
-        case .auto:
-            postureMode = .laptop
-            SceneOrientationController.alignForLaptopPostureIfLandscape(size: viewportSize)
-        case .laptop:
-            postureMode = .fullScreen
-        case .fullScreen:
-            postureMode = .auto
+        if postureMode == .auto && new == .partiallyOpen && old != .unknown {
+            UIImpactFeedbackGenerator(style: .soft).impactOccurred()
         }
     }
 
@@ -219,6 +184,7 @@ final class VMViewModel: ObservableObject {
         fbHeight = b.framebufferHeight
         presentedFrames = b.presentedFrames
         availableMemoryMB = b.availableMemoryMB
+        guestRAMMB = b.guestRAMMB
         usbKeyboardReady = b.usbKeyboardReady
         usbTabletReady = b.usbTabletReady
         usbEventsDelivered = b.usbEventsDelivered

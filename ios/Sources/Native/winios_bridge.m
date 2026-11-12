@@ -100,7 +100,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 - (void)configureAudioSessionAndMicPermission {
     AVAudioSession *session = [AVAudioSession sharedInstance];
     AVAudioSessionCategoryOptions opts = AVAudioSessionCategoryOptionDefaultToSpeaker |
-                                         AVAudioSessionCategoryOptionAllowBluetooth |
+                                         AVAudioSessionCategoryOptionAllowBluetoothHFP |
                                          AVAudioSessionCategoryOptionAllowBluetoothA2DP |
                                          AVAudioSessionCategoryOptionMixWithOthers;
     NSError *err = nil;
@@ -169,8 +169,6 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     winios_jit_install_trap_handler();
     [[UIApplication sharedApplication] setIdleTimerDisabled:YES];
     [self configureAudioSessionAndMicPermission];
-    UIScreen *mainScreen = [UIScreen mainScreen];
-    [self updateScreenSize:mainScreen.bounds.size scale:mainScreen.scale];
     [self notifyChanged];
 }
 
