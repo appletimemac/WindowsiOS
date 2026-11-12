@@ -621,6 +621,10 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     hv_winvm_request_display_size(width, height);
 }
 
+- (void)setLaptopPosture:(BOOL)laptop {
+    hv_winvm_set_posture(laptop ? 1 : 0);
+}
+
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel {
     if (!_vmRunning) return;
     hv_winvm_tablet(x, y, buttons, wheel);

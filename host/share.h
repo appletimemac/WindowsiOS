@@ -16,6 +16,9 @@ char *hv_share_take_clipboard(void);
 /* Seconds since the helper in macOS was last heard from, or -1 if it never has been. */
 long hv_share_agent_seen(void);
 
+/* The device's posture for the guest's tablet mode: 1 laptop, 0 tablet (the default). Served at GET /.henge/posture. */
+void hv_share_set_posture(int laptop);
+
 /* Enable/disable host SafariSheet handling of guest `/.henge/open-url` requests (0 -> guest falls back to Edge). */
 void hv_share_set_url_handler_enabled(int enabled);
 int hv_share_url_handler_enabled(void);

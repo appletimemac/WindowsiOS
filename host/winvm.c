@@ -424,6 +424,10 @@ void hv_winvm_power_button(void) {
     hv_winvirt_power_button(&board);
 }
 
+void hv_winvm_set_posture(int laptop) {
+    hv_share_set_posture(laptop);
+}
+
 void hv_winvm_key_hid(uint8_t usage, int down) {
     if (board.usb) hv_xhci_key(board.usb, usage, down);
 }

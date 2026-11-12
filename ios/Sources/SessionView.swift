@@ -66,6 +66,10 @@ struct SessionView: View {
                 fabItems(laptopActive: laptopActive)
             }
         }
+        // Windows' tablet posture follows the layout: the deck is the keyboard.
+        .onChange(of: laptopActive, initial: true) { _, laptop in
+            WinIOSBridge.shared.setLaptopPosture(laptop)
+        }
         .sheet(item: $vm.activeSafariURL) { item in
             SafariSheet(url: item.url)
                 .ignoresSafeArea()

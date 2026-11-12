@@ -59,6 +59,8 @@ typedef struct WinIOSTouchContact {
 @property (nonatomic, readonly) BOOL touchscreenReady;
 /// The size, in guest pixels, Windows should render at (virtio-gpu); ignored on ramfb.
 - (void)requestDisplayWidth:(uint32_t)width height:(uint32_t)height;
+/// Laptop deck showing (YES) or full-screen tablet (NO); Windows' slate indicator follows it.
+- (void)setLaptopPosture:(BOOL)laptop;
 - (void)sendKeyHid:(uint8_t)usage down:(BOOL)down;
 - (void)tapKeyHid:(uint8_t)usage;
 - (void)sendKeyComboWithModifiers:(NSArray<NSNumber *> *)modifiers key:(uint8_t)usage;

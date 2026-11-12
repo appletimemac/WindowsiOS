@@ -52,6 +52,9 @@ static time_t last_oauth_seen;
 static int guest_oauth_done;
 static int url_handler_enabled = -1;
 static time_t agent_seen;
+static int posture_laptop; /* atomic; 0 = tablet */
+
+void hv_share_set_posture(int laptop) { __atomic_store_n(&posture_laptop, laptop ? 1 : 0, __ATOMIC_RELAXED); }
 
 static int is_url_handler_on(void) {
     if (url_handler_enabled < 0) {
@@ -761,6 +764,11 @@ static int serve_henge(Conn *c, Request *r) {
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);
     }
     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r);
+    if (!strcmp(what, "posture") && !strcmp(r->method, "GET")) {
+        if (body_discard(c, r) != 0) return -1;
+        const char *text = __atomic_load_n(&posture_laptop, __ATOMIC_RELAXED) ? "laptop" : "tablet";
+        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n", text, strlen(text));
+    }
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
     if (!strcmp(what, "open-url") && (!strcmp(r->method, "PUT") || !strcmp(r->method, "POST"))) return open_url_put(c, r);

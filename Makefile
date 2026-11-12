@@ -106,7 +106,51 @@ $(IB)/libwinvm.a: $(IOS_OBJ)
 
 ios-lib: $(IB)/libwinvm.a
 
+# ---- freestanding Windows ARM64 guest tools: build/*.exe ----
+# Import libraries are made from the .def files generated below, one per DLL, listing every function
+# the tools import (a superset is harmless: only the functions a tool calls end up in its import table).
+WIN_LLVM = /opt/homebrew/opt/llvm/bin
+WIN_CC = $(WIN_LLVM)/clang --target=aarch64-pc-windows-msvc -ffreestanding -fno-builtin \
+         -fno-stack-protector -nostdlib -fuse-ld=lld -O2 -Wall -Wextra
+WL = $(B)/winlibs
+
+KERNEL32_IMPORTS = CloseHandle CreateFileW CreateMutexW CreateProcessW CreateThread \
+                   ExitProcess GetCommandLineW GetCurrentProcess GetFileAttributesW GetLastError \
+                   GetModuleFileNameW GetProcessHeap GetStdHandle GetTempPathW GetTickCount64 HeapAlloc \
+                   HeapFree MultiByteToWideChar Sleep WaitForMultipleObjects WideCharToMultiByte WriteFile
+ADVAPI32_IMPORTS = AdjustTokenPrivileges LookupPrivilegeValueW OpenProcessToken RegCloseKey RegCreateKeyExW \
+                   RegOpenKeyExW RegQueryValueExW RegSetValueExW
+WS2_32_IMPORTS = WSAStartup accept bind closesocket connect listen recv send setsockopt shutdown socket
+SETUPAPI_IMPORTS = SetupDiDestroyDeviceInfoList SetupDiEnumDeviceInterfaces SetupDiGetClassDevsW \
+                   SetupDiGetDeviceInterfaceDetailW
+
+empty :=
+space := $(empty) $(empty)
+define WINLIB
+$(WL)/$(1).def: Makefile | $(WL)
+	printf 'LIBRARY $(1).dll\nEXPORTS\n$(subst $(space),\n,$(2))\n' > $$@
+$(WL)/$(1).lib: $(WL)/$(1).def
+	$(WIN_LLVM)/llvm-dlltool -m arm64 -d $$< -l $$@
+endef
+$(eval $(call WINLIB,kernel32,$(KERNEL32_IMPORTS)))
+$(eval $(call WINLIB,advapi32,$(ADVAPI32_IMPORTS)))
+$(eval $(call WINLIB,ws2_32,$(WS2_32_IMPORTS)))
+$(eval $(call WINLIB,setupapi,$(SETUPAPI_IMPORTS)))
+
+$(WL):
+	mkdir -p $(WL)
+
+$(B)/opt_hive_arm64.exe: tools/opt_hive_arm64.c $(WL)/kernel32.lib $(WL)/advapi32.lib
+	$(WIN_CC) -Wl,/entry:mainCRTStartup -Wl,/subsystem:console $< $(WL)/kernel32.lib $(WL)/advapi32.lib -o $@
+$(B)/winios_browser_arm64.exe: tools/winios_browser_arm64.c $(WL)/kernel32.lib $(WL)/ws2_32.lib
+	$(WIN_CC) -Wl,/entry:WinMainCRTStartup -Wl,/subsystem:windows $< $(WL)/kernel32.lib $(WL)/ws2_32.lib -o $@
+$(B)/winios_agent_arm64.exe: tools/winios_agent_arm64.c $(WL)/kernel32.lib $(WL)/advapi32.lib $(WL)/ws2_32.lib $(WL)/setupapi.lib
+	$(WIN_CC) -Wl,/entry:WinMainCRTStartup -Wl,/subsystem:windows $< $(WL)/kernel32.lib $(WL)/advapi32.lib \
+	    $(WL)/ws2_32.lib $(WL)/setupapi.lib -o $@
+
+guest-tools: $(B)/winios_agent_arm64.exe $(B)/opt_hive_arm64.exe $(B)/winios_browser_arm64.exe
+
 clean:
 	rm -rf $(B)
 
-.PHONY: all test-core ios-lib clean
+.PHONY: all test-core ios-lib guest-tools clean

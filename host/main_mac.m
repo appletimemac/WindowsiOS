@@ -161,6 +161,8 @@ static void *cmd_file_thread(void *arg) {
             usleep(90000);
             c.tip = 0;
             hv_winvm_touch(&c, 1);
+        } else if (!strcmp(line, "posture laptop") || !strcmp(line, "posture tablet")) {
+            hv_winvm_set_posture(line[8] == 'l');
         } else if (!strcmp(line, "touchready")) {
             fprintf(stderr, "TOUCH_READY %d\n", hv_winvm_touch_ready());
         } else if (sscanf(line, "combo %i %i", &code, &yi) == 2) {
