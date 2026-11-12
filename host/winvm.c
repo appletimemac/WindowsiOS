@@ -2,6 +2,7 @@
 #include "winvm.h"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach_time.h>
 #include <TargetConditionals.h>
 #include <os/lock.h>
 #include <pthread.h>
@@ -142,6 +143,8 @@ int hv_winvm_save_png(const char *path) {
     return fb ? hv_fb_save_png(fb, path) : -1;
 }
 
+static void kicker_timer_hint(HvMachine *mm, uint64_t due);
+
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)
         return fail(err, errlen, "UEFI firmware (code.fd) and NVRAM (vars.fd) are required.");
@@ -178,6 +181,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
 
     m.log = c->log;
     m.stats_interval = c->stats_interval;
+    m.timer_hint = kicker_timer_hint;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1;
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK") != NULL;
@@ -212,16 +216,69 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     return 0;
 }
 
+/* The kicker makes running CPUs leave translated code: every KICK_PERIOD so CPU 0
+   keeps polling devices, and exactly when a CPU's guest timer falls due so timer
+   interrupts are not quantized to that period. mach_absolute_time runs at 24 MHz. */
+#if TARGET_OS_IPHONE
+#define KICK_PERIOD_TICKS 60000ull /* 2.5 ms */
+#else
+#define KICK_PERIOD_TICKS 24000ull /* 1 ms */
+#endif
+
+static pthread_mutex_t kick_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t kick_cv = PTHREAD_COND_INITIALIZER;
+/* The host time the kicker sleeps until, or 0 while it plans (not waiting). Written under kick_mu. */
+static _Atomic uint64_t kick_wake_at;
+
+static void kicker_timer_hint(HvMachine *mm, uint64_t due) {
+    (void)mm;
+    uint64_t w = atomic_load_explicit(&kick_wake_at, memory_order_acquire);
+    if (w && due >= w) return; /* the kicker wakes first and re-plans with this deadline */
+    /* Holding kick_mu orders this after the kicker's plan: it either waits already
+       (and this wakes it) or has not read timer_due yet. */
+    pthread_mutex_lock(&kick_mu);
+    pthread_cond_signal(&kick_cv);
+    pthread_mutex_unlock(&kick_mu);
+}
+
 static void *kicker_thread(void *unused) {
     (void)unused;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    uint64_t next_all = mach_absolute_time() + KICK_PERIOD_TICKS;
+    pthread_mutex_lock(&kick_mu);
     while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
-#if TARGET_OS_IPHONE
-        usleep(2500);
-#else
-        usleep(1000);
-#endif
-        hv_machine_kick_all(&m);
+        uint64_t now = mach_absolute_time();
+        uint64_t wake = next_all;
+        for (int i = 0; i < ncpus; i++) {
+            uint64_t due = __atomic_load_n(&cpus[i].timer_due, __ATOMIC_RELAXED);
+            if (due > now && due < wake) wake = due;
+        }
+        if (wake > now) {
+            atomic_store_explicit(&kick_wake_at, wake, memory_order_release);
+            uint64_t d = wake - now;
+            struct timespec ts = {(time_t)(d / 24000000), (long)(d % 24000000) * 1000 / 24};
+            pthread_cond_timedwait_relative_np(&kick_cv, &kick_mu, &ts);
+            atomic_store_explicit(&kick_wake_at, 0, memory_order_release);
+        }
+        now = mach_absolute_time();
+        if (now >= next_all) {
+            next_all = now + KICK_PERIOD_TICKS;
+            hv_machine_kick_all(&m);
+            continue;
+        }
+        /* A CPU parked in WFI keeps a stale deadline; kicking it only sets a flag, and
+           it times its own sleep. */
+        int kicked = 0;
+        for (int i = 0; i < ncpus; i++) {
+            uint64_t due = __atomic_load_n(&cpus[i].timer_due, __ATOMIC_RELAXED);
+            if (due && due <= now) {
+                __atomic_store_n(&cpus[i].exit_req, 1, __ATOMIC_SEQ_CST);
+                kicked = 1;
+            }
+        }
+        if (kicked) __asm__ volatile("sev" ::: "memory");
     }
+    pthread_mutex_unlock(&kick_mu);
     return NULL;
 }
 

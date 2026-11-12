@@ -213,6 +213,9 @@ typedef struct HvMachine {
        Returns the host time (mach_absolute_time units) of the next timer event, or 0. */
     uint64_t (*tick)(struct HvMachine *m, HvCpu *cpu);
     void *tick_opaque;
+    /* Optional: a running CPU armed its next timer event for host time `due`, so whoever
+       kicks running CPUs can do so on time instead of at its next fixed period. */
+    void (*timer_hint)(struct HvMachine *m, uint64_t due);
     /* GIC CPU interface system registers (ICC_*_EL1), reg = op0:op1:CRn:CRm:op2. */
     uint64_t (*icc_read)(struct HvMachine *m, HvCpu *cpu, uint32_t reg);
     void (*icc_write)(struct HvMachine *m, HvCpu *cpu, uint32_t reg, uint64_t v);
