@@ -232,7 +232,7 @@ private struct BootCard: View {
             VStack(spacing: 6) {
                 Text("Windows 11")
                     .font(.title2.weight(.semibold))
-                Text(vm.vmStatusText)
+                Text(vm.stikDebugStatus ?? vm.vmStatusText)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -244,7 +244,7 @@ private struct BootCard: View {
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                Label(vm.isJITLive ? "JIT enabled" : "JIT not enabled",
+                Label(vm.isJITLive ? "JIT enabled" : vm.jitStatusText,
                       systemImage: vm.isJITLive ? "bolt.fill" : "bolt.slash")
                 if vm.guestRAMMB > 0 {
                     Label("\(Self.size(megabytes: vm.guestRAMMB)) for Windows", systemImage: "memorychip")
