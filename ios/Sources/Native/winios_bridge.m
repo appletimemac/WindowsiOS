@@ -408,6 +408,10 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     NSString *codePath = [dir stringByAppendingPathComponent:@"code.fd"];
     NSString *varsPath = [dir stringByAppendingPathComponent:@"vars.fd"];
     NSString *diskPath = [dir stringByAppendingPathComponent:@"windows11.img"];
+    /* The "WindowsiOS Tools" disk (the posture agent and its installer for Windows) rides as the
+       second NVMe disk whenever it has been copied in. */
+    NSString *toolsImage = [dir stringByAppendingPathComponent:@"tools.img"];
+    const char *toolsPath = [[NSFileManager defaultManager] fileExistsAtPath:toolsImage] ? toolsImage.fileSystemRepresentation : NULL;
 
     _configuredRamMB = ramMB;
     _configuredCPUs = 4;
@@ -416,7 +420,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         .code_fd = codePath.fileSystemRepresentation,
         .vars_fd = varsPath.fileSystemRepresentation,
         .disk0 = diskPath.fileSystemRepresentation,
-        .disk1 = NULL,
+        .disk1 = toolsPath,
         .share_dir = sharedDir.fileSystemRepresentation,
         .share_sock = shareSock.fileSystemRepresentation,
         .ncpus = _configuredCPUs,
