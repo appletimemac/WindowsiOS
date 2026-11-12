@@ -44,6 +44,7 @@ typedef struct HvVirtio {
     uint32_t config_len;
     void (*notify)(struct HvVirtio *v, int q);
     void (*config_write)(struct HvVirtio *v, uint32_t off, uint64_t val, unsigned size);
+    void (*reset)(struct HvVirtio *v); /* the driver wrote status 0 (not called while the device is being created) */
     void *dev;
 } HvVirtio;
 
@@ -55,6 +56,9 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
 int hv_virtq_pop(HvVirtio *v, int q, HvVirtqElem *e);
 void hv_virtq_push(HvVirtio *v, int q, const HvVirtqElem *e, uint32_t written);
 void hv_virtio_interrupt(HvVirtio *v);
+/* The device config changed: bump the generation and, once the driver is running, raise a config-change interrupt.
+   Call with the device lock held. */
+void hv_virtio_config_changed(HvVirtio *v);
 
 /* Copy between an element's buffers and host memory, skipping `off` bytes of
    the readable (to) or writable (from) segments. Return bytes copied. */

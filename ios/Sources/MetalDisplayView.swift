@@ -18,6 +18,10 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     private var scrollAccum: CGFloat = 0
     private let tapHaptic = UIImpactFeedbackGenerator(style: .light)
 
+    private var pendingSizeRequest: DispatchWorkItem?
+    private var requestedGuestSize: CGSize = .zero
+    /// Guest pixels per point: on a 3x panel this is exactly 2 device pixels per Windows pixel.
+    private static let guestPixelsPerPoint: CGFloat = 1.5
     override init(frame: CGRect) {
         super.init(frame: frame)
         configure()
@@ -86,6 +90,24 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     override func layoutSubviews() {
         super.layoutSubviews()
         updateDrawableScale()
+        requestGuestSizeWhenSettled()
+    }
+
+    /// Ask the guest (virtio-gpu) to render at this view's shape, once the size stops changing,
+    /// so a fold or posture animation does not trigger a burst of Windows mode changes.
+    private func requestGuestSizeWhenSettled() {
+        let factor = Self.guestPixelsPerPoint
+        let target = CGSize(width: (bounds.width * factor / 2).rounded() * 2,
+                            height: (bounds.height * factor / 2).rounded() * 2)
+        guard target.width >= 640, target.height >= 480, target != requestedGuestSize else { return }
+        pendingSizeRequest?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.requestedGuestSize = target
+            WinIOSBridge.shared.requestDisplayWidth(UInt32(target.width), height: UInt32(target.height))
+        }
+        pendingSizeRequest = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     private func updateDrawableScale() {

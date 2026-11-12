@@ -13,7 +13,7 @@ ENGINE = $(CORE) $(HOST)
 
 DEV = $(B)/acpi.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B)/gicv3.o $(B)/hda.o \
       $(B)/nvme.o $(B)/pcie.o $(B)/pflash.o $(B)/pl011.o $(B)/pl031.o $(B)/pl061.o $(B)/timer.o \
-      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o \
+      $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_gpu.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o \
       $(B)/winvirt.o $(B)/xhci.o
 
 VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o
@@ -23,7 +23,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
                  -framework AudioToolbox
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-             $(B)/test_mmu $(B)/test_exc
+             $(B)/test_mmu $(B)/test_exc $(B)/test_virtio_gpu
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -56,6 +56,9 @@ $(B)/test_operands: tests/test_operands.c tests/operand_cases.s $(B)/operands.o
 	$(CC) $(CFLAGS) $^ -o $@
 $(B)/test_mmu: tests/test_mmu.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_mmu.c $(ENGINE) -o $@
+
+$(B)/test_virtio_gpu: tests/test_virtio_gpu.c $(ENGINE) $(B)/gicv3.o $(B)/pcie.o $(B)/virtio.o $(B)/virtio_gpu.o $(B)/fb_display.o $(B)/fw_cfg.o
+	$(CC) $(CFLAGS) tests/test_virtio_gpu.c $(ENGINE) $(B)/gicv3.o $(B)/pcie.o $(B)/virtio.o $(B)/virtio_gpu.o $(B)/fb_display.o $(B)/fw_cfg.o -o $@
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@

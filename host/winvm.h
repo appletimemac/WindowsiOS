@@ -40,6 +40,9 @@ void hv_winvm_set_display_layer(void *ca_metal_layer);
 int hv_winvm_display_size(uint32_t *w, uint32_t *h);
 uint64_t hv_winvm_display_frames(void);
 int hv_winvm_save_png(const char *path);
+/* The host window's size in pixels: the guest's virtio-gpu is told to render at it (clamped to even values in
+   640x480..3840x2160). Works before hv_winvm_create too (it is applied then). */
+void hv_winvm_request_display_size(uint32_t width, uint32_t height);
 
 /* Input hooks (any thread) */
 void hv_winvm_key_hid(uint8_t usage, int down);

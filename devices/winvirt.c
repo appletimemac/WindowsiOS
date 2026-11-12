@@ -194,7 +194,8 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
      *    Slot 2: NVMe 0      (1b36:0010, serial WIN11IOS01 -> matches UEFI Boot0001!)
      *    Slot 3: xHCI USB 3  (1b36:000d, Port 1 Keyboard + Port 2 Absolute Tablet)
      *    Slot 4: NVMe 1      (optional installer/secondary image)
-     *    Slot 5: VirtIO-Snd  (optional audio) */
+     *    Slot 5: VirtIO-Snd  (optional audio)
+     *    Next free slot after those (5, or 6 with the installer image): VirtIO-GPU (1af4:1050, INTx like the rest) */
     b->pcie = hv_pcie_create(m, b->gic, WINVIRT_PCIE_ECAM_PA, WINVIRT_PCIE_ECAM_SZ,
                              WINVIRT_PCIE_MMIO_PA, WINVIRT_PCIE_MMIO_SZ, WINVIRT_INTID_PCIE);
     hv_pcie_add_pio(b->pcie, WINVIRT_PCIE_PIO_PA, WINVIRT_PCIE_PIO_SZ);
@@ -207,6 +208,9 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
     if (disk0) b->nvme0 = hv_nvme_create(m, b->pcie, disk0, "WIN11IOS01");
     b->usb = hv_xhci_create(m, b->pcie);
     b->hda = hv_hda_create(m, b->pcie);
+    /* Off unless HV_VIRTIO_GPU is set: virtio-win's viogpudo bug-checks Windows on this board
+       (IRQL_NOT_LESS_OR_EQUAL seconds after it starts), so Windows stays on ramfb for now. */
+    if (getenv("HV_VIRTIO_GPU")) b->gpu = hv_virtio_gpu_create(m, b->pcie, b->fb);
     if (disk1) b->nvme1 = hv_nvme_create(m, b->pcie, disk1, "WIN11INST");
     (void)enable_sound;
 

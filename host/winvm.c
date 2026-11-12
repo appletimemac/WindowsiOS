@@ -145,6 +145,19 @@ int hv_winvm_save_png(const char *path) {
 
 static void kicker_timer_hint(HvMachine *mm, uint64_t due);
 
+static uint32_t pending_width, pending_height;
+
+void hv_winvm_request_display_size(uint32_t width, uint32_t height) {
+    os_unfair_lock_lock(&display_lock);
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    if (!fb) {
+        pending_width = width;
+        pending_height = height;
+    }
+    os_unfair_lock_unlock(&display_lock);
+    if (fb) hv_fb_display_request_size(fb, width, height);
+}
+
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)
         return fail(err, errlen, "UEFI firmware (code.fd) and NVRAM (vars.fd) are required.");
@@ -211,7 +224,9 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     os_unfair_lock_lock(&display_lock);
     if (display_layer_set && board.fb) hv_fb_metal_set_layer(board.fb, (void *)display_layer);
     atomic_store_explicit(&display_fb, board.fb, memory_order_release);
+    uint32_t want_w = pending_width, want_h = pending_height;
     os_unfair_lock_unlock(&display_lock);
+    if (want_w && board.fb) hv_fb_display_request_size(board.fb, want_w, want_h);
 
     return 0;
 }
@@ -360,6 +375,7 @@ int hv_winvm_run_cpu0(void) {
                 board.flash1->status = 0x80;
             }
             if (board.fb) board.fb->active = 0;
+            if (board.gpu) hv_virtio_gpu_reset(board.gpu); /* the scanout must not outlive the guest that set it */
             hv_winvirt_reset_cpu(&board);
             m.flush_pending = 1;
             spawn_secondaries();

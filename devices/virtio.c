@@ -39,6 +39,7 @@ static void reset(HvVirtio *v) {
     v->qsel = 0;
     for (int i = 0; i < v->nq; i++) v->q[i] = (HvVirtq){.size = HV_VIRTQ_MAX_SIZE};
     hv_pci_set_intx(&v->pci, 0);
+    if (v->reset) v->reset(v);
 }
 
 static uint64_t common_read(HvVirtio *v, uint64_t off) {
@@ -163,6 +164,14 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
 
 void hv_virtio_interrupt(HvVirtio *v) {
     v->isr |= 1;
+    hv_pci_set_intx(&v->pci, 1);
+}
+
+void hv_virtio_config_changed(HvVirtio *v) {
+    v->config_gen++;
+    /* Before DRIVER_OK nobody services the line, and INTx is shared: an interrupt nobody reads would keep it asserted. */
+    if (!(v->status & 4)) return;
+    v->isr |= 2;
     hv_pci_set_intx(&v->pci, 1);
 }
 

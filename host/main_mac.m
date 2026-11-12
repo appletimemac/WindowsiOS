@@ -120,7 +120,7 @@ static void *cmd_file_thread(void *arg) {
         if (!line[0] || line[0] == '#') continue;
 
         double xn = 0, yn = 0;
-        int code = 0;
+        int code = 0, yi = 0;
         if (sscanf(line, "click %lf %lf", &xn, &yn) == 2) {
             hv_winvm_tablet(xn, yn, 0, 0);
             usleep(40000);
@@ -155,6 +155,8 @@ static void *cmd_file_thread(void *arg) {
             hv_winvm_key_hid(0x28, 1);
             usleep(50000);
             hv_winvm_key_hid(0x28, 0);
+        } else if (sscanf(line, "size %d %d", &code, &yi) == 2 && code > 0 && yi > 0) {
+            hv_winvm_request_display_size((uint32_t)code, (uint32_t)yi);
         } else if (!strcmp(line, "cad")) {
             hv_winvm_send_ctrl_alt_del();
         } else if (!strcmp(line, "power")) {
@@ -415,6 +417,7 @@ static void *timer_thread(void *arg) {
 
     [_view layoutSubtreeIfNeeded];
     hv_winvm_set_display_layer((__bridge void *)_view.metalLayer);
+    [self requestGuestSize];
 
     /* Menu bar shortcuts for Windows actions */
     NSMenu *menubar = [[NSMenu alloc] init];
@@ -443,6 +446,30 @@ static void *timer_thread(void *arg) {
     }];
 }
 
+/* The guest's virtio-gpu renders at the window's size in pixels. */
+- (void)requestGuestSize {
+    CGFloat scale = _window.backingScaleFactor > 0 ? _window.backingScaleFactor : 2.0;
+    NSSize size = _view.bounds.size;
+    long w = lround(size.width * scale), h = lround(size.height * scale);
+    if (w > 0 && h > 0) hv_winvm_request_display_size((uint32_t)w, (uint32_t)h);
+}
+
+/* A live resize reports every frame of the drag; the guest changes mode once it settles. */
+- (void)scheduleGuestSizeRequest {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(requestGuestSize) object:nil];
+    [self performSelector:@selector(requestGuestSize) withObject:nil afterDelay:0.25];
+}
+
+- (void)windowDidResize:(NSNotification *)notification {
+    (void)notification;
+    [self scheduleGuestSizeRequest];
+}
+
+- (void)windowDidChangeBackingProperties:(NSNotification *)notification {
+    (void)notification;
+    [self scheduleGuestSizeRequest];
+}
+
 - (void)sendCAD:(id)sender {
     (void)sender;
     hv_winvm_send_ctrl_alt_del();
@@ -456,6 +483,7 @@ static void *timer_thread(void *arg) {
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;
     [_statusTimer invalidate];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(requestGuestSize) object:nil];
     hv_winvm_set_display_layer(NULL);
     hv_winvm_stop();
     [NSApp terminate:nil];

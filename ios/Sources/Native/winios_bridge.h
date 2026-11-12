@@ -45,6 +45,8 @@ typedef void (^WinIOSStateCallback)(void);
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees;
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel;
+/// The size, in guest pixels, Windows should render at (virtio-gpu); ignored on ramfb.
+- (void)requestDisplayWidth:(uint32_t)width height:(uint32_t)height;
 - (void)sendKeyHid:(uint8_t)usage down:(BOOL)down;
 - (void)tapKeyHid:(uint8_t)usage;
 - (void)sendKeyComboWithModifiers:(NSArray<NSNumber *> *)modifiers key:(uint8_t)usage;
