@@ -2,7 +2,7 @@
 """
 End-to-end post-OOBE verification, sparse packing, iPhone Duo staging/transfer,
 TXM JIT + 4096 MiB RAM launch, and live Windows 11 Pro 24H2 ARM64 Desktop capture
-on Ammaar's physical foldable iPhone Duo (00008160-000E05D036C0000A).
+on Alan's physical foldable iPhone Duo ($WINIOS_DUO_UDID or ~/.config/windowsios/duo-udid).
 """
 
 import os
@@ -19,8 +19,17 @@ WINVM = ROOT / "build" / "winvm"
 HVSPARSE = ROOT / "build" / "hvsparse"
 LAUNCH_DUO = ROOT / "scripts" / "launch_on_duo.sh"
 
-UDID = "00008160-000E05D036C0000A"
-BUNDLE_ID = "me.ammaar.windowsios"
+def configured_duo_udid() -> str:
+    """$WINIOS_DUO_UDID, else ~/.config/windowsios/duo-udid; kept out of the repo."""
+    udid = os.environ.get("WINIOS_DUO_UDID", "").strip()
+    if not udid:
+        cfg = Path.home() / ".config" / "windowsios" / "duo-udid"
+        udid = cfg.read_text().strip() if cfg.exists() else ""
+    return udid
+
+
+UDID = configured_duo_udid() or sys.exit("set WINIOS_DUO_UDID or write it to ~/.config/windowsios/duo-udid")
+BUNDLE_ID = "com.RRGSyndicate.WindowsiOS"
 
 CODE_FD = WORK / "code.fd"
 VARS_CLEAN = WORK / "vars_clean.fd"
@@ -335,7 +344,7 @@ def launch_and_verify_on_duo():
         if is_desk:
             desktop_hits += 1
             if desktop_hits >= 4:
-                log("SUCCESS: Live Windows 11 Pro 24H2 ARM64 Desktop confirmed on Ammaar's iPhone Duo!")
+                log("SUCCESS: Live Windows 11 Pro 24H2 ARM64 Desktop confirmed on Alan's iPhone Duo!")
                 return
 
         if elapsed > 1800:

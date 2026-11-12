@@ -1,16 +1,15 @@
 name: WindowsiOS
 options:
-  bundleIdPrefix: me.ammaar
+  bundleIdPrefix: com.RRGSyndicate
   deploymentTarget:
     iOS: "17.0"
   xcodeVersion: "16.0"
 
 settings:
   base:
-    DEVELOPMENT_TEAM: 7S264298H8
-    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: 6SD7AF9K8B
+    CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "Apple Development"
-    PROVISIONING_PROFILE_SPECIFIER: "WindowsiOS Duo Dev"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     TARGETED_DEVICE_FAMILY: "1,2"
     SWIFT_VERSION: "5.0"
@@ -56,11 +55,8 @@ targets:
         get-task-allow: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: me.ammaar.windowsios
+        PRODUCT_BUNDLE_IDENTIFIER: com.RRGSyndicate.WindowsiOS
         PRODUCT_NAME: WindowsiOS
-        CODE_SIGN_STYLE: Manual
-        CODE_SIGN_IDENTITY: "Apple Development: Ammaar Reshi (6U8W89GC8D)"
-        PROVISIONING_PROFILE_SPECIFIER: "WindowsiOS Duo Dev"
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_OBJC_BRIDGING_HEADER: $(PROJECT_DIR)/Sources/Native/WindowsiOS-Bridging-Header.h
         HEADER_SEARCH_PATHS:
