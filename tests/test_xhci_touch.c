@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "machine.h"
 #include "pcie.h"
@@ -677,6 +678,80 @@ static void test_touch_queue(void) {
     drain();
 }
 
+/* Windows times press-and-hold (its touch right-click) off the digitizer's report stream, so a finger
+   resting still must keep being reported at the scan rate, not only when the host sends a new frame. */
+static void test_touch_hold(void) {
+    int slot = x->touch_slot;
+    int first = in_next;
+    HvTouchContact press[1] = {tc(0, 1, 16000, 12000)};
+    hv_xhci_touch(x, press, 1);
+    post_in(slot, 4);
+    hv_xhci_poll(x);
+    check("press delivered", host(IN_BUF(first))[0], 1);
+
+    usleep(15000);
+    hv_xhci_poll(x);
+    const uint8_t *again = host(IN_BUF(first + 1));
+    check("a resting finger is reported again", again[0], 1);
+    check("repeat keeps the tip down", contact_field(again, 0, 0x0d, 0x42), 1);
+    check("repeat keeps the position", contact_field(again, 0, 0x01, 0x30), 16000);
+    const Field *scan = find_field(0, 1, 0x0d, 0x56, 0);
+    uint32_t s0 = field_value(host(IN_BUF(first)), scan), s1 = field_value(again, scan);
+    check("repeat carries a later scan time", s1 != s0 && ((s1 - s0) & 0xffff) < 0x8000, 1);
+
+    usleep(15000);
+    hv_xhci_poll(x);
+    check("and again while it rests", host(IN_BUF(first + 2))[0], 1);
+
+    HvTouchContact lift[1] = {tc(0, 0, 16000, 12000)};
+    hv_xhci_touch(x, lift, 1);
+    hv_xhci_poll(x);
+    check("lift delivered", contact_field(host(IN_BUF(first + 3)), 0, 0x0d, 0x42), 0);
+    usleep(15000);
+    post_in(slot, 1);
+    hv_xhci_poll(x);
+    check("nothing repeats after the lift", host(IN_BUF(first + 4))[0], 0);
+
+    /* Two fingers, one lifts: the lift goes out once and repeats carry only the finger still down. */
+    int k = first + 4; /* the buffer posted for "nothing repeats after the lift" is still waiting */
+    HvTouchContact two[2] = {tc(0, 1, 1000, 1000), tc(1, 1, 2000, 2000)};
+    HvTouchContact partial[2] = {tc(0, 1, 1000, 1000), tc(1, 0, 2000, 2000)};
+    hv_xhci_touch(x, two, 2);
+    hv_xhci_touch(x, partial, 2);
+    post_in(slot, 2);
+    hv_xhci_poll(x);
+    check("partial lift delivered", contact_field(host(IN_BUF(k + 1)), 1, 0x0d, 0x42), 0);
+    usleep(15000);
+    hv_xhci_poll(x);
+    const uint8_t *rest = host(IN_BUF(k + 2));
+    check("repeat after a partial lift has one contact", field_value(rest, find_field(0, 1, 0x0d, 0x54, 0)), 1);
+    check("that contact is the finger still down", contact_field(rest, 0, 0x0d, 0x51), 0);
+    check("and its tip is down", contact_field(rest, 0, 0x0d, 0x42), 1);
+
+    /* A halted controller manufactures nothing. */
+    mmio_w(OP, 4, 4);
+    usleep(15000);
+    hv_xhci_poll(x);
+    check("no repeat while the controller is halted", queued(), 0);
+    mmio_w(OP, 1 | 4, 4);
+    HvTouchContact up[1] = {tc(0, 0, 1000, 1000)};
+    hv_xhci_touch(x, up, 1);
+    post_in(slot, 1);
+    hv_xhci_poll(x);
+    drain();
+
+    /* A finger held while the endpoint stops is not replayed when it comes back. */
+    hv_xhci_touch(x, press, 1);
+    hv_xhci_poll(x);
+    check("stop endpoint while held", (uint64_t)run_cmd(TRB_STOP_EP, slot, 0, 3u << 16, NULL), CC_SUCCESS);
+    int after = in_next;
+    usleep(15000);
+    post_in(slot, 1);
+    hv_xhci_poll(x);
+    check("a hold does not survive an endpoint stop", host(IN_BUF(after))[0], 0);
+    drain();
+}
+
 int main(void) {
     if (hv_machine_init(&m, 4 << 20) != 0) return 1;
     mem = aligned_alloc(4096, MEM_SIZE);
@@ -709,6 +784,9 @@ int main(void) {
     test_get_set_report();
     printf("== touch queue\n");
     test_touch_queue();
+
+    printf("== touch hold\n");
+    test_touch_hold();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

@@ -69,6 +69,7 @@ typedef struct HvXhci {
     uint8_t touch_reports[HV_XHCI_REPORTS][HV_TOUCH_REPORT_LEN];
     uint32_t chead, ctail;
     uint8_t touch_state[HV_TOUCH_REPORT_LEN];
+    uint64_t touch_last_ns; /* atomic; when the last touch report was queued (CLOCK_MONOTONIC) */
     uint8_t touch_mode;  /* Device Configuration feature: Input Mode (0 mouse, 1 single, 2 multiple input) */
     uint8_t touch_index; /* Device Configuration feature: Device Index */
 

@@ -163,6 +163,18 @@ static void *cmd_file_thread(void *arg) {
             hv_winvm_touch(&c, 1);
         } else if (!strcmp(line, "posture laptop") || !strcmp(line, "posture tablet")) {
             hv_winvm_set_posture(line[8] == 'l');
+        } else if ((sscanf(line, "press %lf %lf %d", &xn, &yn, &code) == 3 ||
+                    sscanf(line, "pressrepeat %lf %lf %d", &xn, &yn, &code) == 3) && code > 0) {
+            /* Touch and hold for code ms; "pressrepeat" re-sends the held frame every 20 ms. */
+            HvTouchContact c = {.id = 0, .tip = 1, .x = (uint16_t)(xn * 32767.0), .y = (uint16_t)(yn * 32767.0)};
+            int repeat = !strncmp(line, "pressrepeat", 11);
+            hv_winvm_touch(&c, 1);
+            for (int t = 0; t < code; t += 20) {
+                usleep(20000);
+                if (repeat) hv_winvm_touch(&c, 1);
+            }
+            c.tip = 0;
+            hv_winvm_touch(&c, 1);
         } else if (!strcmp(line, "touchready")) {
             fprintf(stderr, "TOUCH_READY %d\n", hv_winvm_touch_ready());
         } else if (sscanf(line, "combo %i %i", &code, &yi) == 2) {

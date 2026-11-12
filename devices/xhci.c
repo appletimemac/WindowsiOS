@@ -687,11 +687,19 @@ static void run_ep_in(HvXhci *x) {
 }
 
 /* An endpoint stops running: whatever is queued for the touchscreen is stale by the time it restarts. */
+/* No finger is down: nothing to repeat. Caller holds x->mu. */
+static void touch_clear_held(HvXhci *x) {
+    memset(x->touch_state, 0, sizeof x->touch_state);
+    x->touch_state[0] = TOUCH_REPORT_ID;
+    __atomic_store_n(&x->touch_last_ns, 0, __ATOMIC_RELAXED);
+}
+
 static void ep_stop(HvXhci *x, int slot, int dci) {
     x->slots[slot].ep_running[dci] = 0;
     if (slot == x->touch_slot && dci == HID_DCI_IN) {
         pthread_mutex_lock(&x->mu);
         x->chead = x->ctail;
+        touch_clear_held(x); /* nor is a resting finger repeated when it restarts */
         pthread_mutex_unlock(&x->mu);
     }
 }
@@ -935,8 +943,7 @@ static void reset(HvXhci *x) {
     x->touch_slot = 0;
     pthread_mutex_lock(&x->mu);
     x->chead = x->ctail = 0;
-    memset(x->touch_state, 0, sizeof x->touch_state);
-    x->touch_state[0] = TOUCH_REPORT_ID;
+    touch_clear_held(x);
     x->touch_mode = TOUCH_INPUT_MULTI;
     x->touch_index = 0;
     pthread_mutex_unlock(&x->mu);
@@ -1164,12 +1171,28 @@ void hv_xhci_tablet(HvXhci *x, int abs_x, int abs_y, uint8_t buttons, int8_t whe
     hv_machine_wake(x->m);
 }
 
-/* Scan Time: a monotonic clock in 100 us units, wrapping at 16 bits like the report field. */
-static uint16_t touch_scan_time(void) {
+/* What repeats are made from: the contacts still down, so a lift goes out exactly once. Caller holds x->mu. */
+static void touch_set_held(HvXhci *x, const uint8_t *rep, uint64_t now) {
+    uint8_t held[HV_TOUCH_REPORT_LEN] = {TOUCH_REPORT_ID};
+    int n = 0;
+    for (int i = 0; i < rep[HV_TOUCH_REPORT_LEN - 1] && i < HV_TOUCH_MAX_CONTACTS; i++) {
+        if (rep[1 + 6 * i] & 1) memcpy(held + 1 + 6 * n++, rep + 1 + 6 * i, 6);
+    }
+    held[31] = rep[31], held[32] = rep[32];
+    held[HV_TOUCH_REPORT_LEN - 1] = (uint8_t)n;
+    memcpy(x->touch_state, held, sizeof held);
+    __atomic_store_n(&x->touch_last_ns, n ? now : 0, __ATOMIC_RELAXED);
+}
+
+static uint64_t touch_now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-    return (uint16_t)(ns / 100000ull);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* Scan Time: a monotonic clock in 100 us units, wrapping at 16 bits like the report field. */
+static uint16_t touch_scan_time(void) {
+    return (uint16_t)(touch_now_ns() / 100000ull);
 }
 
 /* 1 when b only moves the contacts of a: same count, ids and tip/confidence bits (so no contact lands or lifts). */
@@ -1198,17 +1221,20 @@ void hv_xhci_touch(HvXhci *x, const HvTouchContact *contacts, int count) {
         c[2] = (uint8_t)(cx & 0xff), c[3] = (uint8_t)(cx >> 8);
         c[4] = (uint8_t)(cy & 0xff), c[5] = (uint8_t)(cy >> 8);
     }
-    uint16_t scan = touch_scan_time();
-    rep[31] = (uint8_t)(scan & 0xff), rep[32] = (uint8_t)(scan >> 8);
     rep[33] = (uint8_t)count;
 
     pthread_mutex_lock(&x->mu);
-    memcpy(x->touch_state, rep, sizeof rep);
     if (!ep_in_running(x, x->touch_slot)) {
         x->chead = x->ctail; /* nobody to deliver to: drop this and anything stale */
+        touch_clear_held(x);
         pthread_mutex_unlock(&x->mu);
         return;
     }
+    /* Stamped under mu, so a repeat queued meanwhile cannot carry a later scan time. */
+    uint64_t now = touch_now_ns();
+    uint16_t scan = (uint16_t)(now / 100000ull);
+    rep[31] = (uint8_t)(scan & 0xff), rep[32] = (uint8_t)(scan >> 8);
+    touch_set_held(x, rep, now);
     /* A backed-up queue only keeps the latest position of a frame that lands or lifts nothing. */
     if (x->ctail != x->chead) {
         uint8_t *prev = x->touch_reports[(x->ctail - 1) % HV_XHCI_REPORTS];
@@ -1223,6 +1249,27 @@ void hv_xhci_touch(HvXhci *x, const HvTouchContact *contacts, int count) {
     memcpy(x->touch_reports[x->ctail++ % HV_XHCI_REPORTS], rep, sizeof rep);
     pthread_mutex_unlock(&x->mu);
     hv_machine_wake(x->m);
+}
+
+/* A real digitizer reports a resting finger at its scan rate, and Windows times press-and-hold (its
+   touch right-click) off that stream: while a contact is down and nothing new is queued, the last
+   frame goes out again every TOUCH_REPEAT_NS with a fresh scan time. */
+#define TOUCH_REPEAT_NS 10000000ull
+
+static void touch_repeat_held(HvXhci *x) {
+    uint64_t last = __atomic_load_n(&x->touch_last_ns, __ATOMIC_RELAXED);
+    if (!last) return; /* nothing held: no clock read and no lock on every tick */
+    uint64_t now = touch_now_ns();
+    if (now - last < TOUCH_REPEAT_NS) return;
+    pthread_mutex_lock(&x->mu);
+    if (x->touch_last_ns && now - x->touch_last_ns >= TOUCH_REPEAT_NS && x->chead == x->ctail &&
+        (x->usbcmd & 1) && ep_in_running(x, x->touch_slot)) {
+        uint16_t scan = touch_scan_time();
+        x->touch_state[31] = (uint8_t)(scan & 0xff), x->touch_state[32] = (uint8_t)(scan >> 8);
+        memcpy(x->touch_reports[x->ctail++ % HV_XHCI_REPORTS], x->touch_state, HV_TOUCH_REPORT_LEN);
+        __atomic_store_n(&x->touch_last_ns, now, __ATOMIC_RELAXED);
+    }
+    pthread_mutex_unlock(&x->mu);
 }
 
 int hv_xhci_touch_ready(HvXhci *x) {
@@ -1257,7 +1304,9 @@ void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down) {
 }
 
 void hv_xhci_poll(HvXhci *x) {
-    if (!x || (x->rhead == x->rtail && x->thead == x->ttail && x->chead == x->ctail)) return;
+    if (!x) return;
+    touch_repeat_held(x);
+    if (x->rhead == x->rtail && x->thead == x->ttail && x->chead == x->ctail) return;
     run_ep_in(x);
 }
 
