@@ -12,6 +12,9 @@
  * It must run elevated: the indicator device's ACL gives administrators write access only through an
  * elevated token, so a normal-token copy fails CreateFile with error 5 (logged to %TEMP%\winios_agent.log).
  * That is why the installer registers it as a scheduled task with highest privileges.
+ *
+ * It also asks `GET http://10.0.2.4/.henge/power` each round; "hibernate" (the app's Hibernate action, answered
+ * once) runs shutdown /h, so Windows saves its session and powers off, and the next boot resumes it.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -103,6 +106,26 @@ __declspec(dllimport) HANDLE GetProcessHeap(void);
 __declspec(dllimport) void  *HeapAlloc(HANDLE hHeap, DWORD dwFlags, size_t dwBytes);
 __declspec(dllimport) BOOL   HeapFree(HANDLE hHeap, DWORD dwFlags, void *lpMem);
 __declspec(dllimport) void   ExitProcess(DWORD uExitCode);
+
+typedef struct {
+    DWORD    cb;
+    WCHAR   *lpReserved, *lpDesktop, *lpTitle;
+    DWORD    dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+    uint16_t wShowWindow, cbReserved2;
+    uint8_t *lpReserved2;
+    HANDLE   hStdInput, hStdOutput, hStdError;
+} StartupInfoW;
+typedef struct {
+    HANDLE hProcess, hThread;
+    DWORD  dwProcessId, dwThreadId;
+} ProcessInformation;
+_Static_assert(sizeof(StartupInfoW) == 104, "STARTUPINFOW on 64-bit Windows");
+_Static_assert(sizeof(ProcessInformation) == 24, "PROCESS_INFORMATION on 64-bit Windows");
+#define CREATE_NO_WINDOW 0x08000000U
+__declspec(dllimport) BOOL CreateProcessW(const WCHAR *lpApplicationName, WCHAR *lpCommandLine, void *lpProcessAttributes,
+                                          void *lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags,
+                                          void *lpEnvironment, const WCHAR *lpCurrentDirectory,
+                                          StartupInfoW *lpStartupInfo, ProcessInformation *lpProcessInformation);
 
 /* advapi32.dll */
 __declspec(dllimport) LONG RegOpenKeyExW(HKEY hKey, const WCHAR *lpSubKey, DWORD ulOptions,
@@ -197,9 +220,9 @@ static int send_all(SOCKET s, const char *buf, int len) {
     return 0;
 }
 
-/* GET /.henge/posture from the host share. 1 laptop, 0 tablet, -1 if the share can't be reached yet
-   or answers anything else. The host closes the connection after the reply. */
-static int fetch_posture(void) {
+/* GET http://10.0.2.4<path>. Returns the body length (the body is copied to body, NUL-terminated) or -1 if the
+   share can't be reached yet or does not answer 200. The host closes the connection after the reply. */
+static int share_get(const char *req, int req_len, char *body, int body_cap) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return -1;
 
@@ -216,10 +239,7 @@ static int fetch_posture(void) {
         closesocket(s);
         return -1;
     }
-
-    static const char req[] =
-        "GET /.henge/posture HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n";
-    if (send_all(s, req, (int)sizeof(req) - 1) != 0) {
+    if (send_all(s, req, req_len) != 0) {
         closesocket(s);
         return -1;
     }
@@ -240,16 +260,58 @@ static int fetch_posture(void) {
     if (sp + 4 > have || resp[sp + 1] != '2' || resp[sp + 2] != '0' || resp[sp + 3] != '0') return -1;
     for (int i = 0; i + 4 <= have; i++) {
         if (resp[i] == '\r' && resp[i + 1] == '\n' && resp[i + 2] == '\r' && resp[i + 3] == '\n') {
-            const char *body = resp + i + 4;
             int left = have - (i + 4);
-            if (left >= 6 && body[0] == 'l' && body[1] == 'a' && body[2] == 'p' && body[3] == 't' &&
-                body[4] == 'o' && body[5] == 'p') return 1;
-            if (left >= 6 && body[0] == 't' && body[1] == 'a' && body[2] == 'b' && body[3] == 'l' &&
-                body[4] == 'e' && body[5] == 't') return 0;
-            return -1;
+            if (left > body_cap - 1) left = body_cap - 1;
+            for (int k = 0; k < left; k++) body[k] = resp[i + 4 + k];
+            body[left] = 0;
+            return left;
         }
     }
     return -1;
+}
+
+static int starts_with(const char *s, int len, const char *word) {
+    int n = (int)str_len(word);
+    if (len < n) return 0;
+    for (int i = 0; i < n; i++)
+        if (s[i] != word[i]) return 0;
+    return 1;
+}
+
+/* 1 laptop, 0 tablet, -1 if the share can't be reached yet or answers anything else. */
+static int fetch_posture(void) {
+    static const char req[] = "GET /.henge/posture HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n";
+    char body[64];
+    int n = share_get(req, (int)sizeof(req) - 1, body, (int)sizeof(body));
+    if (starts_with(body, n, "laptop")) return 1;
+    if (starts_with(body, n, "tablet")) return 0;
+    return -1;
+}
+
+/* 1 when the app asked Windows to hibernate (the host answers that once), else 0. */
+static int fetch_hibernate(void) {
+    static const char req[] = "GET /.henge/power HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n";
+    char body[64];
+    int n = share_get(req, (int)sizeof(req) - 1, body, (int)sizeof(body));
+    return starts_with(body, n, "hibernate");
+}
+
+static void hibernate(void) {
+    WCHAR cmd[] = u"C:\\Windows\\System32\\shutdown.exe /h";
+    StartupInfoW si;
+    ProcessInformation pi;
+    mem_zero(&si, sizeof(si));
+    mem_zero(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, 0, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        char num[16];
+        u32_to_dec(GetLastError(), num);
+        log_line("hibernate_failed ", num);
+        return;
+    }
+    log_line("hibernate", "");
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
 }
 
 /* ConvertibleSlateMode as Windows sees it: 1 laptop, 0 slate. The value is absent until the driver
@@ -354,6 +416,7 @@ void WinMainCRTStartup(void) {
         } else {
             if (!share_up) log_line(want ? "share_up posture=laptop" : "share_up posture=tablet", "");
             share_up = 1;
+            if (fetch_hibernate()) hibernate();
 
             int have = read_slate_mode();
             uint64_t now = GetTickCount64();

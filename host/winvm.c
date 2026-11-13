@@ -209,6 +209,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
 
     share_on = 0;
     if (c->share_dir && *c->share_dir && c->share_sock && *c->share_sock) {
+        hv_share_clear_hibernate();
         if (hv_share_start(c->share_dir, c->share_sock, NULL) == 0) {
             hv_net_set_share_socket(c->share_sock);
             share_on = 1;
@@ -431,6 +432,10 @@ void hv_winvm_stop(void) {
 
 void hv_winvm_power_button(void) {
     hv_winvirt_power_button(&board);
+}
+
+void hv_winvm_request_hibernate(void) {
+    hv_share_request_hibernate();
 }
 
 void hv_winvm_set_posture(int laptop) {

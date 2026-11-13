@@ -18,6 +18,10 @@ long hv_share_agent_seen(void);
 
 /* The device's posture for the guest's tablet mode: 1 laptop, 0 tablet (the default). Served at GET /.henge/posture. */
 void hv_share_set_posture(int laptop);
+/* Ask Windows to hibernate: the WindowsiOS Tools agent picks it up within a second and runs shutdown /h. */
+void hv_share_request_hibernate(void);
+/* Forget an untaken request (a new VM is starting). */
+void hv_share_clear_hibernate(void);
 
 /* Enable/disable host SafariSheet handling of guest `/.henge/open-url` requests (0 -> guest falls back to Edge). */
 void hv_share_set_url_handler_enabled(int enabled);

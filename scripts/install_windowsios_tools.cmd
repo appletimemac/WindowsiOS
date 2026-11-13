@@ -36,6 +36,7 @@ call :step_files
 call :step_task
 call :step_settings
 call :step_updates
+call :step_hibernate
 goto :summary
 
 :fail
@@ -44,7 +45,7 @@ echo   FAILED: %~1
 exit /b
 
 :step_files
-echo [1/4] Program files in %DEST%
+echo [1/5] Program files in %DEST%
 if not exist "%DEST%" mkdir "%DEST%"
 schtasks /end /tn "%TASK%" >nul 2>&1
 taskkill /f /im WinIOSAgent.exe >nul 2>&1
@@ -58,7 +59,7 @@ if errorlevel 1 call :fail "could not copy %~2"
 exit /b
 
 :step_task
-echo [2/4] Posture agent (scheduled task "%TASK%")
+echo [2/5] Posture agent (scheduled task "%TASK%")
 schtasks /create /f /sc onlogon /rl highest /tn "%TASK%" /tr "\"%DEST%\WinIOSAgent.exe\"" >nul
 if not errorlevel 1 goto :task_ok
 call :fail "schtasks /create failed"
@@ -71,16 +72,31 @@ if errorlevel 1 call :fail "could not start the agent now, it starts at next sig
 exit /b
 
 :step_settings
-echo [3/4] Tablet mode
+echo [3/5] Tablet mode
 call :regdword "HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl" ConvertibilityEnabled 1
 exit /b
 :step_updates
-echo [4/4] Windows Update on demand
+echo [4/5] Windows Update on demand
 rem The image's optimizer disabled these services. Manual start lets Settings check for and
 rem install updates when asked, while the NoAutoUpdate policy keeps it from running on its own.
 call :svc_manual wuauserv
 call :svc_manual UsoSvc
 call :svc_manual DoSvc
+exit /b
+:step_hibernate
+echo [5/5] Hibernation (the app's Hibernate action)
+powercfg /h on >nul 2>&1
+if errorlevel 1 goto :hib_fail
+rem The default "reduced" hiberfile only serves Fast Startup; shutdown /h needs a full one.
+powercfg /h /type full >nul 2>&1
+if errorlevel 1 goto :hib_fail
+rem No sign-in prompt when it resumes: the account has no password anyway.
+powercfg /setacvalueindex scheme_current sub_none consolelock 0 >nul 2>&1
+powercfg /setdcvalueindex scheme_current sub_none consolelock 0 >nul 2>&1
+powercfg /setactive scheme_current >nul 2>&1
+exit /b
+:hib_fail
+call :fail "powercfg could not turn on hibernation"
 exit /b
 :svc_manual
 sc config %1 start= demand >nul 2>&1

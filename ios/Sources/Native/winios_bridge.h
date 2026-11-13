@@ -69,6 +69,8 @@ typedef struct WinIOSTouchContact {
 - (void)sendAltTab;
 - (void)sendEscape;
 - (void)pressPowerButton;
+/// Ask Windows to hibernate (through the WindowsiOS Tools agent); the VM stops once it has saved itself.
+- (void)requestHibernate;
 - (void)flushDisks;
 - (void)stopVM;
 

@@ -6,6 +6,7 @@ struct SessionView: View {
     @ObservedObject var vm: VMViewModel
     @State private var fabExpanded = false
     @State private var confirmingShutDown = false
+    @State private var confirmingHibernate = false
     /// Bottom leading by default: clear of the Windows tray and clock, and of a maximized
     /// window's close button.
     @AppStorage("fabCorner") private var fabCorner: FABCorner = .bottomLeading
@@ -74,6 +75,14 @@ struct SessionView: View {
             SafariSheet(url: item.url)
                 .ignoresSafeArea()
                 .preferredColorScheme(.dark)
+        }
+        .alert("Hibernate Windows?", isPresented: $confirmingHibernate) {
+            Button("Hibernate") {
+                WinIOSBridge.shared.requestHibernate()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Windows saves your open apps and picks up where you left off next time. Needs WindowsiOS Tools.")
         }
         .alert("Shut down Windows?", isPresented: $confirmingShutDown) {
             Button("Shut Down", role: .destructive) {
@@ -161,6 +170,9 @@ struct SessionView: View {
         if vm.isVMRunning {
             FABMenuItem(title: "Shut Down", icon: "power", role: .destructive) {
                 confirmingShutDown = true
+            }
+            FABMenuItem(title: "Hibernate", icon: "moon.zzz") {
+                confirmingHibernate = true
             }
             FABMenuItem(title: "Task Manager", icon: "waveform.path.ecg") {
                 WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe0), NSNumber(value: 0xe1)], key: 0x29)

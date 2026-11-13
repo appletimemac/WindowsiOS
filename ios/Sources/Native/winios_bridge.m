@@ -687,6 +687,11 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     hv_winvm_power_button();
 }
 
+- (void)requestHibernate {
+    if (!_vmRunning) return;
+    hv_winvm_request_hibernate();
+}
+
 - (void)flushDisks {
     if (!_vmRunning) return;
     hv_winvm_flush_disks();

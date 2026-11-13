@@ -56,6 +56,17 @@ static int posture_laptop; /* atomic; 0 = tablet */
 
 void hv_share_set_posture(int laptop) { __atomic_store_n(&posture_laptop, laptop ? 1 : 0, __ATOMIC_RELAXED); }
 
+/* When the app asked Windows to hibernate (CLOCK_UPTIME_RAW ns, 0 for none), atomic. GET /.henge/power, which
+   WinIOSAgent polls twice a second, answers it once. One the agent did not take within HIBERNATE_TTL_NS (no agent
+   installed, Windows still booting, a second tap while it saves) is dropped rather than left for a later agent,
+   which would hibernate a session nobody asked to. */
+#define HIBERNATE_TTL_NS (10ull * 1000000000ull)
+static uint64_t hibernate_requested_at;
+void hv_share_request_hibernate(void) {
+    __atomic_store_n(&hibernate_requested_at, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
+}
+void hv_share_clear_hibernate(void) { __atomic_store_n(&hibernate_requested_at, 0, __ATOMIC_RELAXED); }
+
 static int is_url_handler_on(void) {
     if (url_handler_enabled < 0) {
 #if TARGET_OS_IPHONE
@@ -767,6 +778,12 @@ static int serve_henge(Conn *c, Request *r) {
     if (!strcmp(what, "posture") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         const char *text = __atomic_load_n(&posture_laptop, __ATOMIC_RELAXED) ? "laptop" : "tablet";
+        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n", text, strlen(text));
+    }
+    if (!strcmp(what, "power") && !strcmp(r->method, "GET")) {
+        if (body_discard(c, r) != 0) return -1;
+        uint64_t at = __atomic_exchange_n(&hibernate_requested_at, 0, __ATOMIC_RELAXED);
+        const char *text = at && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - at < HIBERNATE_TTL_NS ? "hibernate" : "none";
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n", text, strlen(text));
     }
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);

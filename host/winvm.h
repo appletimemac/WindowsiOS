@@ -31,6 +31,8 @@ void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason));
 int hv_winvm_run_cpu0(void);
 void hv_winvm_stop(void);
 void hv_winvm_power_button(void);
+/* Windows saves its session to disk and powers off; the next boot resumes it (needs WindowsiOS Tools). */
+void hv_winvm_request_hibernate(void);
 void hv_winvm_flush_disks(void);
 /* Periodic checkpoint while running: an ordering barrier instead of a full sync. */
 void hv_winvm_checkpoint_disks(void);
