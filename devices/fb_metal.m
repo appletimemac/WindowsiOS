@@ -76,7 +76,10 @@ typedef struct {
     /* Where in the drawable the picture goes (0..1 of each axis), under lock. Unset: the whole drawable,
        letterboxed in black. Set: the rest of the drawable continues the picture's edge pixels. */
     double content[4];
-    BOOL hasContent, contentMoved;
+    BOOL hasContent;
+    /* The picture's place is counted when it is set and when a frame is drawn with it, so a place set on a
+       tick that drew nothing (no frame yet, no drawable) is still drawn on a later one. */
+    uint32_t contentGen, drawnContentGen;
     _Atomic(uint64_t) framesPresented;
 }
 - (instancetype)initWithDisplay:(HvFbDisplay *)display;
@@ -164,7 +167,7 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
     content[1] = y;
     content[2] = w;
     content[3] = h;
-    contentMoved = YES;
+    contentGen++;
     os_unfair_lock_unlock(&lock);
 }
 
@@ -234,10 +237,10 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
     @autoreleasepool {
         os_unfair_lock_lock(&lock);
         CAMetalLayer *curLayer = layer;
-        BOOL extend = hasContent, moved = contentMoved;
+        uint32_t gen = contentGen;
+        BOOL extend = hasContent, moved = gen != drawnContentGen;
         double rx = extend ? content[0] : 0.0, ry = extend ? content[1] : 0.0;
         double rw = extend ? content[2] : 1.0, rh = extend ? content[3] : 1.0;
-        contentMoved = NO;
         os_unfair_lock_unlock(&lock);
         if (!curLayer || !pipeLinear || !queue) return;
 
@@ -354,6 +357,7 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
         [cb commit];
 
         lastDrawableSize = dsize;
+        drawnContentGen = gen;
         atomic_fetch_add_explicit(&framesPresented, 1, memory_order_relaxed);
     }
 }
