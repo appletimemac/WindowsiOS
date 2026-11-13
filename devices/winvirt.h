@@ -84,6 +84,9 @@ typedef struct HvWinVirt {
 
     uint32_t ged_events;
     void (*poll)(void);
+
+    /* Read racily from another thread (host ticks are mach_absolute_time units). */
+    uint64_t tick0_last, tick0_gap_max_ticks; /* CPU 0 device poll: last time, largest gap since the reader zeroed it */
 } HvWinVirt;
 
 uint8_t *hv_alloc_no_footprint(uint64_t size);

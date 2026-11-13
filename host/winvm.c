@@ -2,6 +2,7 @@
 #include "winvm.h"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <TargetConditionals.h>
 #include <os/lock.h>
@@ -82,10 +83,14 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
     sigaction(sig, prior, NULL);
 }
 
-static void prepare_cpu_thread(void) {
+static mach_port_t cpu_port[HV_MAX_CPUS]; /* each vCPU's host thread, for its on-core time in perf.csv */
+static uint64_t created_at;                /* mach time hv_winvm_create ran */
+
+static void prepare_cpu_thread(int index) {
     static __thread int done;
     if (done) return;
     done = 1;
+    if (index >= 0 && index < HV_MAX_CPUS) cpu_port[index] = mach_thread_self();
     stack_t ss = {.ss_sp = malloc(1u << 16), .ss_size = 1u << 16, .ss_flags = 0};
     if (ss.ss_sp) sigaltstack(&ss, NULL);
     sigset_t set;
@@ -192,6 +197,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!getenv("HV_FLUSH")) hv_knob[HV_K_FLUSH] = 1;
 #endif
 
+    created_at = mach_absolute_time();
     m.log = c->log;
     m.stats_interval = c->stats_interval;
     m.timer_hint = kicker_timer_hint;
@@ -300,7 +306,7 @@ static void *kicker_thread(void *unused) {
 
 static void *secondary_thread(void *arg) {
     HvCpu *c = arg;
-    prepare_cpu_thread();
+    prepare_cpu_thread((int)c->index);
     int r = hv_run(c);
     if (!c->halted) {
         fprintf(stderr, "winvm: cpu %u stopped (%s) at pc=%llx el=%u\n",
@@ -342,7 +348,7 @@ void hv_winvm_checkpoint_disks(void) {
 }
 
 int hv_winvm_run_cpu0(void) {
-    prepare_cpu_thread();
+    prepare_cpu_thread(0);
     for (;;) {
         int r = hv_run(&cpus[0]);
         hv_winvm_flush_disks();
@@ -498,9 +504,127 @@ void hv_winvm_usb_stats(int *kbd_ready, int *tab_ready, uint64_t *delivered) {
 }
 
 void hv_winvm_engine_stats(uint64_t *jit_used_bytes, uint64_t *jit_cap_bytes,
-                           uint64_t *jit_full_flushes, uint64_t *wfi_ticks) {
+                           uint64_t *jit_flushes, uint64_t *wfi_ticks) {
     if (jit_used_bytes) *jit_used_bytes = (uint64_t)m.jit.used * 4ull;
     if (jit_cap_bytes) *jit_cap_bytes = (uint64_t)m.jit.capacity * 4ull;
-    if (jit_full_flushes) *jit_full_flushes = m.stats.flush_full;
+    if (jit_flushes) *jit_flushes = m.stats.block_flushes;
     if (wfi_ticks) *wfi_ticks = m.stats.wfi_ticks;
+}
+
+static uint64_t ticks_ns(uint64_t t) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return t * tb.numer / tb.denom;
+}
+
+/* Largest-since-last-read values: take and zero (a racing update may be lost, which is fine here). */
+static uint64_t take_max_us(uint64_t *v) { return ticks_ns(__atomic_exchange_n(v, 0, __ATOMIC_RELAXED)) / 1000; }
+
+static uint64_t thread_run_ns(mach_port_t port) {
+    if (!port) return 0;
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &n) != KERN_SUCCESS) return 0;
+    return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000000ull +
+           ((uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds) * 1000ull;
+}
+
+/* Reads every counter racily: a snapshot for rates, not an audit. Host-side fields (memory, thermal) are the caller's. */
+void hv_winvm_perf_snapshot(HvPerfSnap *s) {
+    memset(s, 0, sizeof *s);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    s->t_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+    if (created_at) s->uptime_ms = ticks_ns(mach_absolute_time() - created_at) / 1000000ull;
+
+    HvStats *st = &m.stats;
+    s->translations = st->translations;
+    s->blocks = st->blocks;
+    s->block_flushes = st->block_flushes;
+    s->flush_full = st->flush_full;
+    s->flush_smc = st->flush_smc;
+    s->flush_ic = st->flush_ic;
+    s->code_protects = st->code_protects;
+    s->chained = st->chained;
+    s->chain_far = st->chain_far;
+    s->xchained_now = m.nxchained;
+    s->nblocks_now = m.nblocks;
+    s->jit_used_kb_now = (uint64_t)m.jit.used * 4ull / 1024ull;
+    s->jit_cap_kb_now = (uint64_t)m.jit.capacity * 4ull / 1024ull;
+    s->inval_dev = st->inval_dev;
+    s->inval_scanned = st->inval_scanned;
+    s->inval_ns = ticks_ns(st->inval_ticks);
+    s->stw_count = st->stw_count;
+    s->stw_ns = ticks_ns(st->stw_ticks);
+    s->stw_max_us = take_max_us(&st->stw_max_ticks);
+    s->exceptions = st->exceptions;
+    s->interrupts = st->interrupts;
+    s->tlb_flushes = st->tlb_flushes;
+    s->fetch_walks = st->fetch_walks;
+    s->proc_switches = st->stash_saves;
+    /* Indirect-branch cache: resets and light resolves always count; fills, TLB refills and dispatcher
+       entries by cause only with engine stats on (stats_interval != 0). */
+    s->ijc_resets = st->ijc_resets;
+    s->ijc_light = st->ijc_light;
+    s->ijc_fills = st->ijc_fills;
+    s->tlb_refills = st->refills;
+    uint64_t *disp[6] = {&s->disp_chainfill, &s->disp_kick, &s->disp_exc, &s->disp_irq, &s->disp_cached, &s->disp_miss};
+    for (int i = 0; i < 6; i++) *disp[i] = st->why[i];
+    s->wfi = st->wfi;
+    s->wfi_ns = ticks_ns(st->wfi_ticks);
+    uint64_t *wfi_cpu[4] = {&s->wfi0_ns, &s->wfi1_ns, &s->wfi2_ns, &s->wfi3_ns};
+    uint64_t *run_cpu[4] = {&s->run0_ns, &s->run1_ns, &s->run2_ns, &s->run3_ns};
+    for (int i = 0; i < ncpus && i < 4; i++) {
+        *wfi_cpu[i] = ticks_ns(m.percpu[i].wfi_ticks);
+        *run_cpu[i] = thread_run_ns(cpu_port[i]);
+    }
+    s->translate_ns = ticks_ns(st->translate_ticks);
+    s->dev_wait_ns = ticks_ns(st->dev_wait_ticks);
+    s->tr_wait_ns = ticks_ns(st->tr_wait_ticks);
+    s->tlbi_wait_ns = ticks_ns(st->sync_ticks);
+
+    HvVirtioGpu *g = board.gpu;
+    if (g) {
+        s->gpu_cmds = g->cmds;
+        s->gpu_transfers = g->transfers;
+        s->gpu_flushes = g->flushes;
+        s->gpu_flush_px = g->flush_px;
+        s->gpu_xfer_bytes = g->xfer_bytes;
+        s->gpu_xfer_ns = ticks_ns(g->xfer_ticks);
+        s->gpu_rect_small = g->rect_small;
+        s->gpu_rect_mid = g->rect_mid;
+        s->gpu_rect_big = g->rect_big;
+        _Static_assert(HV_VGPU_GRID_W * HV_VGPU_GRID_H == HV_PERF_GRID, "perf.csv grid matches the GPU's");
+        for (int i = 0; i < HV_PERF_GRID; i++) s->gpu_grid[i] = g->grid[i];
+    }
+    s->frames_presented = hv_winvm_display_frames();
+    uint32_t fw = 0, fh = 0;
+    if (hv_winvm_display_size(&fw, &fh) == 0) {
+        s->fb_w_now = fw;
+        s->fb_h_now = fh;
+    }
+    HvNvme *nv = board.nvme0;
+    if (nv) {
+        s->nvme_rd_n = nv->rd_n;
+        s->nvme_rd_bytes = nv->rd_bytes;
+        s->nvme_rd_ns = ticks_ns(nv->rd_ticks);
+        s->nvme_rd_max_us = take_max_us(&nv->rd_max_ticks);
+        s->nvme_wr_n = nv->wr_n;
+        s->nvme_wr_bytes = nv->wr_bytes;
+        s->nvme_wr_ns = ticks_ns(nv->wr_ticks);
+        s->nvme_wr_max_us = take_max_us(&nv->wr_max_ticks);
+        s->nvme_flush_n = nv->flush_n;
+        s->nvme_lat_100us = nv->lat_hist[0];
+        s->nvme_lat_1ms = nv->lat_hist[1];
+        s->nvme_lat_10ms = nv->lat_hist[2];
+        s->nvme_lat_slow = nv->lat_hist[3];
+    }
+    HvXhci *x = board.usb;
+    if (x) {
+        s->usb_delivered = x->delivered;
+        s->in_n = x->in_n;
+        s->in_q_ns = ticks_ns(x->in_q_ticks);
+        s->in_q_max_us = take_max_us(&x->in_q_max_ticks);
+    }
+    s->tick0_gap_max_us = take_max_us(&board.tick0_gap_max_ticks);
 }

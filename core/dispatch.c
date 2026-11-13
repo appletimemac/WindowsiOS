@@ -496,8 +496,10 @@ static int wait_for_interrupt(HvCpu *cpu) {
     pthread_mutex_unlock(&p->wake_mu);
     unpark(cpu);
     hv_big_lock(m);
+    uint64_t slept = mach_absolute_time() - t0;
     m->stats.wfi++;
-    m->stats.wfi_ticks += mach_absolute_time() - t0;
+    m->stats.wfi_ticks += slept;
+    p->wfi_ticks += slept;
     m->tick(m, cpu);
     return 0;
 }
@@ -769,6 +771,8 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
             hv_jit_write(&m->jit, site, &insn, 4);
             hv_jit_finish(&m->jit, site, 1);
+        } else if (site) {
+            m->stats.chain_far++;
         }
         m->stats.chained++;
         if (m->stats_interval) m->stats.xchained++;
@@ -783,6 +787,8 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
         uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
         hv_jit_write(&m->jit, site, &insn, 4);
         hv_jit_finish(&m->jit, site, 1);
+    } else if (site) {
+        m->stats.chain_far++;
     }
     uint32_t *cond = m->slot_cond[idx];
     if (cond) { /* the conditional branch to that stub, too */
@@ -829,6 +835,7 @@ static void stop_the_world(HvCpu *cpu) {
     HvMachine *m = cpu->m;
     pthread_mutex_lock(&m->stw_mu);
     if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) && !m->stw_active) {
+        uint64_t t0 = mach_absolute_time();
         __atomic_store_n(&m->stw_active, 1, __ATOMIC_SEQ_CST);
         __atomic_store_n(&m->flush_pending, 0, __ATOMIC_SEQ_CST);
         pthread_mutex_unlock(&m->stw_mu);
@@ -845,6 +852,10 @@ static void stop_the_world(HvCpu *cpu) {
         pthread_mutex_lock(&m->tr_mu);
         hv_flush_blocks(m);
         pthread_mutex_unlock(&m->tr_mu);
+        uint64_t dt = mach_absolute_time() - t0;
+        m->stats.stw_count++;
+        m->stats.stw_ticks += dt;
+        if (dt > m->stats.stw_max_ticks) m->stats.stw_max_ticks = dt;
         pthread_mutex_lock(&m->stw_mu);
         __atomic_store_n(&m->stw_active, 0, __ATOMIC_SEQ_CST);
         pthread_cond_broadcast(&m->stw_cv);

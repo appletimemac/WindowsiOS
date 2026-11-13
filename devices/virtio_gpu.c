@@ -1,5 +1,6 @@
 #include "virtio_gpu.h"
 
+#include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -211,16 +212,42 @@ static uint64_t backing_read(const HvVgpuRes *r, uint64_t off, uint8_t *dst, uin
     return done;
 }
 
-/* Rectangle of resource r that is on the scanout, in scanout pixels, handed to the display as changed. */
-static void mark_scanout_dirty(HvVirtioGpu *g, const HvVgpuRes *r, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
-    if (r->id != g->scanout_res) return;
+/* The part of the rectangle (x, y, w, h) of resource r that is on the scanout, as [x0, x1) x [y0, y1) in resource pixels.
+   0 when r is not the scanout resource or the two do not overlap. */
+static int scanout_clip(const HvVirtioGpu *g, const HvVgpuRes *r, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                        uint64_t *cx0, uint64_t *cy0, uint64_t *cx1, uint64_t *cy1) {
+    if (r->id != g->scanout_res) return 0;
     uint64_t x0 = x > g->scanout_x ? x : g->scanout_x, y0 = y > g->scanout_y ? y : g->scanout_y;
     uint64_t x1 = (uint64_t)x + w, y1 = (uint64_t)y + h;
     if (x1 > (uint64_t)g->scanout_x + g->scanout_w) x1 = (uint64_t)g->scanout_x + g->scanout_w;
     if (y1 > (uint64_t)g->scanout_y + g->scanout_h) y1 = (uint64_t)g->scanout_y + g->scanout_h;
-    if (x0 < x1 && y0 < y1)
+    if (x0 >= x1 || y0 >= y1) return 0;
+    *cx0 = x0, *cy0 = y0, *cx1 = x1, *cy1 = y1;
+    return 1;
+}
+
+/* Rectangle of resource r that is on the scanout, in scanout pixels, handed to the display as changed. */
+static void mark_scanout_dirty(HvVirtioGpu *g, const HvVgpuRes *r, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    uint64_t x0, y0, x1, y1;
+    if (scanout_clip(g, r, x, y, w, h, &x0, &y0, &x1, &y1))
         hv_fb_display_mark_dirty(g->fb, (uint32_t)(x0 - g->scanout_x), (uint32_t)(y0 - g->scanout_y), (uint32_t)(x1 - x0),
                                  (uint32_t)(y1 - y0));
+}
+
+/* Counters for a flush: only the part on the scanout counts, by size and by where its center falls. */
+static void count_flush(HvVirtioGpu *g, const HvVgpuRes *r, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    uint64_t x0, y0, x1, y1;
+    if (!scanout_clip(g, r, x, y, w, h, &x0, &y0, &x1, &y1)) return;
+    uint64_t area = (x1 - x0) * (y1 - y0);
+    g->flush_px += area;
+    if (area < 16384) g->rect_small++;
+    else if (area < 262144) g->rect_mid++;
+    else g->rect_big++;
+    uint64_t gx = ((x0 + x1) / 2 - g->scanout_x) * HV_VGPU_GRID_W / g->scanout_w;
+    uint64_t gy = ((y0 + y1) / 2 - g->scanout_y) * HV_VGPU_GRID_H / g->scanout_h;
+    if (gx >= HV_VGPU_GRID_W) gx = HV_VGPU_GRID_W - 1;
+    if (gy >= HV_VGPU_GRID_H) gy = HV_VGPU_GRID_H - 1;
+    g->grid[gy * HV_VGPU_GRID_W + gx] += area;
 }
 
 static int rect_in(const HvVgpuRes *r, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
@@ -308,6 +335,7 @@ static uint32_t cmd_flush(HvVirtioGpu *g, const uint8_t *req, uint32_t n) {
     if (!r) return RESP_ERR_INVALID_RESOURCE_ID;
     if (!rect_in(r, x, y, w, h)) return RESP_ERR_INVALID_PARAMETER;
     g->flushes++;
+    count_flush(g, r, x, y, w, h);
     mark_scanout_dirty(g, r, x, y, w, h);
     return RESP_OK_NODATA;
 }
@@ -328,11 +356,15 @@ static uint32_t cmd_transfer(HvVirtioGpu *g, const uint8_t *req, uint32_t n) {
        end of the backing is left alone. */
     uint64_t row = (uint64_t)w * 4;
     uint8_t *dst = r->pixels + (uint64_t)y * r->stride + (uint64_t)x * 4;
+    uint64_t copied = 0, t0 = mach_absolute_time();
     if (row == r->stride) {
-        backing_read(r, off, dst, row * h);
+        copied = backing_read(r, off, dst, row * h);
     } else {
-        for (uint32_t k = 0; k < h; k++)
-            if (backing_read(r, off + (uint64_t)k * r->stride, dst + (uint64_t)k * r->stride, row) == 0) break;
+        for (uint32_t k = 0; k < h; k++) {
+            uint64_t got = backing_read(r, off + (uint64_t)k * r->stride, dst + (uint64_t)k * r->stride, row);
+            if (got == 0) break;
+            copied += got;
+        }
     }
     if (r->swap) {
         for (uint32_t k = 0; k < h; k++) {
@@ -340,6 +372,8 @@ static uint32_t cmd_transfer(HvVirtioGpu *g, const uint8_t *req, uint32_t n) {
             for (uint32_t i = 0; i < w; i++) p[i] = __builtin_bswap32(p[i]);
         }
     }
+    g->xfer_bytes += copied;
+    g->xfer_ticks += mach_absolute_time() - t0; /* the channel swap is part of getting the pixels into the host copy */
     mark_scanout_dirty(g, r, x, y, w, h);
     return RESP_OK_NODATA;
 }

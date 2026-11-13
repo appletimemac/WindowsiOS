@@ -1,5 +1,6 @@
 #include "xhci.h"
 
+#include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -656,16 +657,30 @@ static int deliver_hid_in(HvXhci *x, int slot, const uint8_t *report, uint32_t r
 
 /* Hands queued reports (stride bytes apart, len bytes each) to the guest until it runs out of TRBs. */
 static void drain_queue(HvXhci *x, int slot, const uint8_t *base, unsigned stride, unsigned len, uint32_t *head,
-                        uint32_t tail, const char *what) {
+                        uint32_t tail, const uint64_t *stamps, const char *what) {
     while (*head != tail) {
         const uint8_t *rep = base + (size_t)(*head % HV_XHCI_REPORTS) * stride;
         if (!deliver_hid_in(x, slot, rep, len)) break;
+        uint64_t stamp = stamps[*head % HV_XHCI_REPORTS];
+        if (stamp) { /* 0: not stamped (nothing queues one that way) */
+            uint64_t waited = mach_absolute_time() - stamp;
+            x->in_n++;
+            x->in_q_ticks += waited;
+            if (waited > x->in_q_max_ticks) x->in_q_max_ticks = waited;
+        }
         (*head)++;
         x->delivered++;
         if (xlog() && x->delivered <= 24)
             fprintf(stderr, "xhci: delivered %s report #%llu (%02x %02x %02x)\n", what, (unsigned long long)x->delivered,
                     rep[0], rep[1], rep[2]);
     }
+}
+
+/* Forgets whatever is queued for the touchscreen (stale, or nobody to deliver to), enqueue stamps included.
+   Caller holds x->mu. */
+static void touch_drop_queue(HvXhci *x) {
+    for (uint32_t i = x->chead; i != x->ctail; i++) x->touch_stamps[i % HV_XHCI_REPORTS] = 0;
+    x->chead = x->ctail;
 }
 
 static int ep_in_running(const HvXhci *x, int slot) {
@@ -675,14 +690,14 @@ static int ep_in_running(const HvXhci *x, int slot) {
 static void run_ep_in(HvXhci *x) {
     pthread_mutex_lock(&x->mu);
     if (ep_in_running(x, x->kbd_slot))
-        drain_queue(x, x->kbd_slot, x->reports[0], 8, 8, &x->rhead, x->rtail, "kbd");
+        drain_queue(x, x->kbd_slot, x->reports[0], 8, 8, &x->rhead, x->rtail, x->stamps, "kbd");
     if (ep_in_running(x, x->tab_slot))
-        drain_queue(x, x->tab_slot, x->tab_reports[0], 6, 6, &x->thead, x->ttail, "tab");
+        drain_queue(x, x->tab_slot, x->tab_reports[0], 6, 6, &x->thead, x->ttail, x->tab_stamps, "tab");
     if (ep_in_running(x, x->touch_slot))
         drain_queue(x, x->touch_slot, x->touch_reports[0], HV_TOUCH_REPORT_LEN, HV_TOUCH_REPORT_LEN, &x->chead,
-                    x->ctail, "touch");
+                    x->ctail, x->touch_stamps, "touch");
     else
-        x->chead = x->ctail; /* a stale burst must not replay when the endpoint comes back */
+        touch_drop_queue(x); /* a stale burst must not replay when the endpoint comes back */
     pthread_mutex_unlock(&x->mu);
 }
 
@@ -698,7 +713,7 @@ static void ep_stop(HvXhci *x, int slot, int dci) {
     x->slots[slot].ep_running[dci] = 0;
     if (slot == x->touch_slot && dci == HID_DCI_IN) {
         pthread_mutex_lock(&x->mu);
-        x->chead = x->ctail;
+        touch_drop_queue(x);
         touch_clear_held(x); /* nor is a resting finger repeated when it restarts */
         pthread_mutex_unlock(&x->mu);
     }
@@ -942,6 +957,7 @@ static void reset(HvXhci *x) {
     x->tab_slot = 0;
     x->touch_slot = 0;
     pthread_mutex_lock(&x->mu);
+    touch_drop_queue(x);
     x->chead = x->ctail = 0;
     touch_clear_held(x);
     x->touch_mode = TOUCH_INPUT_MULTI;
@@ -1132,8 +1148,10 @@ void hv_xhci_key(HvXhci *x, uint8_t usage, int down) {
             s[7] = 0;
         }
     }
-    if (x->rtail - x->rhead < HV_XHCI_REPORTS)
+    if (x->rtail - x->rhead < HV_XHCI_REPORTS) {
+        x->stamps[x->rtail % HV_XHCI_REPORTS] = mach_absolute_time();
         memcpy(x->reports[x->rtail++ % HV_XHCI_REPORTS], s, 8);
+    }
     pthread_mutex_unlock(&x->mu);
     hv_machine_wake(x->m);
 }
@@ -1165,8 +1183,10 @@ void hv_xhci_tablet(HvXhci *x, int abs_x, int abs_y, uint8_t buttons, int8_t whe
             return;
         }
     }
-    if (x->ttail - x->thead < HV_XHCI_REPORTS)
+    if (x->ttail - x->thead < HV_XHCI_REPORTS) {
+        x->tab_stamps[x->ttail % HV_XHCI_REPORTS] = mach_absolute_time();
         memcpy(x->tab_reports[x->ttail++ % HV_XHCI_REPORTS], rep, 6);
+    }
     pthread_mutex_unlock(&x->mu);
     hv_machine_wake(x->m);
 }
@@ -1225,7 +1245,7 @@ void hv_xhci_touch(HvXhci *x, const HvTouchContact *contacts, int count) {
 
     pthread_mutex_lock(&x->mu);
     if (!ep_in_running(x, x->touch_slot)) {
-        x->chead = x->ctail; /* nobody to deliver to: drop this and anything stale */
+        touch_drop_queue(x); /* nobody to deliver to: drop this and anything stale */
         touch_clear_held(x);
         pthread_mutex_unlock(&x->mu);
         return;
@@ -1246,6 +1266,7 @@ void hv_xhci_touch(HvXhci *x, const HvTouchContact *contacts, int count) {
         }
     }
     if (x->ctail - x->chead >= HV_XHCI_REPORTS) x->chead++; /* guest stalled for good: keep the newest */
+    x->touch_stamps[x->ctail % HV_XHCI_REPORTS] = mach_absolute_time();
     memcpy(x->touch_reports[x->ctail++ % HV_XHCI_REPORTS], rep, sizeof rep);
     pthread_mutex_unlock(&x->mu);
     hv_machine_wake(x->m);
@@ -1266,6 +1287,7 @@ static void touch_repeat_held(HvXhci *x) {
         (x->usbcmd & 1) && ep_in_running(x, x->touch_slot)) {
         uint16_t scan = touch_scan_time();
         x->touch_state[31] = (uint8_t)(scan & 0xff), x->touch_state[32] = (uint8_t)(scan >> 8);
+        x->touch_stamps[x->ctail % HV_XHCI_REPORTS] = mach_absolute_time();
         memcpy(x->touch_reports[x->ctail++ % HV_XHCI_REPORTS], x->touch_state, HV_TOUCH_REPORT_LEN);
         __atomic_store_n(&x->touch_last_ns, now, __ATOMIC_RELAXED);
     }

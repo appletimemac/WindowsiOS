@@ -106,7 +106,12 @@ typedef struct HvStats {
     uint64_t helper[12];      /* by HV_OP_* */
     uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
+    /* Always counted (perf.csv): chains left on the stub because the target is out of B range, code
+       invalidations' cost (host ticks, cross-page chains scanned, how many came from device writes), and
+       stop-the-world flushes (count, ticks from the request to the restart, largest since read). */
+    uint64_t chain_far;
     uint64_t inval_ticks, inval_scanned, inval_dev;
+    uint64_t stw_count, stw_ticks, stw_max_ticks;
 } HvStats;
 
 #if TARGET_OS_IPHONE
@@ -182,7 +187,8 @@ typedef struct HvPerCpu {
        flush barrier). tlb_live: active and not itself waiting for acks, i.e. it
        may be using TLB entries right now. */
     int active, tlb_live;
-    uint32_t walk_seq;           /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
+    uint64_t wfi_ticks;          /* this CPU's WFI sleep (stats.wfi_ticks is every CPU's) */
+    uint32_t walk_seq;          /* odd while it walks page tables and fills its TLB (see hv_tlbi_drop_remote_va) */
     uint32_t ijc_seq;            /* odd while it checks a block's mapping in its TLB and caches it (hv_ijc_fill_checked) */
     HvTlbStash stash[HV_STASHES];
     uint64_t stash_clock;

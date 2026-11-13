@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_error.h>
+#include <mach/mach_time.h>
 #include <mach/vm_map.h>
 #include <pthread.h>
 #include <pthread/qos.h>
@@ -93,6 +94,9 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     HvWinVirt *b = m->tick_opaque;
     uint64_t deadline = hv_timer_update(b->gic, cpu);
     if (cpu->index != 0) return deadline;
+    uint64_t now = mach_absolute_time();
+    if (b->tick0_last && now - b->tick0_last > b->tick0_gap_max_ticks) b->tick0_gap_max_ticks = now - b->tick0_last;
+    b->tick0_last = now;
     hv_pl031_tick(b->rtc);
     if (b->poll) b->poll();
     hv_xhci_poll(b->usb);

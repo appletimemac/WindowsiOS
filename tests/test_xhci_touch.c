@@ -1,6 +1,7 @@
 // xHCI USB HID touchscreen (port 3): drives devices/xhci.c through its MMIO interface with a scripted guest
 // (rings in plain RAM) and checks the root hub, enumeration, the HID report descriptor (parsed item by item),
 // the control requests Windows uses (GET_REPORT, SET_REPORT) and the touch frame queue.
+#include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -752,6 +753,93 @@ static void test_touch_hold(void) {
     drain();
 }
 
+static uint64_t us_to_ticks(unsigned us) {
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    return (uint64_t)us * 1000 * tb.denom / tb.numer;
+}
+
+/* in_n, in_q_ticks and in_q_max_ticks: how long each report waits in the host's queue before the guest's ring has it. */
+static void test_input_stats(void) {
+    int slot = x->touch_slot;
+    check("touch endpoint running", (uint64_t)hv_xhci_touch_ready(x), 1);
+    post_in(slot, 8);
+    check("queue is empty", queued(), 0);
+    uint64_t n0 = x->in_n, t0 = x->in_q_ticks;
+    x->in_q_max_ticks = 0;
+
+    HvTouchContact a[1] = {tc(0, 1, 5000, 6000)};
+    hv_xhci_touch(x, a, 1);
+    check("report queued", queued(), 1);
+    check("report stamped", x->touch_stamps[(x->ctail - 1) % HV_XHCI_REPORTS] != 0, 1);
+    check("nothing delivered yet", x->in_n - n0, 0);
+    usleep(3000);
+    hv_xhci_poll(x);
+    check("queue drained", queued(), 0);
+    check("one report delivered", x->in_n - n0, 1);
+    uint64_t waited = x->in_q_ticks - t0;
+    check("it waited at least the 3 ms it sat there", waited >= us_to_ticks(3000), 1);
+    check("the largest wait is that one", x->in_q_max_ticks, waited);
+
+    /* A frame merged into a queued one keeps the older stamp: that is the wait the user saw. */
+    HvTouchContact b[1] = {tc(0, 1, 5010, 6010)}, c[1] = {tc(0, 1, 5020, 6020)};
+    hv_xhci_touch(x, b, 1);
+    check("first frame queued", queued(), 1);
+    uint64_t older = x->touch_stamps[(x->ctail - 1) % HV_XHCI_REPORTS];
+    usleep(4000);
+    hv_xhci_touch(x, c, 1);
+    check("second frame merged", queued(), 1);
+    check("the merged report keeps the older stamp", x->touch_stamps[(x->ctail - 1) % HV_XHCI_REPORTS], older);
+    check("with the newer position", contact_field(queued_at(0), 0, 0x01, 0x30), 5020);
+    usleep(1000);
+    n0 = x->in_n, t0 = x->in_q_ticks;
+    x->in_q_max_ticks = 0;
+    hv_xhci_poll(x);
+    check("merged report delivered once", x->in_n - n0, 1);
+    waited = x->in_q_ticks - t0;
+    check("its wait counts from the first frame", waited >= us_to_ticks(4000), 1);
+    check("max follows the sum for one report", x->in_q_max_ticks, waited);
+
+    /* A resting finger's repeat is stamped too; it is queued and delivered in the same poll. */
+    usleep(15000);
+    n0 = x->in_n;
+    hv_xhci_poll(x);
+    check("the repeat is counted", x->in_n - n0, 1);
+    HvTouchContact up[1] = {tc(0, 0, 5020, 6020)};
+    hv_xhci_touch(x, up, 1);
+    hv_xhci_poll(x);
+
+    /* Dropping the queue (the endpoint stops) clears the stamps and counts nothing. */
+    n0 = x->in_n;
+    hv_xhci_touch(x, a, 1);
+    uint32_t dropped = x->ctail - 1;
+    check("a report waits", queued(), 1);
+    check("stop endpoint", (uint64_t)run_cmd(TRB_STOP_EP, slot, 0, 3u << 16, NULL), CC_SUCCESS);
+    check("the queue is dropped", queued(), 0);
+    check("its stamp is cleared", x->touch_stamps[dropped % HV_XHCI_REPORTS], 0);
+    check("a dropped report is not counted", x->in_n - n0, 0);
+    post_in(slot, 1); /* restarts the endpoint */
+    check("touch endpoint running again", (uint64_t)hv_xhci_touch_ready(x), 1);
+    drain();
+
+    /* The keyboard and tablet queues stamp what they enqueue (no endpoint runs for them here: look at the queues). */
+    uint32_t rt = x->rtail, tt = x->ttail;
+    hv_xhci_key(x, 4, 1);
+    check("key report queued", x->rtail - rt, 1);
+    check("key report stamped", x->stamps[rt % HV_XHCI_REPORTS] != 0, 1);
+    hv_xhci_key(x, 4, 0);
+    hv_xhci_tablet(x, 100, 200, 0, 0);
+    check("tablet report queued", x->ttail - tt, 1);
+    uint64_t tab_older = x->tab_stamps[tt % HV_XHCI_REPORTS];
+    check("tablet report stamped", tab_older != 0, 1);
+    usleep(2000);
+    hv_xhci_tablet(x, 110, 210, 0, 0);
+    check("tablet motion merged", x->ttail - tt, 1);
+    check("the merged tablet report keeps the older stamp", x->tab_stamps[tt % HV_XHCI_REPORTS], tab_older);
+    x->rhead = x->rtail; /* nothing delivers these here */
+    x->thead = x->ttail;
+}
+
 /* A machine reset (the guest rebooted) must keep input out of the rings of the OS that is gone. */
 static void test_machine_reset(void) {
     int slot = x->touch_slot;
@@ -805,6 +893,8 @@ int main(void) {
 
     printf("== touch hold\n");
     test_touch_hold();
+    printf("== input latency counters\n");
+    test_input_stats();
     printf("== machine reset\n");
     test_machine_reset();
 

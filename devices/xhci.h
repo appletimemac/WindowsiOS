@@ -61,19 +61,24 @@ typedef struct HvXhci {
     uint8_t reports[HV_XHCI_REPORTS][8];
     uint32_t rhead, rtail;
     uint8_t state[8];
+    uint64_t stamps[HV_XHCI_REPORTS]; /* mach_absolute_time when each queued report was enqueued (the older one when merged) */
     /* Port 2 absolute tablet reports (6 bytes: buttons, x_lo, x_hi, y_lo, y_hi, wheel) */
     uint8_t tab_reports[HV_XHCI_REPORTS][6];
     uint32_t thead, ttail;
     uint8_t tab_state[6];
+    uint64_t tab_stamps[HV_XHCI_REPORTS];
     /* Port 3 touchscreen reports (HV_TOUCH_REPORT_LEN bytes, scan time stamped when queued) */
     uint8_t touch_reports[HV_XHCI_REPORTS][HV_TOUCH_REPORT_LEN];
     uint32_t chead, ctail;
     uint8_t touch_state[HV_TOUCH_REPORT_LEN];
+    uint64_t touch_stamps[HV_XHCI_REPORTS];
     uint64_t touch_last_ns; /* atomic; when the last touch report was queued (CLOCK_MONOTONIC) */
     uint8_t touch_mode;  /* Device Configuration feature: Input Mode (0 mouse, 1 single, 2 multiple input) */
     uint8_t touch_index; /* Device Configuration feature: Device Index */
 
     uint64_t delivered;
+    /* Read racily from another thread (host ticks are mach_absolute_time units). */
+    uint64_t in_n, in_q_ticks, in_q_max_ticks; /* HID reports delivered to the guest, and time from host enqueue to delivery */
 } HvXhci;
 
 HvXhci *hv_xhci_create(HvMachine *m, HvPcie *bus);

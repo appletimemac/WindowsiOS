@@ -59,6 +59,11 @@ typedef struct HvNvme {
     uint32_t io_buf_cap;
     uint64_t rd_bytes, wr_bytes;
     uint64_t trim_n, trim_bytes;
+    /* Counters read racily from another thread (host ticks are mach_absolute_time units). */
+    uint64_t rd_n, wr_n, flush_n;            /* I/O commands handled */
+    uint64_t rd_ticks, wr_ticks;             /* host time per command class, including PRP DMA */
+    uint64_t rd_max_ticks, wr_max_ticks;     /* largest single command since the reader last zeroed it */
+    uint64_t lat_hist[4];                    /* reads and writes by latency: < 100 us, < 1 ms, < 10 ms, longer */
 } HvNvme;
 
 HvNvme *hv_nvme_create(HvMachine *m, HvPcie *bus, HvDisk *disk, const char *serial);

@@ -20,6 +20,8 @@
 #define HV_VGPU_MAX_RESOURCES 64
 #define HV_VGPU_DEFAULT_WIDTH 1280
 #define HV_VGPU_DEFAULT_HEIGHT 900
+#define HV_VGPU_GRID_W 8 /* grid[]: flushed pixels by where on the scanout, cells across and down */
+#define HV_VGPU_GRID_H 6
 /* The EDID reports a physical size that puts the requested pixels at this density. Windows still
    starts this monitor at 100% (measured at 1280x900 and 1426x1004), so the tools installer sets 150%. */
 #define HV_VGPU_EDID_DPI 144
@@ -55,6 +57,11 @@ typedef struct HvVirtioGpu {
     uint8_t *req;                      /* request scratch */
     HvVirtqElem elem;
     uint64_t cmds, errors, transfers, flushes;
+    /* Counters read racily from another thread (host ticks are mach_absolute_time units). */
+    uint64_t flush_px;                       /* RESOURCE_FLUSH area that intersects the scanout, pixels */
+    uint64_t xfer_bytes, xfer_ticks;         /* TRANSFER_TO_HOST_2D bytes copied and host time copying */
+    uint64_t rect_small, rect_mid, rect_big; /* scanout flush rects by area: < 16384 px, < 262144 px, larger */
+    uint64_t grid[HV_VGPU_GRID_W * HV_VGPU_GRID_H]; /* flushed pixels by rect center, cells over the scanout, row-major */
 } HvVirtioGpu;
 
 /* Adds the GPU to the bus and registers it as fb's resize handler. */

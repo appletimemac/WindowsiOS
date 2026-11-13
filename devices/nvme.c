@@ -1,5 +1,6 @@
 #include "nvme.h"
 
+#include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -365,6 +366,30 @@ static void process_admin_cmd(HvNvme *nv, HvNvmeSq *sq, const NvmeCmd *cmd) {
     post_cqe(nv, sq, 0, cmd->cid, dw0, status);
 }
 
+/* lat_hist bucket limits (100 us, 1 ms, 10 ms) in mach_absolute_time ticks; set once by hv_nvme_create. */
+static uint64_t lat_limit[3];
+
+static void lat_limits_init(void) {
+    if (lat_limit[0]) return;
+    mach_timebase_info_data_t tb;
+    if (mach_timebase_info(&tb) != 0 || !tb.numer || !tb.denom) tb.numer = tb.denom = 1;
+    static const uint64_t us[3] = {100, 1000, 10000};
+    for (int i = 0; i < 3; i++) lat_limit[i] = us[i] * 1000ull * tb.denom / tb.numer;
+}
+
+static void count_rw(HvNvme *nv, int is_read, uint64_t ticks) {
+    if (is_read) {
+        nv->rd_n++;
+        nv->rd_ticks += ticks;
+        if (ticks > nv->rd_max_ticks) nv->rd_max_ticks = ticks;
+    } else {
+        nv->wr_n++;
+        nv->wr_ticks += ticks;
+        if (ticks > nv->wr_max_ticks) nv->wr_max_ticks = ticks;
+    }
+    nv->lat_hist[ticks < lat_limit[0] ? 0 : ticks < lat_limit[1] ? 1 : ticks < lat_limit[2] ? 2 : 3]++;
+}
+
 static uint8_t *ensure_io_buf(HvNvme *nv, uint32_t bytes) {
     if (bytes <= nv->io_buf_cap) return nv->io_buf;
     uint8_t *nb = realloc(nv->io_buf, bytes);
@@ -388,8 +413,12 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         return;
     }
 
+    int is_rw = cmd->opc == 0x01 || cmd->opc == 0x02;
+    uint64_t t0 = is_rw ? mach_absolute_time() : 0;
+
     switch (cmd->opc) {
     case 0x00: /* Flush */
+        nv->flush_n++;
         if (hv_disk_flush(nv->disk) != 0) status = 0x0004;
         break;
     case 0x01:   /* Write */
@@ -499,6 +528,8 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         status = 0x0001; /* Invalid Command Opcode */
         break;
     }
+
+    if (is_rw) count_rw(nv, cmd->opc == 0x02, mach_absolute_time() - t0);
 
     if (status) { /* Windows turns these into paging and file system errors: say which command failed */
         static int logged;
@@ -658,6 +689,7 @@ HvNvme *hv_nvme_create(HvMachine *m, HvPcie *bus, HvDisk *disk, const char *seri
     nv->disk = disk;
     if (serial) snprintf(nv->serial, sizeof nv->serial, "%s", serial);
     pthread_mutex_init(&nv->mu, NULL);
+    lat_limits_init();
 
     /* CAP: MQES=1023, CQR=1, TO=20, DSTRD=0, CSS=1 (NVM), MPSMIN=0 (4KB), MPSMAX=4 (64KB) */
     nv->cap = 1023ull | (1ull << 16) | (20ull << 24) | (1ull << 37) | (0ull << 48) | (4ull << 52);

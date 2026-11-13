@@ -425,6 +425,108 @@ static void test_scanout_flow(void) {
     free(fbmem);
 }
 
+static void check_grid(const char *what, const uint64_t *want) {
+    for (int i = 0; i < HV_VGPU_GRID_W * HV_VGPU_GRID_H; i++) {
+        char name[96];
+        snprintf(name, sizeof name, "%s: grid cell %d (col %d, row %d)", what, i, i % HV_VGPU_GRID_W, i / HV_VGPU_GRID_W);
+        check(name, gpu->grid[i], want[i]);
+    }
+}
+
+static void zero_flush_counters(void) {
+    gpu->flush_px = gpu->rect_small = gpu->rect_mid = gpu->rect_big = 0;
+    memset(gpu->grid, 0, sizeof gpu->grid);
+}
+
+/* The counters the host reads from another thread: flushed pixels by rectangle size and by where on the scanout,
+   and the transfer bytes and time. A flush counts only the part of its rectangle that is on the scanout. */
+static void test_counters(void) {
+    const uint32_t W = 640, H = 480;
+    const uint64_t total = (uint64_t)W * H * 4;
+    uint64_t want[HV_VGPU_GRID_W * HV_VGPU_GRID_H] = {0};
+    check("grid is 8x6", HV_VGPU_GRID_W == 8 && HV_VGPU_GRID_H == 6, 1);
+    check("create", create_2d(30, 2, W, H), 0x1100);
+    check("create (never the scanout)", create_2d(31, 2, 64, 64), 0x1100);
+    check("attach", attach(30, (uint64_t[]){BACKING_PA + 0x400000}, (uint32_t[]){(uint32_t)total}, 1), 0x1100);
+
+    /* the whole resource is the scanout: cells are 80x80 pixels */
+    check("scanout", set_scanout(0, 30, 0, 0, W, H), 0x1100);
+    zero_flush_counters();
+    check("flush small", flush(30, 0, 0, 100, 100), 0x1100); /* 10000 px, center (50,50): col 0, row 0 */
+    want[0] += 10000;
+    check("flush mid", flush(30, 320, 240, 200, 100), 0x1100); /* 20000 px, center (420,290): col 5, row 3 */
+    want[3 * 8 + 5] += 20000;
+    check("flush big", flush(30, 0, 0, 640, 480), 0x1100); /* 307200 px, center (320,240): col 4, row 3 */
+    want[3 * 8 + 4] += 307200;
+    check("flush of 16384 px is mid", flush(30, 512, 352, 128, 128), 0x1100); /* center (576,416): col 7, row 5 */
+    want[5 * 8 + 7] += 16384;
+    check("flush of 16383 px is small", flush(30, 0, 0, 127, 129), 0x1100); /* center (63,64): col 0, row 0 */
+    want[0] += 16383;
+    check("flush of 261760 px is mid", flush(30, 0, 0, 640, 409), 0x1100); /* center (320,204): col 4, row 2 */
+    want[2 * 8 + 4] += 261760;
+    check("flush of 262400 px is big", flush(30, 0, 0, 640, 410), 0x1100); /* center (320,205): col 4, row 2 */
+    want[2 * 8 + 4] += 262400;
+    check("flush_px", gpu->flush_px, 10000 + 20000 + 307200 + 16384 + 16383 + 261760 + 262400);
+    check("small rects", gpu->rect_small, 2);
+    check("mid rects", gpu->rect_mid, 3);
+    check("big rects", gpu->rect_big, 2);
+    check_grid("whole resource", want);
+
+    /* a part of the resource is the scanout: x 160..480, y 120..360, cells 40x40 pixels */
+    check("scanout part", set_scanout(0, 30, 160, 120, 320, 240), 0x1100);
+    zero_flush_counters();
+    memset(want, 0, sizeof want);
+    uint64_t flushes = gpu->flushes;
+    check("flush over the top left corner", flush(30, 100, 60, 120, 100), 0x1100); /* clipped to x 160..220, y 120..160 */
+    want[0] += 60 * 40;                                                            /* center (190,140): col 0, row 0 */
+    check("flush over the bottom right corner", flush(30, 400, 300, 200, 180), 0x1100); /* clipped to x 400..480, y 300..360 */
+    want[5 * 8 + 7] += 80 * 60;                                                    /* center (440,330): col 7, row 5 */
+    check("flush_px is the clipped area", gpu->flush_px, 60 * 40 + 80 * 60);
+    check("clipped rects are small", gpu->rect_small, 2);
+    check("no mid", gpu->rect_mid, 0);
+    check("no big", gpu->rect_big, 0);
+    check_grid("clipped", want);
+    check("flush wholly left of the part", flush(30, 0, 0, 100, 100), 0x1100);
+    check("flush wholly below it", flush(30, 0, 400, 640, 80), 0x1100);
+    check("nothing counted off the scanout", gpu->flush_px, 60 * 40 + 80 * 60);
+    check("no bucket either", gpu->rect_small + gpu->rect_mid + gpu->rect_big, 2);
+    check("the flush counter still counts them", gpu->flushes - flushes, 4);
+    check_grid("off the scanout", want);
+    check("flush covering the whole part", flush(30, 0, 0, 640, 480), 0x1100); /* clipped to 320x240; center (320,240): col 4, row 3 */
+    want[3 * 8 + 4] += 320 * 240;
+    check("flush_px with the whole part", gpu->flush_px, 60 * 40 + 80 * 60 + 320 * 240);
+    check("the whole part is a mid rect", gpu->rect_mid, 1);
+    check_grid("whole part", want);
+
+    /* a resource that is not on the scanout, and no scanout at all */
+    zero_flush_counters();
+    check("flush of a resource that is not the scanout", flush(31, 0, 0, 64, 64), 0x1100);
+    check("scanout off", set_scanout(0, 0, 0, 0, 0, 0), 0x1100);
+    check("flush with no scanout", flush(30, 0, 0, 100, 100), 0x1100);
+    check("flush_px stays 0", gpu->flush_px, 0);
+    check("no buckets", gpu->rect_small + gpu->rect_mid + gpu->rect_big, 0);
+    memset(want, 0, sizeof want);
+    check_grid("no scanout", want);
+
+    /* transfers: the bytes actually copied, and the host time that took */
+    gpu->xfer_bytes = gpu->xfer_ticks = 0;
+    check("transfer all", transfer(30, 0, 0, W, H, 0), 0x1100);
+    check("bytes of a whole transfer", gpu->xfer_bytes, total);
+    check("it took some time", gpu->xfer_ticks > 0, 1);
+    uint64_t ticks = gpu->xfer_ticks;
+    check("transfer a rect", transfer(30, 100, 50, 40, 30, (50ull * W + 100) * 4), 0x1100);
+    check("bytes of a rectangle", gpu->xfer_bytes, total + 40 * 30 * 4);
+    check("time only grows", gpu->xfer_ticks >= ticks, 1);
+    check("a rejected transfer", transfer(30, 600, 0, 100, 10, 0), 0x1205);
+    check("an empty transfer", transfer(30, 0, 0, 0, 0, 0), 0x1100);
+    check("neither counts bytes", gpu->xfer_bytes, total + 40 * 30 * 4);
+    check("transfer past the end of the backing", transfer(30, 0, H - 1, W, 1, total - 8), 0x1100);
+    check("only the 8 bytes that were there count", gpu->xfer_bytes, total + 40 * 30 * 4 + 8);
+
+    check("unref", simple(0x0102, 30), 0x1100);
+    check("unref the other", simple(0x0102, 31), 0x1100);
+}
+
 static void test_formats(void) {
     check("create ARGB", create_2d(2, 3, 64, 64), 0x1100);
     uint8_t *src = host(BACKING_PA + 0x300000);
@@ -653,6 +755,7 @@ int main(void) {
     test_edid();
     test_errors_and_fences();
     test_scanout_flow();
+    test_counters();
     test_formats();
     test_cursor();
     test_resize();

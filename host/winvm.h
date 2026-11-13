@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "perf.h"
 #include "winvirt.h"
 
 typedef struct HvWinVmConfig {
@@ -61,8 +62,11 @@ void hv_winvm_touch(const HvTouchContact *contacts, int count);
 int hv_winvm_touch_ready(void);
 void hv_winvm_send_ctrl_alt_del(void);
 void hv_winvm_usb_stats(int *kbd_ready, int *tab_ready, uint64_t *delivered);
+/* jit_flushes: translation-cache flushes that happened (stats.block_flushes). */
 void hv_winvm_engine_stats(uint64_t *jit_used_bytes, uint64_t *jit_cap_bytes,
-                           uint64_t *jit_full_flushes, uint64_t *wfi_ticks);
+                           uint64_t *jit_flushes, uint64_t *wfi_ticks);
+/* One row of perf.csv (host/perf.h). Any thread; the caller fills the host fields (memory, thermal, power). */
+void hv_winvm_perf_snapshot(HvPerfSnap *out);
 int hv_winvm_share_up(void);
 
 HvMachine *hv_winvm_machine(void);
