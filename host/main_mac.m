@@ -7,6 +7,7 @@
 #import <Metal/Metal.h>
 
 #include <ctype.h>
+#include <mach/mach.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "winvm.h"
@@ -44,6 +46,102 @@ static void on_sig(int sig) {
     (void)sig;
     g_sig_stop = 1;
     hv_winvm_stop();
+}
+
+/* ---- Timestamps and the perf CSV (--perf-csv) ---- */
+
+static uint64_t g_mono_zero;
+
+/* Monotonic ms since the runner started: the prefix of every logged command. */
+static uint64_t mono_ms(void) {
+    return (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_mono_zero) / 1000000ull;
+}
+
+static HvPerfCsv g_perf;
+static pthread_mutex_t g_perf_mu = PTHREAD_MUTEX_INITIALIZER; /* guards g_perf and g_perf_prev */
+static pthread_t g_perf_tid;
+static int g_perf_up;
+static int g_perf_ms = 1000;
+static atomic_int g_perf_quit;
+static HvPerfSnap g_perf_prev;
+
+static void perf_fill_host(HvPerfSnap *s) {
+    static mach_port_t host;
+    if (!host) host = mach_host_self();
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm, &n) == KERN_SUCCESS)
+        s->avail_mem_mb_now = ((uint64_t)vm.free_count + vm.inactive_count + vm.speculative_count) *
+                              (uint64_t)getpagesize() >> 20;
+    @autoreleasepool {
+        s->thermal_now = (uint64_t)NSProcessInfo.processInfo.thermalState;
+    }
+    s->low_power_now = 0;
+}
+
+static void perf_row(void) {
+    pthread_mutex_lock(&g_perf_mu);
+    if (g_perf.f) {
+        HvPerfSnap s;
+        hv_winvm_perf_snapshot(&s);
+        perf_fill_host(&s);
+        hv_perf_csv_row(&g_perf, &s);
+        g_perf_prev = s;
+    }
+    pthread_mutex_unlock(&g_perf_mu);
+}
+
+static void *perf_thread(void *arg) {
+    (void)arg;
+    uint64_t next = mono_ms() + (uint64_t)g_perf_ms; /* perf_start wrote the first row */
+    while (!atomic_load(&g_perf_quit)) {
+        uint64_t now = mono_ms();
+        if (now >= next) {
+            perf_row();
+            next += (uint64_t)g_perf_ms;
+            if (next <= now) next = now + (uint64_t)g_perf_ms;
+        }
+        uint64_t wait = next > now ? next - now : 0;
+        usleep((useconds_t)(wait < 50 ? wait : 50) * 1000u);
+    }
+    return NULL;
+}
+
+/* At exit, headless or not: one last row, then close. */
+static void perf_finish(void) {
+    if (!g_perf_up) return;
+    g_perf_up = 0;
+    atomic_store(&g_perf_quit, 1);
+    pthread_join(g_perf_tid, NULL);
+    pthread_mutex_lock(&g_perf_mu);
+    if (g_perf.f) {
+        HvPerfSnap s;
+        hv_winvm_perf_snapshot(&s);
+        perf_fill_host(&s);
+        /* A vCPU thread that has exited can no longer be asked for its on-core time: keep the last value read. */
+        uint64_t *run[4] = {&s.run0_ns, &s.run1_ns, &s.run2_ns, &s.run3_ns};
+        const uint64_t prev[4] = {g_perf_prev.run0_ns, g_perf_prev.run1_ns, g_perf_prev.run2_ns, g_perf_prev.run3_ns};
+        for (int i = 0; i < 4; i++)
+            if (*run[i] < prev[i]) *run[i] = prev[i];
+        hv_perf_csv_row(&g_perf, &s);
+        hv_perf_csv_close(&g_perf);
+    }
+    pthread_mutex_unlock(&g_perf_mu);
+}
+
+static int perf_start(const char *path, const HvWinVmConfig *cfg) {
+    char comment[256];
+    const char *q = getenv("HV_QOS");
+    /* winvm.c gives a zero jit_bytes 768 MiB. */
+    snprintf(comment, sizeof comment, "runner=mac cpus=%d ram_mb=%llu jit_mb=%llu qos=%s", cfg->ncpus,
+             (unsigned long long)cfg->ram_mb,
+             (unsigned long long)(cfg->jit_bytes ? cfg->jit_bytes >> 20 : 768), q && *q ? q : "default");
+    if (hv_perf_csv_open(&g_perf, path, 0, comment) != 0) return -1;
+    perf_row();
+    g_perf_up = 1;
+    pthread_create(&g_perf_tid, NULL, perf_thread, NULL);
+    atexit(perf_finish);
+    return 0;
 }
 
 /* Simple ASCII typer using USB HID Keyboard usages */
@@ -549,6 +647,8 @@ static void usage(const char *prog) {
             "  --screenshot-after <sec>  Save screenshot after N seconds\n"
             "  --timeout <sec>           Auto-stop VM after N seconds\n"
             "  --cmd-file <path>         Tail input commands from file\n"
+            "  --perf-csv <path>         Append a row of performance counters to path (host/perf.h)\n"
+            "  --perf-ms <n>             Milliseconds between perf rows (default: 1000); one more row when the VM stops\n"
             "  --no-net                  Disable SLIRP networking\n"
             "  --sound                   Enable VirtIO sound output\n"
             "  --stats <sec>             Print JIT statistics every N seconds\n"
@@ -566,6 +666,8 @@ int main(int argc, char **argv) {
     int headless = 0;
     TimerArgs targs = {NULL, 0, 0};
     const char *cmd_file = getenv("HV_INPUT_FILE");
+    const char *perf_path = NULL;
+    g_mono_zero = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     char share_sock_buf[512] = {0};
 
     for (int i = 1; i < argc; i++) {
@@ -588,6 +690,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cmd-file"))     cmd_file = argv[++i];
         else if (!strcmp(argv[i], "--stats"))        cfg.stats_interval = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--log"))          cfg.log = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--perf-csv"))     perf_path = argv[++i];
+        else if (!strcmp(argv[i], "--perf-ms")) {
+            int ms = atoi(argv[++i]);
+            g_perf_ms = ms > 0 ? ms : 1000;
+        }
         else usage(argv[0]);
     }
 
@@ -607,6 +714,11 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
+
+    if (perf_path && *perf_path && perf_start(perf_path, &cfg) != 0) {
+        fprintf(stderr, "winvm: cannot open perf csv %s\n", perf_path);
+        return 1;
+    }
 
     if (targs.screenshot_path || targs.timeout_sec > 0) {
         pthread_t tt;

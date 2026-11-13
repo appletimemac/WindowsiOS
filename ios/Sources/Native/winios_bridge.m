@@ -11,6 +11,7 @@
 #include <mach/mach_time.h>
 #include <os/lock.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 
 static WinIOSBridge *s_shared_bridge = nil;
 
@@ -29,6 +30,9 @@ static WinIOSBridge *s_shared_bridge = nil;
     uint64_t _lastMachTicks;
     uint64_t _lastWfiTicks;
     double _lastWfiIdlePct;
+    dispatch_source_t _perfTimer;
+    HvPerfCsv _perfCsv;
+    BOOL _engineStats;
 
     os_unfair_lock _metricsLock;
     CGSize _screenSizePts;
@@ -414,7 +418,12 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     const char *toolsPath = [[NSFileManager defaultManager] fileExistsAtPath:toolsImage] ? toolsImage.fileSystemRepresentation : NULL;
 
     _configuredRamMB = ramMB;
-    _configuredCPUs = 4;
+    /* 4 vCPUs; WINIOS_CPUS (1 to 4) at launch for measuring against the phone's 2 performance cores. Only on a
+       fresh boot: a hibernated Windows must resume with the CPU count it hibernated with. */
+    const char *cpusEnv = getenv("WINIOS_CPUS");
+    int cpus = cpusEnv ? atoi(cpusEnv) : 4;
+    _configuredCPUs = cpus >= 1 && cpus <= 4 ? cpus : 4;
+    _engineStats = getenv("HV_ENGINE_STATS") != NULL || [[NSUserDefaults standardUserDefaults] boolForKey:@"winios.engineStats"];
 
     HvWinVmConfig cfg = {
         .code_fd = codePath.fileSystemRepresentation,
@@ -432,7 +441,10 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         .no_net = 0,
         .enable_sound = 1,
         .log = 0,
-        .stats_interval = 0,
+        /* Engine stats (translation time, lock waits) cost a little on every translation: on request only
+           (launch with HV_ENGINE_STATS=1, or the winios.engineStats default). The huge interval keeps the
+           counters on without ever printing the stats summary, which would stall CPU 0. */
+        .stats_interval = _engineStats ? 1000000 : 0,
     };
 
     char err[256] = {0};
@@ -460,6 +472,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     hv_winvm_start(1, vm_exit_trampoline);
 
     [self startDiagTimer];
+    [self startPerfLog];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
     [self notifyChanged];
 }
@@ -486,6 +499,54 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         dispatch_source_cancel(_diagTimer);
         _diagTimer = nil;
     }
+}
+
+static int sysctl_int(const char *name) {
+    int v = 0;
+    size_t n = sizeof v;
+    return sysctlbyname(name, &v, &n, NULL, 0) == 0 ? v : -1;
+}
+
+/* Documents/perf.csv: one row of every counter (host/perf.h) every 2 s, kept to about 8 MB plus perf.csv.1.
+   Pulled with devicectl and read by scripts/perf_report.py. */
+- (void)startPerfLog {
+    [self stopPerfLog];
+    NSString *path = [[self documentsPath] stringByAppendingPathComponent:@"perf.csv"];
+    NSString *build = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?";
+    const char *qos = getenv("HV_QOS");
+    NSString *comment = [NSString stringWithFormat:
+        @"start=%.0f build=%@ os=%@ cpus=%d ram_mb=%llu jit_mb=%.0f pcores=%d ecores=%d engine_stats=%d qos=%s",
+        [NSDate date].timeIntervalSince1970, build, UIDevice.currentDevice.systemVersion, _configuredCPUs,
+        _configuredRamMB, (double)winios_jit_mapping().size / (1024.0 * 1024.0),
+        sysctl_int("hw.perflevel0.logicalcpu"), sysctl_int("hw.perflevel1.logicalcpu"), _engineStats ? 1 : 0,
+        qos ? qos : "default"];
+    dispatch_sync(_diagQueue, ^{
+        hv_perf_csv_open(&self->_perfCsv, path.fileSystemRepresentation, 8l << 20, comment.UTF8String);
+    });
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _diagQueue);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                              2ull * NSEC_PER_SEC, NSEC_PER_SEC / 10);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf->_vmRunning) return;
+        HvPerfSnap s;
+        hv_winvm_perf_snapshot(&s);
+        s.avail_mem_mb_now = [strongSelf availableMemoryMB];
+        s.thermal_now = (uint64_t)NSProcessInfo.processInfo.thermalState;
+        s.low_power_now = NSProcessInfo.processInfo.lowPowerModeEnabled ? 1 : 0;
+        hv_perf_csv_row(&strongSelf->_perfCsv, &s);
+    });
+    _perfTimer = timer;
+    dispatch_resume(timer);
+}
+
+- (void)stopPerfLog {
+    if (_perfTimer) {
+        dispatch_source_cancel(_perfTimer);
+        _perfTimer = nil;
+    }
+    dispatch_sync(_diagQueue, ^{ hv_perf_csv_close(&self->_perfCsv); });
 }
 
 - (void)onDiagTickBackground {
@@ -557,8 +618,11 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         @"avail_mem_mb: %llu\n"
         @"jit_used_mb: %.1f\n"
         @"jit_cap_mb: %.0f\n"
-        @"jit_full_flushes: %llu\n"
+        @"jit_flushes: %llu\n"
         @"wfi_idle_pct: %.1f\n"
+        @"thermal_state: %ld\n"
+        @"low_power: %d\n"
+        @"cores_perf_eff: %d/%d\n"
         @"fb_size: %ux%u\n"
         @"frames_presented: %llu\n"
         @"usb_kbd_ready: %d\n"
@@ -583,6 +647,9 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         (double)jitCapBytes / (1024.0 * 1024.0),
         jitFullFlushes,
         wfiIdlePct,
+        (long)NSProcessInfo.processInfo.thermalState,
+        NSProcessInfo.processInfo.lowPowerModeEnabled ? 1 : 0,
+        sysctl_int("hw.perflevel0.logicalcpu"), sysctl_int("hw.perflevel1.logicalcpu"),
         w, h,
         frames,
         kbdReady,
@@ -601,6 +668,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 - (void)handleVMExitWithReason:(NSString *)reason {
     _vmRunning = NO;
     [self stopDiagTimer];
+    [self stopPerfLog];
     [[UIApplication sharedApplication] setIdleTimerDisabled:NO];
     _vmStatus = [NSString stringWithFormat:@"Stopped (%@)", reason];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
