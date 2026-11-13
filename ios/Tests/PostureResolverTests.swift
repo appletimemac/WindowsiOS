@@ -82,4 +82,22 @@ struct PostureResolverTests {
         #expect(lid.maxY <= clamshellCrease.minY)
         #expect(PostureResolver.primaryPane(windowSize: innerPortrait, fold: nil, laptop: false).size == innerPortrait)
     }
+
+    @Test func sideBarOnTheRightStaysOffABookCrease() {
+        let book = FoldGeometry(divisionFrame: bookCrease)
+        let right = PostureResolver.sidePane(windowSize: innerLandscape, fold: book, laptop: false, onRight: true)
+        #expect(right.minX >= bookCrease.maxX)
+        #expect(right.maxX == innerLandscape.width)
+        #expect(right.height == innerLandscape.height)
+        // On the left the pane before the crease already touches that edge.
+        let left = PostureResolver.sidePane(windowSize: innerLandscape, fold: book, laptop: false, onRight: false)
+        #expect(left == PostureResolver.primaryPane(windowSize: innerLandscape, fold: book, laptop: false))
+    }
+
+    @Test func sideBarUsesTheLidInLaptopLayoutAndTheWindowWhenFlat() {
+        let clamshell = FoldGeometry(divisionFrame: clamshellCrease)
+        let lid = PostureResolver.sidePane(windowSize: innerPortrait, fold: clamshell, laptop: true, onRight: true)
+        #expect(lid == PostureResolver.primaryPane(windowSize: innerPortrait, fold: clamshell, laptop: true))
+        #expect(PostureResolver.sidePane(windowSize: innerLandscape, fold: nil, laptop: false, onRight: true).size == innerLandscape)
+    }
 }

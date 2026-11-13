@@ -13,6 +13,14 @@ enum PostureMode: String, CaseIterable {
         case .fullScreen: return "ipad.landscape"
         }
     }
+
+    var title: String {
+        switch self {
+        case .auto: return "Follow Hinge"
+        case .laptop: return "Laptop"
+        case .fullScreen: return "Full Screen"
+        }
+    }
 }
 
 /// Raw values match UIHingeStatus (UIHinge.h, iOS 27.1).
@@ -106,5 +114,16 @@ enum PostureResolver {
         case .horizontal:
             return CGRect(x: 0, y: 0, width: windowSize.width, height: max(0, fold.frame.minY))
         }
+    }
+
+    /// Where chrome that hugs one side of the display goes. Beside a book-style crease that is the
+    /// pane on its own side, so a bar on the right edge never lands on the crease; everywhere else
+    /// it is the primary pane.
+    static func sidePane(windowSize: CGSize, fold: FoldGeometry?, laptop: Bool, onRight: Bool) -> CGRect {
+        guard onRight, !laptop, let fold, fold.axis == .vertical else {
+            return primaryPane(windowSize: windowSize, fold: fold, laptop: laptop)
+        }
+        let x = min(windowSize.width, max(0, fold.frame.maxX))
+        return CGRect(x: x, y: 0, width: windowSize.width - x, height: windowSize.height)
     }
 }

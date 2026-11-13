@@ -176,33 +176,6 @@ final class VMViewModel: ObservableObject {
         }
     }
 
-    func launchGuestEdgeBrowser() {
-        // Win+R -> "msedge" -> Enter
-        WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe3)], key: 0x15)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
-            let msedgeHids: [UInt8] = [0x10, 0x16, 0x08, 0x07, 0x0a, 0x08, 0x28] // m s e d g e Enter
-            for (idx, code) in msedgeHids.enumerated() {
-                DispatchQueue.main.asyncAfter(deadline: .now() + Double(idx) * 0.045) {
-                    WinIOSBridge.shared.tapKeyHid(code)
-                }
-            }
-        }
-    }
-
-    func launchGuestAntigravity() {
-        // Win+R -> "antigravity" -> Enter (registered in HKCU\...\App Paths\antigravity.exe)
-        WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe3)], key: 0x15)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42) {
-            // a n t i g r a v i t y Enter
-            let agHids: [UInt8] = [0x04, 0x11, 0x17, 0x0c, 0x0a, 0x15, 0x04, 0x19, 0x0c, 0x17, 0x1c, 0x28]
-            for (idx, code) in agHids.enumerated() {
-                DispatchQueue.main.asyncAfter(deadline: .now() + Double(idx) * 0.040) {
-                    WinIOSBridge.shared.tapKeyHid(code)
-                }
-            }
-        }
-    }
-
     func syncFromBridge() {
         let b = WinIOSBridge.shared
         isJITLive = b.isJITLive

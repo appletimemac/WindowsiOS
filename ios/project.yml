@@ -43,7 +43,7 @@ targets:
         UIStatusBarHidden: true
         CADisableMinimumFrameDurationOnPhone: true
         UIViewControllerBasedStatusBarAppearance: false
-        NSMicrophoneUsageDescription: "Windows 11 and Antigravity use your iPhone Duo microphone for live voice input and audio capture."
+        NSMicrophoneUsageDescription: "Windows 11 uses your iPhone Duo microphone for live voice input and audio capture."
         UIBackgroundModes:
           - audio
         UISupportedInterfaceOrientations:

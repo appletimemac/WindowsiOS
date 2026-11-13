@@ -5,12 +5,12 @@ import UIKit
 struct SessionView: View {
     @ObservedObject var vm: VMViewModel
     @Environment(\.displayScale) private var displayScale
-    @State private var fabExpanded = false
+    @Environment(\.layoutDirection) private var layoutDirection
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var toolbarOpen = false
+    @State private var showingSettings = false
     @State private var confirmingShutDown = false
     @State private var confirmingHibernate = false
-    /// Bottom leading by default: clear of the Windows tray and clock, and of a maximized
-    /// window's close button.
-    @AppStorage("fabCorner") private var fabCorner: FABCorner = .bottomLeading
 
     var body: some View {
         // A reader that ignores the safe area reads its insets as zero (measured on the iOS 27.2
@@ -35,8 +35,8 @@ struct SessionView: View {
         let fold = activeFold(in: geo)
         let laptopActive = vm.isLaptopLayoutActive(fold: fold)
         let layout = makeLayout(geo: geo, fold: fold, laptop: laptopActive, keyboardInset: keyboardInset)
-        // Floating chrome lives in the pane before the crease (the lid in laptop layout),
-        // inside the picture's margins.
+        // The boot card lives in the pane before the crease (the lid in laptop layout), inside the
+        // picture's margins.
         let pane = PostureResolver.primaryPane(windowSize: size, fold: fold, laptop: laptopActive)
             .intersection(layout.margins.inset(layout.area))
 
@@ -65,8 +65,8 @@ struct SessionView: View {
                     .position(x: pane.midX, y: pane.midY)
             }
 
-            FloatingActionMenu(isExpanded: $fabExpanded, corner: $fabCorner, region: pane) {
-                fabItems(laptopActive: laptopActive)
+            SystemBarEdgeReader { edge in
+                toolbar(barEdge: edge, windowSize: size, fold: fold, laptop: laptopActive, layout: layout)
             }
         }
         // Windows' tablet posture follows the layout: the deck is the keyboard.
@@ -86,6 +86,10 @@ struct SessionView: View {
         .sheet(item: $vm.activeSafariURL) { item in
             SafariSheet(url: item.url)
                 .ignoresSafeArea()
+                .preferredColorScheme(.dark)
+        }
+        .sheet(isPresented: $showingSettings) {
+            SettingsSheet(vm: vm)
                 .preferredColorScheme(.dark)
         }
         .alert("Hibernate Windows?", isPresented: $confirmingHibernate) {
@@ -165,8 +169,8 @@ struct SessionView: View {
         )
     }
 
-    private func openFAB() {
-        withAnimation(.fabBounce) { fabExpanded = true }
+    private func setToolbarOpen(_ open: Bool) {
+        withAnimation(.toolbar(reduceMotion: reduceMotion)) { toolbarOpen = open }
     }
 
     private func setPosture(_ mode: PostureMode) {
@@ -190,7 +194,7 @@ struct SessionView: View {
                 rightClickArmed: $vm.rightClickArmed,
                 keyboardVisible: keyboardVisible,
                 pictureFrame: picture.frame.offsetBy(dx: -area.minX, dy: -area.minY),
-                onThreeFingerTap: openFAB
+                onThreeFingerTap: { setToolbarOpen(true) }
             )
             .frame(width: area.width, height: area.height)
             .position(x: area.midX, y: area.midY)
@@ -215,61 +219,149 @@ struct SessionView: View {
         .frame(width: size.width, height: size.height, alignment: .top)
     }
 
-    // MARK: - FAB menu
+    // MARK: - Toolbar
 
-    /// Listed top to bottom; the last item sits next to the button.
+    /// The bar runs down the side the system keeps its own bars on, where it keeps them on a side;
+    /// otherwise it comes from the top, clear of the Windows taskbar.
+    private func toolbar(barEdge: HorizontalEdge?, windowSize: CGSize, fold: FoldGeometry?, laptop: Bool,
+                         layout: SessionLayout) -> some View {
+        let onRight = barEdge.map { ($0 == .trailing) == (layoutDirection == .leftToRight) } ?? false
+        let outer = barEdge == nil
+            ? PostureResolver.primaryPane(windowSize: windowSize, fold: fold, laptop: laptop)
+            : PostureResolver.sidePane(windowSize: windowSize, fold: fold, laptop: laptop, onRight: onRight)
+        return SessionToolbar(isOpen: $toolbarOpen, dock: barEdge.map(ToolbarDock.side) ?? .top,
+                              outer: outer, region: outer.intersection(layout.margins.inset(layout.area)),
+                              cameras: zip(layout.cameras, layout.camerasActive).filter(\.1).map(\.0)) {
+            toolbarItems(laptopActive: laptop)
+        }
+    }
+
     @ViewBuilder
-    private func fabItems(laptopActive: Bool) -> some View {
+    private func toolbarItems(laptopActive: Bool) -> some View {
         if vm.isVMRunning {
-            FABMenuItem(title: "Shut Down", icon: "power", role: .destructive) {
-                confirmingShutDown = true
-            }
-            FABMenuItem(title: "Hibernate", icon: "moon.zzz") {
-                confirmingHibernate = true
-            }
-            FABMenuItem(title: "Task Manager", icon: "waveform.path.ecg") {
-                WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe0), NSNumber(value: 0xe1)], key: 0x29)
-            }
-            FABMenuItem(title: "Antigravity", icon: "sparkles") {
-                vm.launchGuestAntigravity()
-            }
-            FABMenuItem(title: "Edge", icon: "globe") {
-                vm.launchGuestEdgeBrowser()
-            }
-            FABMenuItem(title: "Sign In with Safari", icon: "safari", isOn: vm.useSafariForOAuth) {
-                vm.toggleOAuthBrowserMode()
-            }
-            FABMenuItem(title: "Right Click", icon: "computermouse", isOn: vm.rightClickArmed) {
-                vm.rightClickArmed.toggle()
-            }
-            FABMenuItem(title: "Trackpad", icon: "rectangle.and.hand.point.up.left", isOn: vm.trackpadMode) {
-                vm.trackpadMode.toggle()
-            }
             if !laptopActive {
-                FABMenuItem(title: "Keyboard", icon: "keyboard", isOn: vm.systemKeyboardVisible) {
+                ToolbarButton(title: "Keyboard",
+                              systemImage: vm.systemKeyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
+                              isOn: vm.systemKeyboardVisible) {
                     vm.systemKeyboardVisible.toggle()
                 }
             }
-        }
-        if vm.postureMode != .auto {
-            FABMenuItem(title: "Follow Hinge", icon: PostureMode.auto.iconName) {
-                setPosture(.auto)
+            ToolbarButton(title: "Trackpad", systemImage: "rectangle.and.hand.point.up.left", isOn: vm.trackpadMode) {
+                vm.trackpadMode.toggle()
             }
-        }
-        if laptopActive {
-            FABMenuItem(title: "Full Screen", icon: "arrow.up.left.and.arrow.down.right") {
-                setPosture(.fullScreen)
-            }
-        } else {
-            FABMenuItem(title: "Laptop", icon: "laptopcomputer") {
-                setPosture(.laptop)
-            }
-        }
-        if vm.isVMRunning {
-            FABMenuItem(title: "Start", icon: "square.grid.2x2") {
+            ToolbarButton(title: "Start") {
                 WinIOSBridge.shared.sendWindowsKey()
+            } icon: {
+                StartMark()
             }
         }
+        Menu {
+            Picker("Screen", selection: Binding(get: { vm.postureMode }, set: { mode in
+                setToolbarOpen(false)
+                setPosture(mode)
+            })) {
+                ForEach(PostureMode.allCases, id: \.self) { mode in
+                    Label(mode.title, systemImage: mode.iconName).tag(mode)
+                }
+            }
+        } label: {
+            ToolbarItemLabel(title: "Screen") {
+                Image(systemName: (laptopActive ? PostureMode.laptop : PostureMode.fullScreen).iconName)
+            }
+        }
+        .tint(.primary)
+        Menu {
+            Section {
+                if vm.isVMRunning {
+                    Button("Task Manager", systemImage: "waveform.path.ecg") {
+                        setToolbarOpen(false)
+                        WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe0), NSNumber(value: 0xe1)], key: 0x29)
+                    }
+                }
+                Button("Settings", systemImage: "gearshape") {
+                    setToolbarOpen(false)
+                    showingSettings = true
+                }
+            }
+            if vm.isVMRunning {
+                Section {
+                    Button("Hibernate", systemImage: "moon.zzz") {
+                        setToolbarOpen(false)
+                        confirmingHibernate = true
+                    }
+                    Button("Shut Down", systemImage: "power", role: .destructive) {
+                        setToolbarOpen(false)
+                        confirmingShutDown = true
+                    }
+                }
+            }
+        } label: {
+            ToolbarItemLabel(title: "More") {
+                Image(systemName: "ellipsis")
+            }
+        }
+        .tint(.primary)
+    }
+}
+
+/// The Windows mark for the Start control. Its size is read inside the toolbar, where Dynamic Type stops
+/// at the size the bar's slots stop at.
+private struct StartMark: View {
+    @ScaledMetric(relativeTo: .title3) private var size: CGFloat = 19
+
+    var body: some View {
+        WindowsLogoMark(size: size, color: .white)
+    }
+}
+
+/// The side the system keeps its own bars on in this pose (iOS 27.1: the outer display, the inner
+/// display in landscape), or nil where it keeps them across the top and bottom.
+private struct SystemBarEdgeReader<Content: View>: View {
+    @ViewBuilder var content: (HorizontalEdge?) -> Content
+
+    var body: some View {
+        if #available(iOS 27.1, *) {
+            Reader(content: content)
+        } else {
+            content(nil)
+        }
+    }
+
+    @available(iOS 27.1, *)
+    private struct Reader: View {
+        @Environment(\.toolbarVerticalEdge) private var edge
+        @ViewBuilder var content: (HorizontalEdge?) -> Content
+
+        var body: some View { content(edge) }
+    }
+}
+
+// MARK: - Settings
+
+private struct SettingsSheet: View {
+    @ObservedObject var vm: VMViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle("Sign In with Safari", isOn: Binding(get: { vm.useSafariForOAuth }, set: { on in
+                        if on != vm.useSafariForOAuth { vm.toggleOAuthBrowserMode() }
+                    }))
+                } footer: {
+                    Text("Sign-in pages that Windows apps open come up in Safari here, with your passkeys and saved passwords. When this is off they open in Edge inside Windows.")
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
     }
 }
 
