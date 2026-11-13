@@ -158,6 +158,7 @@ static uint16_t handle_identify(HvNvme *nv, const NvmeCmd *cmd) {
         buf[25] = 0;                  /* NLBAF = 0 (1 format) */
         buf[26] = 0;                  /* FLBAS = format 0 */
         buf[33] = 0x08;               /* DLFEAT: read bytes from deallocated blocks are 0 */
+        buf[99] = nv->disk->readonly ? 1 : 0; /* NSATTR: write protected */
         /* LBAF 0 at byte 128: MS=0, LBADS=9 (2^9 = 512 bytes), RP=0 */
         buf[130] = 9;
     } else if (cns == 0x01) { /* Identify Controller */
@@ -381,6 +382,12 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         return;
     }
 
+    if (nv->disk->readonly && (cmd->opc == 0x01 || cmd->opc == 0x08 ||
+                              (cmd->opc == 0x09 && (cmd->cdw11 & 4)))) {
+        post_cqe(nv, sq, sqid, cmd->cid, 0, 0x0020); /* Namespace is Write Protected */
+        return;
+    }
+
     switch (cmd->opc) {
     case 0x00: /* Flush */
         if (hv_disk_flush(nv->disk) != 0) status = 0x0004;
@@ -446,6 +453,15 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         break;
     }
 
+    if (status) { /* Windows turns these into paging and file system errors: say which command failed */
+        static int logged;
+        if (logged < 100) {
+            logged++;
+            fprintf(stderr, "nvme[%d] io opc=%02x sq=%u cid=%u cdw10=%08x cdw11=%08x cdw12=%08x prp1=%llx prp2=%llx: status %04x\n",
+                    nv->pci.slot, cmd->opc, sqid, cmd->cid, cmd->cdw10, cmd->cdw11, cmd->cdw12,
+                    (unsigned long long)cmd->prp1, (unsigned long long)cmd->prp2, status);
+        }
+    }
     post_cqe(nv, sq, sqid, cmd->cid, 0, status);
 }
 
