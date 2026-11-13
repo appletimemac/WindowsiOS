@@ -11,6 +11,7 @@
 #define DEVICE 0x2000
 #define NOTIFY 0x3000
 #define NOTIFY_MULT 4
+#define NO_VECTOR 0xffff
 
 #define DESC_F_NEXT 1
 #define DESC_F_WRITE 2
@@ -37,7 +38,8 @@ static void reset(HvVirtio *v) {
     v->status = 0;
     v->isr = 0;
     v->qsel = 0;
-    for (int i = 0; i < v->nq; i++) v->q[i] = (HvVirtq){.size = HV_VIRTQ_MAX_SIZE};
+    v->msix_config = NO_VECTOR;
+    for (int i = 0; i < v->nq; i++) v->q[i] = (HvVirtq){.size = HV_VIRTQ_MAX_SIZE, .msix_vector = NO_VECTOR};
     hv_pci_set_intx(&v->pci, 0);
     if (v->reset) v->reset(v);
 }
@@ -49,13 +51,13 @@ static uint64_t common_read(HvVirtio *v, uint64_t off) {
     case 0x04: return v->dfsel < 2 ? (uint32_t)(v->features >> (32 * v->dfsel)) : 0;
     case 0x08: return v->gfsel;
     case 0x0c: return v->gfsel < 2 ? (uint32_t)(v->driver_features >> (32 * v->gfsel)) : 0;
-    case 0x10: return 0xffff;                  /* config_msix_vector: no MSI-X */
+    case 0x10: return v->msix_config;
     case 0x12: return v->nq;
     case 0x14: return v->status;
     case 0x15: return v->config_gen;
     case 0x16: return v->qsel;
     case 0x18: return q ? q->size : 0;
-    case 0x1a: return 0xffff;
+    case 0x1a: return q ? q->msix_vector : NO_VECTOR;
     case 0x1c: return q ? q->enabled : 0;
     case 0x1e: return v->qsel;                 /* queue_notify_off = queue index */
     case 0x20: return q ? (uint32_t)q->desc : 0;
@@ -74,11 +76,16 @@ static void set64(uint64_t *f, uint64_t off, uint64_t v, unsigned size) {
     else *f = (*f & ~0xffffffffull) | (uint32_t)v;
 }
 
+static uint16_t msix_map(const HvVirtio *v, uint64_t val) {
+    return (uint16_t)val < v->msix_vectors ? (uint16_t)val : NO_VECTOR;
+}
+
 static void common_write(HvVirtio *v, uint64_t off, uint64_t val, unsigned size) {
     HvVirtq *q = v->qsel < v->nq ? &v->q[v->qsel] : NULL;
     switch (off) {
     case 0x00: v->dfsel = (uint32_t)val; break;
     case 0x08: v->gfsel = (uint32_t)val; break;
+    case 0x10: v->msix_config = msix_map(v, val); break;
     case 0x0c:
         if (v->gfsel < 2) {
             uint64_t mask = 0xffffffffull << (32 * v->gfsel);
@@ -98,6 +105,7 @@ static void common_write(HvVirtio *v, uint64_t off, uint64_t val, unsigned size)
         if (getenv("HV_VIRTIO_CFG_LOG"))
             fprintf(stderr, "virtio %04x: queue %u size %llu\n", v->pci.config[2] | v->pci.config[3] << 8, v->qsel, (unsigned long long)val);
         break;
+    case 0x1a: if (q) q->msix_vector = msix_map(v, val); break;
     case 0x1c: if (q) q->enabled = val & 1; break;
     case 0x20: case 0x24: if (q) set64(&q->desc, off, val, size); break;
     case 0x28: case 0x2c: if (q) set64(&q->avail, off, val, size); break;
@@ -171,7 +179,8 @@ void hv_virtio_config_changed(HvVirtio *v) {
     v->config_gen++;
     /* Before DRIVER_OK nobody services the line, and INTx is shared: an interrupt nobody reads would keep it asserted. */
     if (!(v->status & 4)) return;
-    v->isr |= 2;
+    /* Both bits, as QEMU does: viogpudo's INTx handler only knows 1 (queue) and 3 (config). */
+    v->isr |= 3;
     hv_pci_set_intx(&v->pci, 1);
 }
 

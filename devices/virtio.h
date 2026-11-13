@@ -15,7 +15,7 @@
 #define HV_VIRTIO_F_VERSION_1 (1ull << 32)
 
 typedef struct HvVirtq {
-    uint16_t size, enabled, last_avail;
+    uint16_t size, enabled, last_avail, msix_vector;
     uint64_t desc, avail, used;
     uint8_t out[HV_VIRTQ_MAX_SIZE]; /* heads taken and not yet completed (a completion twice corrupts the driver) */
 } HvVirtq;
@@ -39,6 +39,11 @@ typedef struct HvVirtio {
     uint32_t dfsel, gfsel;
     uint8_t status, isr, config_gen;
     uint16_t qsel, nq;
+    /* MSI-X table entries the driver may map. There is no MSI-X capability, so interrupts stay on INTx
+       whatever is mapped, but virtio-win's viogpudo maps the config vector even on INTx and fails to
+       start when it reads back NO_VECTOR. QEMU echoes any vector below its table size; devices that
+       need that set this after hv_virtio_init. 0 keeps every mapping at NO_VECTOR. */
+    uint16_t msix_vectors, msix_config;
     HvVirtq q[HV_VIRTQ_MAX];
     uint8_t config[256];
     uint32_t config_len;

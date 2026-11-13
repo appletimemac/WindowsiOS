@@ -208,6 +208,36 @@ static void test_identity(void) {
     check("events_read starts clear", bar_read(0x2000, 4), 0);
 }
 
+/* viogpudo maps the config vector even on INTx and gives up when the mapping reads back NO_VECTOR. */
+static void test_msix_vectors(void) {
+    check("config vector starts unmapped", bar_read(COMMON + 0x10, 2), 0xffff);
+    bar_write(COMMON + 0x10, 0, 2);
+    check("config vector 0 echoes", bar_read(COMMON + 0x10, 2), 0);
+    bar_write(COMMON + 0x10, 3, 2);
+    check("a vector past the table reads NO_VECTOR", bar_read(COMMON + 0x10, 2), 0xffff);
+    bar_write(COMMON + 0x10, 2, 2);
+    bar_write(COMMON + 0x16, 1, 2);
+    check("queue vector starts unmapped", bar_read(COMMON + 0x1a, 2), 0xffff);
+    bar_write(COMMON + 0x1a, 1, 2);
+    check("queue 1 vector echoes", bar_read(COMMON + 0x1a, 2), 1);
+    bar_write(COMMON + 0x16, 0, 2);
+    check("queue 0 keeps its own vector", bar_read(COMMON + 0x1a, 2), 0xffff);
+    bar_write(COMMON + 0x1a, 0xffff, 2);
+    check("NO_VECTOR unmaps", bar_read(COMMON + 0x1a, 2), 0xffff);
+    bar_write(COMMON + 0x16, 9, 2);
+    check("no queue selected: NO_VECTOR", bar_read(COMMON + 0x1a, 2), 0xffff);
+    bar_write(COMMON + 0x14, 0, 1);
+    check("reset unmaps the config vector", bar_read(COMMON + 0x10, 2), 0xffff);
+    bar_write(COMMON + 0x16, 1, 2);
+    check("reset unmaps queue vectors", bar_read(COMMON + 0x1a, 2), 0xffff);
+    bar_write(COMMON + 0x16, 0, 2);
+    uint16_t vectors = gpu->vio.msix_vectors;
+    gpu->vio.msix_vectors = 0; /* a device that does not opt in, as virtio-net */
+    bar_write(COMMON + 0x10, 0, 2);
+    check("without the opt-in every mapping reads NO_VECTOR", bar_read(COMMON + 0x10, 2), 0xffff);
+    gpu->vio.msix_vectors = vectors;
+}
+
 static void test_edid(void) {
     uint8_t e[128];
     static const struct { uint32_t w, h; } sizes[] = {{1280, 900}, {640, 480}, {3840, 2160}, {1920, 1080}, {2560, 1440}, {1000, 700}};
@@ -493,7 +523,7 @@ static void test_resize(void) {
     check("DISPLAY event", bar_read(0x2000, 4), 1);
     check("config generation moved", (uint8_t)bar_read(COMMON + 0x15, 1), (uint8_t)(gen + 1));
     check("INTx raised", gpu->vio.pci.intx, 1);
-    check("config bit in the ISR", bar_read(ISR, 1), 2);
+    check("config change reads 3 in the ISR, as QEMU's", bar_read(ISR, 1), 3);
     check("ISR read drops the line", gpu->vio.pci.intx, 0);
     hdr(req_buf, 0x0100);
     submit(0, req_buf, 24, resp_buf, 408);
@@ -611,6 +641,7 @@ int main(void) {
     if (!gpu) return 1;
 
     test_identity();
+    test_msix_vectors();
     driver_init();
     test_display_info();
     test_edid();
