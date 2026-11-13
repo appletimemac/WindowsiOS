@@ -47,5 +47,6 @@ _hv_classify_cases:
     pacia x0, x1                // pac
     xpaci x2                    // pac
     pacga x3, x4, x5            // pac
+    .inst 0xd500401f            // cfinv (FEAT_FlagM, advertised in ID_AA64ISAR0): copy
     udf #0                      // undefined
 _hv_classify_cases_end:

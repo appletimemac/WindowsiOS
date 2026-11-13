@@ -217,6 +217,25 @@ pcrel_target:
     sub x4, x28, x0
 END pcrel
 
+// FEAT_FlagM (ID_AA64ISAR0.TS = 1): CFINV is an MSR-immediate encoding, RMIF, SETF8 and SETF16 are data processing.
+// The host's flags are the guest's, so all four must leave NZCV exactly as the host does (Prism's x64 output uses CFINV).
+PROGRAM flagm
+    .inst 0xd500401f            // cfinv
+    adc x0, x1, x2
+    cmp x3, x4
+    .inst 0xd500401f            // cfinv
+    sbc x5, x6, x7
+    .inst 0x3a00080d | (8 << 5)   // setf8 w8
+    adc x9, x10, x11
+    .inst 0x3a00480d | (12 << 5)  // setf16 w12
+    .inst 0xd500401f            // cfinv
+    cset w13, hs
+    .inst 0xba000400 | (9 << 15) | (14 << 5) | 0xa  // rmif x14, #9, #0xa
+    .inst 0xd500401f            // cfinv
+    cset w15, mi
+    cset w16, vs
+END flagm
+
 // More instructions than one block holds.
 // DIT is a PSTATE bit the translator reads and writes inline; x6 and x7 live in the HvCpu.
 PROGRAM pstate_bits

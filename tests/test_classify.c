@@ -21,6 +21,7 @@ static const HvInsnKind expected[] = {
     HV_INSN_BARRIER, HV_INSN_BARRIER,
     HV_INSN_WAIT,
     HV_INSN_PAC, HV_INSN_PAC, HV_INSN_PAC, HV_INSN_PAC, HV_INSN_PAC,
+    HV_INSN_COPY,
     HV_INSN_UNDEFINED,
 };
 
