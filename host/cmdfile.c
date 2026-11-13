@@ -26,6 +26,20 @@ static int cmd_path(const HvCmdFile *cmd, const char *name, char *path, size_t s
     return n < 0 || (size_t)n >= size ? -1 : 0;
 }
 
+/* The instructions around va, as the CPU's own page tables map them: enough to see the loop a CPU is stuck in. */
+static void state_code(FILE *f, HvMachine *m, HvCpu *c, const char *what, uint64_t va) {
+    fprintf(f, "  code around %s %016llx:", what, (unsigned long long)va);
+    for (int o = -96; o < 96; o += 4) {
+        HvWalk w;
+        uint32_t insn = 0;
+        hv_mmu_walk(c, va + (uint64_t)(int64_t)o, HV_ACC_READ, 1, &w);
+        if (o == 0) fprintf(f, " >");
+        if ((w.fsc && !w.block_size) || hv_phys_read(m, w.pa, &insn, 4) != 0) fprintf(f, " ????????");
+        else fprintf(f, " %08x", insn);
+    }
+    fprintf(f, "\n");
+}
+
 int hv_cmdfile_state(const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) return -1;
@@ -57,6 +71,15 @@ int hv_cmdfile_state(const char *path) {
             fprintf(f, "  x%d=%016llx\n", j, (unsigned long long)c->x[j]);
         fprintf(f, "  halted=%d off=%d pc_state->active=%d\n", c->halted, c->off,
                 c->pc_state ? __atomic_load_n(&c->pc_state->active, __ATOMIC_SEQ_CST) : 0);
+        /* Which registers point at a device (kernel addresses that map no RAM), and the code it is in. */
+        for (int j = 0; j < 31; j++) {
+            HvWalk w;
+            if (!((c->x[j] >> 55) & 1)) continue;
+            hv_mmu_walk(c, c->x[j], HV_ACC_READ, 1, &w);
+            if (!w.fsc && !hv_phys_ptr(m, w.pa, 4)) fprintf(f, "  x%d maps device memory at pa %llx\n", j, (unsigned long long)w.pa);
+        }
+        state_code(f, m, c, "pc", c->pc);
+        state_code(f, m, c, "elr", c->elr_el1);
     }
     uint32_t nelchg = m->stats.nelchg;
     fprintf(f, "elchg nelchg=%u (oldest first):\n", nelchg);
@@ -76,6 +99,15 @@ int hv_cmdfile_state(const char *path) {
     }
     fprintf(f, "exceptions=%llu interrupts=%llu\n", (unsigned long long)m->stats.exceptions,
             (unsigned long long)m->stats.interrupts);
+    for (int i = 0; i < m->ncpus; i++) {
+        HvCpu *c = m->cpus[i];
+        if (c)
+            fprintf(f, "timers cpu%d: cntv_ctl=%llx cntv_cval=%llx cntp_ctl=%llx cntp_cval=%llx cntvoff=%llx\n", i,
+                    (unsigned long long)c->cntv_ctl, (unsigned long long)c->cntv_cval, (unsigned long long)c->cntp_ctl,
+                    (unsigned long long)c->cntp_cval, (unsigned long long)c->cntvoff);
+    }
+    if (m->gic) hv_gicv3_dump(m->gic, f);
+    hv_winvm_dump_devices(f);
     hv_ktlb_check_dump(f);
     int rc = ferror(f) ? -1 : 0;
     if (fclose(f) != 0) rc = -1;

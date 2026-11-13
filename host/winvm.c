@@ -44,6 +44,47 @@ static void (*exit_cb)(int reason);
 
 int hv_winvm_share_up(void) { return share_on; }
 HvMachine *hv_winvm_machine(void) { return &m; }
+
+/* What each device would raise an interrupt for, read without the devices' locks: a diagnostic of a machine
+   that is stuck, where a torn value does not matter. */
+static void dump_virtio(FILE *f, const char *name, const HvVirtio *v) {
+    fprintf(f, "%s: status=%02x isr=%u driver_ok=%d", name, v->status, v->isr, (v->status & 4) != 0);
+    for (int q = 0; q < v->nq; q++) {
+        uint16_t flags = 0xffff;
+        const HvVirtq *vq = &v->q[q];
+        if (vq->enabled && vq->avail) hv_phys_read(v->m, vq->avail, &flags, 2);
+        fprintf(f, " q%d: enabled=%u avail_flags=%x", q, vq->enabled, flags);
+    }
+    fprintf(f, "\n");
+}
+
+void hv_winvm_dump_devices(FILE *f) {
+    if (board.pcie) hv_pcie_dump(board.pcie, f);
+    if (board.net) dump_virtio(f, "virtio-net", &board.net->vio);
+    if (board.gpu) dump_virtio(f, "virtio-gpu", &board.gpu->vio);
+    if (board.hda) {
+        const HvHda *d = board.hda;
+        fprintf(f, "hda: gctl=%x intctl=%x wakeen=%x statests=%x rirbctl=%x rirbsts=%x", d->gctl, d->intctl, d->wakeen, d->statests, d->rirbctl, d->rirbsts);
+        for (int s = 0; s < HV_HDA_NSTREAMS; s++)
+            if (d->st[s].ctl || d->st[s].sts || d->st[s].running)
+                fprintf(f, " stream%d: ctl=%x sts=%x running=%d lpib=%x", s, d->st[s].ctl, d->st[s].sts, d->st[s].running, d->st[s].lpib);
+        fprintf(f, "\n");
+    }
+    if (board.usb) {
+        const HvXhci *x = board.usb;
+        fprintf(f, "xhci: usbcmd=%x usbsts=%x", x->usbcmd, x->usbsts);
+        for (int i = 0; i < HV_XHCI_INTRS; i++) fprintf(f, " iman%d=%x", i, x->intr[i].iman);
+        fprintf(f, "\n");
+    }
+    for (int n = 0; n < 2; n++) {
+        const HvNvme *nv = n ? board.nvme1 : board.nvme0;
+        if (!nv) continue;
+        fprintf(f, "nvme%d: cc=%x csts=%x intms=%x", n, nv->cc, nv->csts, nv->intms);
+        for (int q = 0; q < HV_NVME_MAX_QUEUES; q++)
+            if (nv->cq[q].valid) fprintf(f, " cq%d: ien=%u pending=%u head=%u tail=%u", q, nv->cq[q].ien, nv->cq[q].irq_pending, nv->cq[q].head, nv->cq[q].tail);
+        fprintf(f, "\n");
+    }
+}
 HvWinVirt *hv_winvm_board(void) { return &board; }
 
 uint64_t hv_winvm_display_flushes(void) {

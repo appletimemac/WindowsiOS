@@ -143,6 +143,39 @@ static void hv_gicv3_pend_body(HvGic *g, int intid) {
     hv_gicv3_update(g);
 }
 
+/* For the state dump: what each CPU's interface holds and every interrupt that is asserted, pending or active. */
+void hv_gicv3_dump(HvGic *g, FILE *f) {
+    pthread_mutex_lock(&g->mu);
+    fprintf(f, "gic: ctlr=%x\n", g->ctlr);
+    for (int c = 0; c < ncpus(g); c++) {
+        HvGicCpu *k = &g->cpu[c];
+        HvPerCpu *p = &g->m->percpu[c];
+        uint8_t prio = 0;
+        int grp = 1, shown = hppi_ex(g, c, 1, &prio, &grp), any = hppi_ex(g, c, 0, NULL, NULL);
+        fprintf(f, "gic cpu%d: irq_line=%d fiq_line=%d pmr=%llx igrpen0=%llu igrpen1=%llu ctlr=%llx running=%x depth=%d hppi=%d (prio %x) unmasked_hppi=%d lpis=%u\n",
+                c, p->irq_line, p->fiq_line, (unsigned long long)k->pmr, (unsigned long long)k->igrpen0,
+                (unsigned long long)k->igrpen1, (unsigned long long)k->icc_ctlr, running_priority(g, c), k->depth, shown, prio, any,
+                k->gicr_ctlr & 1);
+        for (int d = 0; d < k->depth; d++) fprintf(f, "  acknowledged[%d]: intid %u prio %x group %u\n", d, k->stack[d].intid, k->stack[d].prio, k->stack[d].group);
+        for (int i = 0; i < 32; i++)
+            if (k->latch[i] || k->level[i] || k->active[i])
+                fprintf(f, "  intid %d: enabled=%u latch=%u level=%u active=%u prio=%x group=%u edge=%u\n", i, k->enabled[i], k->latch[i],
+                        k->level[i], k->active[i], k->priority[i], k->group[i], k->edge[i]);
+        for (int w = 0; w < HV_GIC_MAX_LPIS / 64; w++)
+            for (uint64_t bits = k->lpi_pending[w]; bits; bits &= bits - 1) {
+                int lpi = HV_GIC_LPI_BASE + w * 64 + __builtin_ctzll(bits);
+                uint8_t lp = 0;
+                int en = lpi_prop_read(g, c, lpi, &lp);
+                fprintf(f, "  lpi %d: pending enabled=%d prio=%x\n", lpi, en, lp);
+            }
+    }
+    for (int i = 32; i < HV_GIC_NUM_IRQS; i++)
+        if (g->latch[i] || g->level[i] || g->active[i])
+            fprintf(f, "gic spi %d: enabled=%u latch=%u level=%u active=%u prio=%x group=%u edge=%u cpu=%d\n", i, g->enabled[i], g->latch[i],
+                    g->level[i], g->active[i], g->priority[i], g->group[i], g->edge[i], target_of(g, i));
+    pthread_mutex_unlock(&g->mu);
+}
+
 /* ---- the CPU interface ---- */
 
 static uint64_t acknowledge(HvGic *g, int c, int grp) {

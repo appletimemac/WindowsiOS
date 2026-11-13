@@ -77,6 +77,7 @@ char *hv_winvm_take_open_url(void);
 int hv_winvm_take_oauth_done(void);
 
 HvMachine *hv_winvm_machine(void);
+void hv_winvm_dump_devices(FILE *f); /* device interrupt lines, for the state dump */
 HvWinVirt *hv_winvm_board(void);
 const char *hv_winvm_reason_name(int reason);
 

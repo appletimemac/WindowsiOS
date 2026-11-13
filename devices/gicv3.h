@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "machine.h"
 
@@ -67,5 +68,7 @@ void hv_gicv3_set_ppi(HvGic *g, int cpu, int intid, int level);
 void hv_gicv3_pend(HvGic *g, int intid);
 /* Recompute every CPU's IRQ and FIQ inputs (waking any that just got one). */
 void hv_gicv3_update(HvGic *g);
+/* The interfaces and every interrupt that is asserted, pending or active, for the state dump. */
+void hv_gicv3_dump(HvGic *g, FILE *f);
 
 #endif
