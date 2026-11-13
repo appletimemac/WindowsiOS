@@ -106,12 +106,27 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         }
     }
 
+    /// The canvas the presenter draws into, and every canvas that is in a window. Two exist for a moment
+    /// when the layout changes. When the change reverses mid-transition SwiftUI brings the old canvas back
+    /// without a new didMoveToWindow (measured), so when the bound one leaves, one that stays takes over.
+    private static weak var bound: MetalCanvasUIView?
+    private static let inWindow = NSHashTable<MetalCanvasUIView>.weakObjects()
+
+    private func bindPresenter() {
+        Self.bound = self
+        WinIOSBridge.shared.bindMetalLayer(metalLayer)
+        sendPictureRect()
+    }
+
     override func didMoveToWindow() {
         super.didMoveToWindow()
         updateDrawableScale()
         if window != nil {
-            WinIOSBridge.shared.bindMetalLayer(metalLayer)
-            sendPictureRect()
+            Self.inWindow.add(self)
+            bindPresenter()
+        } else {
+            Self.inWindow.remove(self)
+            if Self.bound === self { Self.inWindow.allObjects.first { $0.window != nil }?.bindPresenter() }
         }
     }
 
