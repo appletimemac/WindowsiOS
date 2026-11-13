@@ -37,6 +37,7 @@ call :step_task
 call :step_settings
 call :step_updates
 call :step_hibernate
+call :step_tune
 goto :summary
 
 :fail
@@ -45,7 +46,7 @@ echo   FAILED: %~1
 exit /b
 
 :step_files
-echo [1/5] Program files in %DEST%
+echo [1/6] Program files in %DEST%
 if not exist "%DEST%" mkdir "%DEST%"
 schtasks /end /tn "%TASK%" >nul 2>&1
 taskkill /f /im WinIOSAgent.exe >nul 2>&1
@@ -59,7 +60,7 @@ if errorlevel 1 call :fail "could not copy %~2"
 exit /b
 
 :step_task
-echo [2/5] Posture agent (scheduled task "%TASK%")
+echo [2/6] Posture agent (scheduled task "%TASK%")
 schtasks /create /f /sc onlogon /rl highest /tn "%TASK%" /tr "\"%DEST%\WinIOSAgent.exe\"" >nul
 if not errorlevel 1 goto :task_ok
 call :fail "schtasks /create failed"
@@ -72,11 +73,11 @@ if errorlevel 1 call :fail "could not start the agent now, it starts at next sig
 exit /b
 
 :step_settings
-echo [3/5] Tablet mode
+echo [3/6] Tablet mode
 call :regdword "HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl" ConvertibilityEnabled 1
 exit /b
 :step_updates
-echo [4/5] Windows Update on demand
+echo [4/6] Windows Update on demand
 rem The image's optimizer disabled these services. Manual start lets Settings check for and
 rem install updates when asked, while the NoAutoUpdate policy keeps it from running on its own.
 call :svc_manual wuauserv
@@ -84,7 +85,7 @@ call :svc_manual UsoSvc
 call :svc_manual DoSvc
 exit /b
 :step_hibernate
-echo [5/5] Hibernation (the app's Hibernate action)
+echo [5/6] Hibernation (the app's Hibernate action)
 powercfg /h on >nul 2>&1
 if errorlevel 1 goto :hib_fail
 rem The default "reduced" hiberfile only serves Fast Startup; shutdown /h needs a full one.
@@ -105,6 +106,16 @@ reg add "HKLM\SYSTEM\CurrentControlSet\Services\%1" /v Start /t REG_DWORD /d 3 /
 if errorlevel 1 call :fail "could not set the %1 service to manual start"
 exit /b
 
+:step_tune
+echo [6/6] Performance tuning
+if exist "%SRC%winios_tune.ps1" goto :tune_go
+call :fail "winios_tune.ps1 is missing from the tools disk"
+exit /b
+:tune_go
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%winios_tune.ps1"
+if errorlevel 1 call :fail "performance tuning reported failures; see C:\ProgramData\WindowsiOS\tune-*.txt"
+exit /b
+
 :regdword
 reg add "%~1" /v %2 /t REG_DWORD /d %3 /f >nul
 if errorlevel 1 call :fail "could not set %~1 %2"
@@ -115,7 +126,7 @@ echo.
 echo ------------------------------------------------
 if "%FAILS%"=="0" echo   Done, no problems.
 if not "%FAILS%"=="0" echo   Finished with %FAILS% problem(s), see the messages above.
-echo   Restart Windows so tablet mode and Windows Update take effect.
+echo   Restart Windows so the new settings take effect.
 echo.
 choice /c YN /n /m "Restart now? [Y/N] "
 if errorlevel 2 goto :done
