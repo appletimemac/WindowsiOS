@@ -54,7 +54,7 @@ struct SessionView: View {
                 laptopLayout(size: size, layout: layout)
                     .transition(.opacity)
             } else {
-                canvas(layout.picture, in: layout.area, keyboardVisible: $vm.systemKeyboardVisible)
+                canvas(layout.picture, in: layout.area, keyboardVisible: $vm.systemKeyboardVisible, followsTextFocus: true)
                     .transition(.opacity)
             }
 
@@ -72,6 +72,7 @@ struct SessionView: View {
         // Windows' tablet posture follows the layout: the deck is the keyboard.
         .onChange(of: laptopActive, initial: true) { _, laptop in
             WinIOSBridge.shared.setLaptopPosture(laptop)
+            vm.laptopLayoutShowing = laptop
             // The deck is the keyboard there. Left on, the software keyboard would come back with the
             // studio layout and its inset would be counted while nothing shows.
             if laptop { vm.systemKeyboardVisible = false }
@@ -187,14 +188,17 @@ struct SessionView: View {
     /// corners, so nothing Windows draws is cut off, and the canvas carries the picture's edge
     /// pixels on to the glass, so nothing around it is black.
     @ViewBuilder
-    private func canvas(_ picture: GuestPicture?, in area: CGRect, keyboardVisible: Binding<Bool>) -> some View {
+    private func canvas(_ picture: GuestPicture?, in area: CGRect, keyboardVisible: Binding<Bool>,
+                        followsTextFocus: Bool) -> some View {
         if let picture {
             MetalDisplayView(
                 trackpadMode: $vm.trackpadMode,
                 rightClickArmed: $vm.rightClickArmed,
                 keyboardVisible: keyboardVisible,
                 pictureFrame: picture.frame.offsetBy(dx: -area.minX, dy: -area.minY),
-                onThreeFingerTap: { setToolbarOpen(true) }
+                onThreeFingerTap: { setToolbarOpen(true) },
+                onGuestTap: followsTextFocus ? { x, y in vm.canvasTapped(guestX: x, guestY: y) } : nil,
+                onReturnKey: followsTextFocus ? { vm.returnKeyTyped() } : nil
             )
             .frame(width: area.width, height: area.height)
             .position(x: area.midX, y: area.midY)
@@ -204,7 +208,7 @@ struct SessionView: View {
     /// Windows on the lid, the keyboard deck below; the split lands on the crease when folded.
     private func laptopLayout(size: CGSize, layout: SessionLayout) -> some View {
         VStack(spacing: 0) {
-            canvas(layout.picture, in: layout.area, keyboardVisible: .constant(false))
+            canvas(layout.picture, in: layout.area, keyboardVisible: .constant(false), followsTextFocus: false)
                 .frame(width: size.width, height: layout.area.height)
 
             // The physical crease while half-folded: nothing interactive here.
@@ -243,7 +247,7 @@ struct SessionView: View {
                 ToolbarButton(title: "Keyboard",
                               systemImage: vm.systemKeyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
                               isOn: vm.systemKeyboardVisible) {
-                    vm.systemKeyboardVisible.toggle()
+                    vm.toggleSystemKeyboard()
                 }
             }
             ToolbarButton(title: "Trackpad", systemImage: "rectangle.and.hand.point.up.left", isOn: vm.trackpadMode) {
@@ -346,6 +350,13 @@ private struct SettingsSheet: View {
         NavigationStack {
             Form {
                 Section {
+                    Toggle("Keyboard for Text Fields", isOn: $vm.autoKeyboard)
+                } footer: {
+                    Text(vm.textFocusAgentPresent
+                         ? "In full screen, the keyboard comes up when you tap a text field in Windows and goes away when you tap elsewhere."
+                         : "In full screen, the keyboard comes up when you tap a text field in Windows. This needs the latest WindowsiOS Tools installed in Windows.")
+                }
+                Section {
                     Toggle("Sign In with Safari", isOn: Binding(get: { vm.useSafariForOAuth }, set: { on in
                         if on != vm.useSafariForOAuth { vm.toggleOAuthBrowserMode() }
                     }))
@@ -362,6 +373,7 @@ private struct SettingsSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+        .onAppear { vm.refreshTextFocusAgent() }
     }
 }
 

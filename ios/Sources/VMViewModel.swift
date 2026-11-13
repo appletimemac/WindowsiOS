@@ -69,7 +69,29 @@ final class VMViewModel: ObservableObject {
     @Published var deckLayout: DeckLayout = .split
     @Published var trackpadMode: Bool = false
     @Published var rightClickArmed: Bool = false
-    @Published var systemKeyboardVisible: Bool = false
+    @Published var systemKeyboardVisible: Bool = false {
+        didSet { if !systemKeyboardVisible { keyboardFollowsFocus = false } }
+    }
+    /// The software keyboard comes up for a text field tapped in Windows (full screen only).
+    @Published var autoKeyboard: Bool = UserDefaults.standard.object(forKey: VMViewModel.autoKeyboardKey) as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(autoKeyboard, forKey: Self.autoKeyboardKey)
+            if !autoKeyboard { keyboardFollowsFocus = false }
+        }
+    }
+    /// WindowsiOS Tools in this Windows reports text focus (an older agent does not).
+    @Published var textFocusAgentPresent: Bool = false
+    /// The deck is the keyboard while it shows, so text focus is not followed there.
+    var laptopLayoutShowing = false
+    /// The keyboard is up because a text field took focus, so losing that focus takes it down. One
+    /// brought up by hand stays until it is put away by hand.
+    private var keyboardFollowsFocus = false
+    /// When the keyboard was last raised or put away by hand, and when the tap or Return that Windows
+    /// is answering was noted (system uptime). An answer for something done before the hand set the
+    /// keyboard does not undo it.
+    private var keyboardSetByHandAt: TimeInterval = 0
+    private var focusEventNotedAt: TimeInterval = 0
+    private static let autoKeyboardKey = "winios.autoKeyboard"
     @Published var activeSafariURL: IdentifiableURL? = nil
     @Published var useSafariForOAuth: Bool = WinIOSBridge.shared.useSafariForGuestLinks
 
@@ -91,6 +113,11 @@ final class VMViewModel: ObservableObject {
         bridge.onStateChanged = { [weak self] in
             Task { @MainActor in
                 self?.syncFromBridge()
+            }
+        }
+        bridge.onGuestTextFocus = { [weak self] editable, inside in
+            Task { @MainActor in
+                self?.guestTextFocusChanged(editable: editable, inside: inside)
             }
         }
         syncFromBridge()
@@ -174,6 +201,49 @@ final class VMViewModel: ObservableObject {
             guestSizeRequest = nil
             WinIOSBridge.shared.requestDisplayWidth(UInt32(target.width), height: UInt32(target.height))
         }
+    }
+
+    // MARK: - Keyboard
+
+    func toggleSystemKeyboard() {
+        systemKeyboardVisible.toggle()
+        keyboardFollowsFocus = false
+        keyboardSetByHandAt = ProcessInfo.processInfo.systemUptime
+    }
+
+    /// A tap on the full-screen canvas, in guest pixels. The agent in Windows answers with what has
+    /// the focus once the tap has landed (guestTextFocusChanged).
+    func canvasTapped(guestX: Int, guestY: Int) {
+        guard autoKeyboard, isVMRunning, !laptopLayoutShowing else { return }
+        focusEventNotedAt = ProcessInfo.processInfo.systemUptime
+        WinIOSBridge.shared.noteTap(atGuestX: Int32(guestX), y: Int32(guestY))
+    }
+
+    /// Return on the software keyboard often moves the focus out of the field (a search, an address).
+    func returnKeyTyped() {
+        guard autoKeyboard, keyboardFollowsFocus else { return }
+        focusEventNotedAt = ProcessInfo.processInfo.systemUptime
+        WinIOSBridge.shared.noteFocusLook()
+    }
+
+    /// The keyboard rises for a tap inside an editable field. It goes down once the focus is on
+    /// something that takes no text, and stays for a tap elsewhere that leaves the focus in the field
+    /// (a toolbar button beside a document).
+    private func guestTextFocusChanged(editable: Bool, inside: Bool) {
+        textFocusAgentPresent = true
+        guard autoKeyboard, !laptopLayoutShowing, focusEventNotedAt >= keyboardSetByHandAt else { return }
+        if editable && inside {
+            if !systemKeyboardVisible {
+                systemKeyboardVisible = true
+                keyboardFollowsFocus = true
+            }
+        } else if !editable, systemKeyboardVisible, keyboardFollowsFocus {
+            systemKeyboardVisible = false
+        }
+    }
+
+    func refreshTextFocusAgent() {
+        textFocusAgentPresent = WinIOSBridge.shared.textFocusAgentSeenSeconds >= 0
     }
 
     func syncFromBridge() {

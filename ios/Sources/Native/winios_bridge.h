@@ -37,6 +37,11 @@ typedef struct WinIOSTouchContact {
 @property (nonatomic, readonly) uint64_t usbEventsDelivered;
 @property (nonatomic, assign) BOOL useSafariForGuestLinks;
 @property (nonatomic, copy, nullable) WinIOSStateCallback onStateChanged;
+/// What has the focus in Windows after a noted tap or look, from the WindowsiOS Tools agent, on the
+/// main queue: editable when it takes text, inside when the tap landed in it.
+@property (nonatomic, copy, nullable) void (^onGuestTextFocus)(BOOL editable, BOOL inside);
+/// Seconds since that agent last asked for taps, or -1 if this Windows has none that reports focus.
+@property (nonatomic, readonly) NSInteger textFocusAgentSeenSeconds;
 
 - (nullable NSString *)takeGuestOpenURL;
 - (BOOL)takeGuestOAuthDone;
@@ -66,6 +71,10 @@ typedef struct WinIOSTouchContact {
 - (void)requestDisplayWidth:(uint32_t)width height:(uint32_t)height;
 /// Laptop deck showing (YES) or full-screen tablet (NO); Windows' slate indicator follows it.
 - (void)setLaptopPosture:(BOOL)laptop;
+/// A tap reached Windows at this guest pixel; the agent answers through onGuestTextFocus.
+- (void)noteTapAtGuestX:(int32_t)x y:(int32_t)y;
+/// Nothing was tapped, but the focus may have moved (Return was typed): the agent looks again.
+- (void)noteFocusLook;
 - (void)sendKeyHid:(uint8_t)usage down:(BOOL)down;
 - (void)tapKeyHid:(uint8_t)usage;
 - (void)sendKeyComboWithModifiers:(NSArray<NSNumber *> *)modifiers key:(uint8_t)usage;

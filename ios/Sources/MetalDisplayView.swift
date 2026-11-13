@@ -12,6 +12,12 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     var rightClickArmed: Bool = false
     var onRightClickConsumed: (() -> Void)?
     var onThreeFingerTap: (() -> Void)?
+    /// A tap that reached Windows, in guest pixels: the software keyboard follows text focus from it.
+    var onGuestTap: ((Int, Int) -> Void)?
+    var onReturnKey: (() -> Void)?
+    /// The software keyboard went away by another road than `keyboardVisible`: its own dismiss key,
+    /// or a sheet taking the screen.
+    var onKeyboardResigned: (() -> Void)?
     /// Where the Windows picture sits in this view. The view itself runs to the display's edges
     /// and continues the picture's edge pixels around it; touches out there land on the nearest
     /// pixel of the picture.
@@ -36,6 +42,12 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         let touch: UITouch
         let slot: UInt8
     }
+
+    /// The first finger of a touch sequence, while it can still be a tap: one finger, lifted soon,
+    /// close to where it landed.
+    private var tapStart: (point: CGPoint, time: TimeInterval)?
+    private static let tapSlop: CGFloat = 12
+    private static let tapDuration: TimeInterval = 0.6
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -158,23 +170,45 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
             setDigitizerActive(!trackpadMode && !rightClickArmed && WinIOSBridge.shared.touchscreenReady)
         }
         guard digitizerActive else { return super.touchesBegan(touches, with: event) }
+        if contacts.isEmpty, touches.count == 1, let first = touches.first {
+            tapStart = (first.location(in: self), first.timestamp)
+        } else {
+            tapStart = nil
+        }
         touches.forEach(addContact)
         sendTouchFrame()
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard digitizerActive else { return super.touchesMoved(touches, with: event) }
+        if let start = tapStart, let touch = touches.first {
+            let at = touch.location(in: self)
+            if hypot(at.x - start.point.x, at.y - start.point.y) > Self.tapSlop { tapStart = nil }
+        }
         sendTouchFrame()
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard digitizerActive else { return super.touchesEnded(touches, with: event) }
+        let tap = tapStart
+        tapStart = nil
         endTouches(touches)
+        if let tap, let touch = touches.first, touch.timestamp - tap.time <= Self.tapDuration {
+            let at = touch.location(in: self)
+            if hypot(at.x - tap.point.x, at.y - tap.point.y) <= Self.tapSlop { reportGuestTap(normalizedPoint(for: at)) }
+        }
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard digitizerActive else { return super.touchesCancelled(touches, with: event) }
+        tapStart = nil
         endTouches(touches)
+    }
+
+    private func reportGuestTap(_ normalized: (Double, Double)) {
+        let width = Double(WinIOSBridge.shared.framebufferWidth), height = Double(WinIOSBridge.shared.framebufferHeight)
+        guard width > 0, height > 0 else { return }
+        onGuestTap?(Int(min(width - 1, normalized.0 * width)), Int(min(height - 1, normalized.1 * height)))
     }
 
     private func endTouches(_ touches: Set<UITouch>) {
@@ -240,9 +274,11 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         }
         if trackpadMode {
             PointerController.shared.clickAtCurrent(buttonMask: mask)
+            if mask == 1 { reportGuestTap((PointerController.shared.cursorX, PointerController.shared.cursorY)) }
         } else {
             let (nx, ny) = normalizedPoint(for: gr.location(in: self))
             PointerController.shared.directTapAt(x: nx, y: ny, buttonMask: mask)
+            if mask == 1 { reportGuestTap((nx, ny)) }
         }
     }
 
@@ -336,12 +372,19 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     // MARK: - Software & Hardware Keyboard (USB HID Page 0x07)
 
     override var canBecomeFirstResponder: Bool { true }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { onKeyboardResigned?() }
+        return resigned
+    }
     var hasText: Bool { true }
 
     func insertText(_ text: String) {
         for ch in text {
             sendCharacterAsHID(ch)
         }
+        if text.contains(where: \.isNewline) { onReturnKey?() }
     }
 
     func deleteBackward() {
@@ -424,6 +467,8 @@ struct MetalDisplayView: UIViewRepresentable {
     /// The picture's place in the view's own coordinates.
     var pictureFrame: CGRect
     var onThreeFingerTap: () -> Void
+    var onGuestTap: ((Int, Int) -> Void)?
+    var onReturnKey: (() -> Void)?
 
     func makeUIView(context: Context) -> MetalCanvasUIView {
         let view = MetalCanvasUIView(frame: .zero)
@@ -438,11 +483,26 @@ struct MetalDisplayView: UIViewRepresentable {
         uiView.trackpadMode = trackpadMode
         uiView.rightClickArmed = rightClickArmed
         uiView.onThreeFingerTap = onThreeFingerTap
+        uiView.onGuestTap = onGuestTap
+        uiView.onReturnKey = onReturnKey
+        uiView.onKeyboardResigned = { [weak uiView] in
+            DispatchQueue.main.async {
+                if self.keyboardVisible, uiView?.isFirstResponder != true { self.keyboardVisible = false }
+            }
+        }
         uiView.pictureFrame = pictureFrame
+        // Each hop looks again: the state may have changed, or the view left the window, before it runs.
         if keyboardVisible && !uiView.isFirstResponder {
-            DispatchQueue.main.async { _ = uiView.becomeFirstResponder() }
+            DispatchQueue.main.async {
+                guard self.keyboardVisible, uiView.window != nil, !uiView.isFirstResponder else { return }
+                // Refused (a sheet has the screen): the state says so, rather than trying again on every update.
+                if !uiView.becomeFirstResponder() { self.keyboardVisible = false }
+            }
         } else if !keyboardVisible && uiView.isFirstResponder {
-            DispatchQueue.main.async { _ = uiView.resignFirstResponder() }
+            DispatchQueue.main.async {
+                guard !self.keyboardVisible, uiView.isFirstResponder else { return }
+                _ = uiView.resignFirstResponder()
+            }
         }
     }
 }

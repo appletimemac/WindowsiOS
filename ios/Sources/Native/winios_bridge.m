@@ -850,6 +850,7 @@ static int sysctl_int(const char *name) {
         @"usb_tab_ready: %d\n"
         @"usb_delivered: %llu\n"
         @"share_up: %d\n"
+        @"focus_agent_seen_s: %ld\n"
         @"oauth_safari: %d\n"
         @"hinge_status: %ld\n"
         @"hinge_angle_deg: %.1f\n"
@@ -878,6 +879,7 @@ static int sysctl_int(const char *name) {
         tabReady,
         usbDelivered,
         running ? hv_winvm_share_up() : 0,
+        hv_share_focus_agent_seen(),
         hv_share_url_handler_enabled(),
         (long)hingeStatus,
         hingeDeg,
@@ -1007,6 +1009,40 @@ static int sysctl_int(const char *name) {
 - (void)setUseSafariForGuestLinks:(BOOL)useSafariForGuestLinks {
     hv_share_set_url_handler_enabled(useSafariForGuestLinks ? 1 : 0);
     [[NSUserDefaults standardUserDefaults] setBool:useSafariForGuestLinks forKey:@"winios.safariOAuthV2"];
+}
+
+/* The event the app noted last, on the main queue. A report that answers an earlier one is dropped there: the
+   share server has checked it against its own latest, but a newer tap can be noted before the report is delivered.
+   Only earlier ones: the command file's notetap and notelook note events the app never sees, and their reports
+   must still arrive. */
+static unsigned long latest_focus_event;
+
+static void text_focus_reported(unsigned long seq, int editable, int inside, void *ctx) {
+    (void)ctx;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (seq < latest_focus_event) return;
+        void (^handler)(BOOL, BOOL) = WinIOSBridge.shared.onGuestTextFocus;
+        if (handler) handler(editable != 0, inside != 0);
+    });
+}
+
+- (void)setOnGuestTextFocus:(void (^)(BOOL, BOOL))onGuestTextFocus {
+    _onGuestTextFocus = [onGuestTextFocus copy];
+    hv_share_set_text_focus_handler(_onGuestTextFocus ? text_focus_reported : NULL, NULL);
+}
+
+- (NSInteger)textFocusAgentSeenSeconds {
+    return (NSInteger)hv_share_focus_agent_seen();
+}
+
+- (void)noteTapAtGuestX:(int32_t)x y:(int32_t)y {
+    dispatch_assert_queue(dispatch_get_main_queue());
+    latest_focus_event = hv_share_note_tap(x, y);
+}
+
+- (void)noteFocusLook {
+    dispatch_assert_queue(dispatch_get_main_queue());
+    latest_focus_event = hv_share_note_look();
 }
 
 - (nullable NSString *)takeGuestOpenURL {
