@@ -405,11 +405,20 @@ void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len) {
 void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len) {
     if (cpu->m && cpu->m->stats_interval) cpu->m->stats.kernel_ranges++;
     uint64_t first = va & ~(uint64_t)PAGE_MASK;
+    uint64_t span = va + len - first; /* by length: the range may end where the address space does, at 0 */
     if (len <= (4096ull << HV_TLB_PAGE_BITS)) {
-        for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS) hv_tlb_flush_va_asid(cpu, p, -1);
+        for (uint64_t o = 0; o < span; o += 1ull << HV_TLB_PAGE_BITS) hv_tlb_flush_va_asid(cpu, first + o, -1);
         return;
     }
-    uint64_t lo = first & 0x00ffffffffffffffull, hi = (va + len) & 0x00ffffffffffffffull; /* tagged addresses: by the low 56 bits */
+    uint64_t lo = first & 0x00ffffffffffffffull, hi = lo + span; /* tagged addresses: by the low 56 bits */
+    {   /* A large mapping the range only starts or ends in is invalidated whole: its pages are cached one by one. */
+        HvPerCpu *p = cpu->pc_state;
+        uint32_t b0 = hv_large_big_bit(first), b1 = hv_large_big_bit(first + span - 1);
+        int big = p && ((p->large_big_bloom[b0 >> 6] >> (b0 & 63) & 1) || (p->large_big_bloom[b1 >> 6] >> (b1 & 63) & 1));
+        uint64_t unit = big ? 1ull << 30 : 1ull << 21;
+        lo &= ~(unit - 1);
+        hi = (hi + unit - 1) & ~(unit - 1);
+    }
     for (int t = 0; t < 3; t++)
         for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
             HvTlbEntry *e = hv_tlb_ent(cpu, i, t);
@@ -487,7 +496,8 @@ static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt,
    them, if the filters say it has any. */
 /* remote: another CPU doing it (hv_tlbi_drop_remote_va): returns 0 instead of
    starting the user half over, which only cpu itself may do. */
-static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
+/* ran: the caller saw an entry to fetch through (1) or none (0) before it cleared the slot; -1: look here. */
+static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote, int ran) {
     int kernel = (va >> 55) & 1;
     HvMachine *m = cpu->m;
     HvPerCpu *p = cpu->pc_state;
@@ -497,7 +507,8 @@ static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
         uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
         uint32_t sl = (uint32_t)(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
         const HvTlbEntry *t1 = hv_tlb_ent(cpu, sl, 1), *t2 = hv_tlb_ent(cpu, sl, 2);
-        int some = kernel ? t1->exec_tag == hv_exec_key(page, t1->addend) || t2->exec_tag == hv_exec_key(page, t2->addend) : asid < 0 || asid == current_asid(cpu) || current_asid(cpu) < 0;
+        int some = !kernel ? asid < 0 || asid == current_asid(cpu) || current_asid(cpu) < 0 :
+                   ran >= 0 ? ran : t1->exec_tag == hv_exec_key(page, t1->addend) || t2->exec_tag == hv_exec_key(page, t2->addend);
         if (some) {
             if (!remote) ret_new(cpu, kernel);
             else if (!ret_new_remote(cpu, kernel)) return 0;
@@ -547,7 +558,7 @@ static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
 }
 
 void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
-    ijc_drop_va(cpu, va, asid, 0);
+    ijc_drop_va(cpu, va, asid, 0, -1);
 }
 
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
@@ -568,6 +579,9 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
             int had_exec = 0;
             for (uint32_t s = 0; s < (1u << (21 - HV_TLB_PAGE_BITS)); s++) {
                 uint32_t sl = ((uint32_t)(base >> HV_TLB_PAGE_BITS) + s) & (HV_TLB_SIZE - 1);
+                /* The kernel's cached targets in every page of the mapping, not only the page named and not
+                   only where a TLB entry is left. */
+                if ((va >> 55) & 1) ijc_drop_va(cpu, base + ((uint64_t)s << HV_TLB_PAGE_BITS), asid, 0, 0);
                 for (int el = 0; el < 3; el++) {
                     HvTlbEntry *e = hv_tlb_ent(cpu, sl, el);
                     if (e->read_tag == HV_TLB_INVALID && e->exec_tag == HV_TLB_INVALID && e->write_tag == HV_TLB_INVALID) continue;
@@ -583,6 +597,8 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
             if (had_exec) {
                 if ((va >> 55) & 1) hv_ijc_reset(cpu, 1);
                 else hv_ijc_drop_range(cpu, base, 1ull << 21, asid);
+            } else if ((va >> 55) & 1) {
+                ret_new(cpu, 1); /* once for the mapping: a return may lead into any page of it */
             }
         }
         uint32_t hb = hv_large_big_bit(va);
@@ -795,7 +811,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     /* Its cached branch targets in the page too: a cache fill checks the TLB
        entry first (hv_ijc_fill_checked), so one after this sees it gone, and one
        during it changed ijc_seq. */
-    if (!ijc_drop_va(target, va, asid, 1)) return -1; /* only target can do it: no use trying again */
+    if (!ijc_drop_va(target, va, asid, 1, fetched)) return -1; /* only target can do it: no use trying again */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int ok = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
              __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;

@@ -369,6 +369,83 @@ int main(void) {
         }
     }
 
+    /* A TLBI of a kernel address has to find what is cached for it wherever it is: branch targets in the other
+       pages of a large mapping, the return table of a CPU it is done for from outside, the pages of a range that
+       ends where the address space does. */
+    {
+#define CHECK(what, cond)                        \
+    do {                                         \
+        checks++;                                \
+        if (!(cond)) {                           \
+            printf("  FAIL kernel TLBI: %s\n", what); \
+            failures++;                          \
+        }                                        \
+    } while (0)
+#define SLOT(va, table) hv_tlb_ent(&cpu, (uint32_t)((va) >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table)
+        const uint64_t kg = 0xffffffc000100000ull, kn = 0xffffffc000200000ull; /* a code page, a data page */
+        const uint64_t pg = PT_PA + 0xe0000, pn = PT_PA + 0xe1000;
+        hv_cpu_reset(&cpu, &m);
+        cpu.el = 1;
+        pt_next = 1 * 65536;
+        uint64_t kt = alloc_table(), got;
+        cpu.mair_el1 = 0x00ff;
+        cpu.tcr_el1 = 25 | 25u << 16 | 1u << 22 | 2u << 30 | 5ull << 32 | 1ull << 36; /* 4K, 39 bits each, the ASID in TTBR1 */
+        cpu.sctlr_el1 |= 1;
+        cpu.ttbr1_el1 = (22ull << 48) | kt;
+        hv_ijc_reset(&cpu, 1);
+        map(kt, 12, 39, kg, 3, pg | PAGE | AF, 0);
+        map(kt, 12, 39, kn, 3, pn | PAGE | AF | PXN, 0);
+        /* In a 2 MB mapping: the targets in every page of it, also where the TLB entry is gone. */
+        const uint64_t blk = 0xffffffc000400000ull, far = blk + 0x1000 + ((uint64_t)HV_TLB_SIZE << HV_TLB_PAGE_BITS);
+        map(kt, 12, 39, blk, 2, PT_PA | BLOCK | AF, 0);
+        map(kt, 12, 39, far, 3, pg | PAGE | AF, 0); /* lands in the same TLB slot as blk + 0x1000 */
+        CHECK("code in a 2 MB mapping fetches", hv_mmu_access(&cpu, blk + 0x1000, HV_ACC_EXEC, 1, &got) == 0 && got == PT_PA + 0x1000);
+        static HvBlock in_block;
+        in_block = (HvBlock){.va = blk + 0x1010, .flags = HV_BLOCK_EL1, .code = (uint32_t *)(uintptr_t)0x1234};
+        hv_ijc_fill(&cpu, &in_block);
+        uint64_t tag = in_block.va ^ cpu.ijc_salt[1];
+        uint64_t *cached = m.percpu[0].ijc + (size_t)(HV_BLOCK_EL1 & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8) + (size_t)hv_ijc_index(tag) * 2;
+        CHECK("its branch target is cached", cached[0] == tag);
+        hv_mmu_access(&cpu, far, HV_ACC_READ, 1, &got); /* evicts the block's TLB entry */
+        CHECK("the 2 MB mapping's TLB entry is evicted", SLOT(blk + 0x1000, 1)->exec_tag == HV_TLB_INVALID || SLOT(blk + 0x1000, 1)->read_tag == far - HV_TLB_ADJ);
+        hv_tlb_flush_va_asid(&cpu, blk, -1); /* the guest invalidates the mapping by its first page */
+        tag = in_block.va ^ cpu.ijc_salt[1];
+        cached = m.percpu[0].ijc + (size_t)(HV_BLOCK_EL1 & (HV_IJC_TABLES - 1)) * (HV_IJC_TABLE_BYTES / 8) + (size_t)hv_ijc_index(tag) * 2;
+        CHECK("TLBI of a 2 MB mapping forgets the targets in its other pages", cached[0] != tag && cached[2] != tag);
+        /* A big range that starts inside a 2 MB mapping takes the whole mapping (range TLBI: xnu's, not Windows'). */
+        hv_mmu_access(&cpu, blk + 0x1000, HV_ACC_READ, 1, &got);
+        CHECK("(the page is cached again)", SLOT(blk + 0x1000, 1)->read_tag == blk + 0x1000 - HV_TLB_ADJ);
+        hv_tlb_flush_kernel_range(&cpu, blk + 0x100000, 32ull << 20);
+        CHECK("a range from the middle of a 2 MB mapping drops the pages before it", SLOT(blk + 0x1000, 1)->read_tag == HV_TLB_INVALID);
+        /* Another CPU's TLBI of a kernel code page does it here itself: the entry goes, and because code could be
+           fetched through it, so does the kernel's return table (it has to notice before it clears the entry). */
+        hv_tlb_flush(&cpu);
+        CHECK("global code fetches", hv_mmu_access(&cpu, kg, HV_ACC_EXEC, 1, &got) == 0 && got == pg);
+        uint64_t before = cpu.ret_salt[1];
+        CHECK("a remote TLBI is done from the other CPU", hv_tlbi_drop_remote_va(&cpu, kg, -1) == 1);
+        CHECK("it drops the entry", SLOT(kg, 1)->exec_tag == HV_TLB_INVALID && SLOT(kg, 1)->read_tag == HV_TLB_INVALID);
+        CHECK("and renews the kernel's return table", cpu.ret_salt[1] != before);
+        hv_mmu_access(&cpu, kn, HV_ACC_READ, 1, &got); /* data (PXN): no return can lead into it */
+        before = cpu.ret_salt[1];
+        hv_tlbi_drop_remote_va(&cpu, kn, -1);
+        CHECK("a remote TLBI of a data page leaves the return table", cpu.ret_salt[1] == before && SLOT(kn, 1)->read_tag == HV_TLB_INVALID);
+        /* A range that ends where the address space does, 16 pages and then a whole 1 GB mapping. */
+        const uint64_t top = 0xffffffffc0000000ull, last = 0xfffffffffffff000ull;
+        map(kt, 12, 39, last, 3, pg | PAGE | AF, 0);
+        CHECK("the last page reads", hv_mmu_access(&cpu, last, HV_ACC_READ, 1, &got) == 0 && got == pg);
+        CHECK("and is in the TLB", SLOT(last, 1)->read_tag == last - HV_TLB_ADJ);
+        hv_tlb_flush_kernel_range(&cpu, 0xffffffffffff0000ull, 0x10000);
+        CHECK("a range of pages that ends at the top drops them", SLOT(last, 1)->read_tag == HV_TLB_INVALID);
+        hv_tlb_flush(&cpu);
+        map(kt, 12, 39, top, 1, PT_PA | BLOCK | AF, 0); /* the level 1 entry becomes a block */
+        CHECK("a page of the last 1 GB mapping reads", hv_mmu_access(&cpu, top + 0x1000, HV_ACC_READ, 1, &got) == 0 && got == PT_PA + 0x1000);
+        CHECK("and is in the TLB", SLOT(top + 0x1000, 1)->read_tag == top + 0x1000 - HV_TLB_ADJ);
+        hv_tlb_flush_va_asid(&cpu, top, -1);
+        CHECK("TLBI of the last 1 GB mapping drops its other pages", SLOT(top + 0x1000, 1)->read_tag == HV_TLB_INVALID);
+#undef SLOT
+#undef CHECK
+    }
+
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }
