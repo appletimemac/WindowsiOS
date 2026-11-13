@@ -1303,6 +1303,10 @@ void hv_xhci_key_linux(HvXhci *x, uint16_t code, int down) {
     if (code < 256) hv_xhci_key(x, linux_to_hid[code], down);
 }
 
+void hv_xhci_reset(HvXhci *x) {
+    if (x) reset(x);
+}
+
 void hv_xhci_poll(HvXhci *x) {
     if (!x) return;
     touch_repeat_held(x);

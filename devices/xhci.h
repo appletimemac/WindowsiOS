@@ -97,5 +97,7 @@ void hv_xhci_touch(HvXhci *x, const HvTouchContact *contacts, int count);
 int hv_xhci_touch_ready(HvXhci *x);
 /* CPU thread: hand waiting keyboard, tablet & touch reports to the guest. */
 void hv_xhci_poll(HvXhci *x);
+/* Machine reset: as a host controller reset (HCRST). Call with the device lock held. */
+void hv_xhci_reset(HvXhci *x);
 
 #endif

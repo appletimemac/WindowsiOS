@@ -575,8 +575,14 @@ static void test_reset(void) {
     check("no interrupt from a config change before DRIVER_OK", (uint32_t)(hv_virtio_config_changed(&gpu->vio), gpu->vio.pci.intx), 0);
     driver_init();
     check("queues work after the reset", create_2d(8, 2, 64, 64), 0x1100);
+    bar_write(COMMON + 0x10, 1, 2);
     hv_virtio_gpu_reset(gpu);
     check("explicit reset", gpu->host_bytes, 0);
+    check("explicit reset clears the status", bar_read(COMMON + 0x14, 1), 0);
+    check("explicit reset unmaps vectors", bar_read(COMMON + 0x10, 2), 0xffff);
+    bar_write(COMMON + 0x16, 0, 2);
+    check("explicit reset disables queues", bar_read(COMMON + 0x1c, 2), 0);
+    driver_init(); /* as the next OS's driver would */
 }
 
 /* Host threads: a presenter taking frames and a window resizing, against the guest drawing. */

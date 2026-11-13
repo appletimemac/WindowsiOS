@@ -376,6 +376,15 @@ int hv_winvm_run_cpu0(void) {
             }
             if (board.fb) board.fb->active = 0;
             if (board.gpu) hv_virtio_gpu_reset(board.gpu); /* the scanout must not outlive the guest that set it */
+            /* Devices that write guest memory on their own (received frames, input reports, audio) would
+               otherwise keep using the rings of the OS that just rebooted, in memory the firmware and the
+               next kernel now own, until a driver resets them. */
+            hv_dev_lock(&m);
+            if (board.net) hv_virtio_reset(&board.net->vio);
+            if (board.snd) hv_virtio_reset(&board.snd->vio);
+            if (board.usb) hv_xhci_reset(board.usb);
+            if (board.hda) hv_hda_reset(board.hda);
+            hv_dev_unlock(&m);
             hv_winvirt_reset_cpu(&board);
             m.flush_pending = 1;
             spawn_secondaries();

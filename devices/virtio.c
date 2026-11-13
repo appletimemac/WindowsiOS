@@ -170,6 +170,10 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
     reset(v);
 }
 
+void hv_virtio_reset(HvVirtio *v) {
+    reset(v);
+}
+
 void hv_virtio_interrupt(HvVirtio *v) {
     v->isr |= 1;
     hv_pci_set_intx(&v->pci, 1);

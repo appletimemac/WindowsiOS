@@ -752,6 +752,24 @@ static void test_touch_hold(void) {
     drain();
 }
 
+/* A machine reset (the guest rebooted) must keep input out of the rings of the OS that is gone. */
+static void test_machine_reset(void) {
+    int slot = x->touch_slot;
+    int first = in_next;
+    post_in(slot, 2);
+    hv_xhci_reset(x);
+    check("reset halts the controller", mmio_r(OP + 4, 4) & 1, 1);
+    check("reset stops it", mmio_r(OP, 4) & 1, 0);
+    check("touch is not ready after a reset", hv_xhci_touch_ready(x), 0);
+    HvTouchContact press[1] = {tc(0, 1, 100, 100)};
+    hv_xhci_touch(x, press, 1);
+    hv_xhci_poll(x);
+    usleep(15000);
+    hv_xhci_poll(x);
+    check("no report reaches the old rings", host(IN_BUF(first))[0], 0);
+    check("nor the one after", host(IN_BUF(first + 1))[0], 0);
+}
+
 int main(void) {
     if (hv_machine_init(&m, 4 << 20) != 0) return 1;
     mem = aligned_alloc(4096, MEM_SIZE);
@@ -787,6 +805,8 @@ int main(void) {
 
     printf("== touch hold\n");
     test_touch_hold();
+    printf("== machine reset\n");
+    test_machine_reset();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

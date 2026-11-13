@@ -61,6 +61,8 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
 int hv_virtq_pop(HvVirtio *v, int q, HvVirtqElem *e);
 void hv_virtq_push(HvVirtio *v, int q, const HvVirtqElem *e, uint32_t written);
 void hv_virtio_interrupt(HvVirtio *v);
+/* Power-on state, as if the driver had written status 0: for a machine reset. Call with the device lock held. */
+void hv_virtio_reset(HvVirtio *v);
 /* The device config changed: bump the generation and, once the driver is running, raise a config-change interrupt.
    Call with the device lock held. */
 void hv_virtio_config_changed(HvVirtio *v);

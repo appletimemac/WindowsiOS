@@ -511,7 +511,7 @@ static void do_reset(HvVirtio *v) {
 void hv_virtio_gpu_reset(HvVirtioGpu *g) {
     if (!g) return;
     hv_dev_lock(g->vio.m);
-    do_reset(&g->vio);
+    hv_virtio_reset(&g->vio); /* the transport too: queues, status and vectors (it calls do_reset) */
     hv_dev_unlock(g->vio.m);
 }
 
