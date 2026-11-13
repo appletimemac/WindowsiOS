@@ -86,13 +86,14 @@ typedef struct {
     uint32_t nfix;
     Ool ool[MAX_OOL];
     uint32_t nool;
-    struct { uint32_t slot, at, flags, stub, cond_at; uint64_t target; uint8_t cold, stub_cold, has_cond; } site[MAX_OOL]; /* chainable exits: their slot, the B chaining patches, its stub, where to; the hot part's conditional branch to it if chaining may patch that too */
+    struct { uint32_t slot, at, flags, stub, cond_at; uint64_t target; uint8_t cold, stub_cold, has_cond, entry; } site[MAX_OOL]; /* chainable exits: their slot, the B chaining patches, its stub, where to; the hot part's conditional branch to it if chaining may patch that too */
     int site_direct;    /* the exit just written needs nothing done before its B: no check, no restores */
     uint32_t nsite;
     uint32_t pool_at;    /* where the literal pool is, in the cold part */
     uint32_t flags;
     int slow_mem;
-    uint64_t page;       /* guest VA of the 16 KB page the block is in */
+    uint64_t page;       /* guest VA of the page the block is in */
+    uint64_t page_pa;    /* and its physical address */
     int no_ijc;          /* indirect branches always go to the dispatcher (breakpoints, tests' stop PC) */
     HvMachine *m;
     uint64_t cur_pc;     /* guest PC of the instruction being translated (or whose out-of-line exit is) */
@@ -316,15 +317,15 @@ static void put_exit(Emit *e, uint64_t target) {
     put(e, BR_X(1));
 }
 
-/* A direct branch to target. Within the block's own 16 KB page the exit is
+/* A direct branch to target. Within the block's own 4 KB page the exit is
    chainable: it jumps to the block whose entry the dispatcher stored in this
-   exit's slot (plain data, so chaining never rewrites code), as long as nobody
-   has asked the CPU to leave. The hit path touches only the free scratch
-   registers, so guest x0/x1 stay live and the target needs no prologue. An
-   empty slot leaves with its address in last_stub so the dispatcher can fill
-   it. A same-page target always has the same physical mapping as this block,
-   so the chain stays correct across page-table changes. Other pages go through
-   the indirect-branch cache. */
+   exit's slot, as long as nobody has asked the CPU to leave. The hit path
+   touches only the free scratch registers, so guest x0/x1 stay live and the
+   target needs no prologue. An empty slot leaves with its address in last_stub
+   so the dispatcher can fill it. A same-page target has the same physical
+   mapping as this block only while the page tables stand still, so the slot
+   names the physical page it leaves and chain() takes no block of another.
+   Other pages go through the indirect-branch cache. */
 /* plain: an ordinary branch, not an exit that synchronises (ISB, a system
    register write, an interrupt let through). One going forward (to a higher
    address than the branch) skips the exit_req check: blocks only run forward
@@ -392,7 +393,9 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     e->m->slot_site[slot_index] = NULL; /* until placed: what it held is a dropped block's */
     e->m->slot_cond[slot_index] = NULL;
     e->m->slot_xa[slot_index] = xa;
-    e->m->slot_xpa[slot_index] = 0;
+    /* An exit within the page names the physical page it leaves (| 2): chain() only takes a target in that
+       page, as the address may be mapped elsewhere by the time the dispatcher looks it up. */
+    e->m->slot_xpa[slot_index] = xa ? 0 : e->page_pa | 2;
     uint32_t to_exit = ~0u;
     if (check) {
         put(e, 0xb9400000u | (HV_CPU_EXIT_REQ / 4) << 10 | 28 << 5 | 15); /* ldr w15, [x28, #exit_req] */
@@ -426,6 +429,7 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
         e->site[e->nsite].cold = (uint8_t)(p0 && !e->flat);
         e->site[e->nsite].stub = e->n;
         e->site[e->nsite].has_cond = 0;
+        e->site[e->nsite].entry = 0;
         e->site[e->nsite++].stub_cold = (uint8_t)(e->in_cold && !e->flat);
         e->site_direct = !check && !xa;
     }
@@ -1798,8 +1802,12 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         }
         if (op2 == 6) { /* ISB: later instructions must see earlier system register writes */
             /* Writes that change how blocks are translated already left. What is
-               left to synchronise is code invalidation, which sets exit_req: the
-               chainable exit checks it. */
+               left to synchronise is code invalidation. A dropped page sets
+               exit_req, which the chainable exit checks. A retired block
+               (retire_blocks) asks nobody to leave: its first word became a
+               branch, which this core must fetch again, so the guest's ISB is one
+               here too (as hv_enter's is for blocks entered from the dispatcher). */
+            put(e, 0xd5033fdfu); /* isb */
             if (e->no_ijc) put_exit(e, pc + 4);
             else put_branch_exit(e, pc + 4, 0);
             return 1;
@@ -1819,7 +1827,12 @@ static int translate_one(Emit *e, uint32_t insn, uint64_t pc) {
         return 1;
     case HV_INSN_EXCEPTION:
         put_helper(e, pc, insn, HV_OP_EXCEPTION);
-        if ((insn & 0xffe0001f) == 0xd4000002 && (e->flags & HV_BLOCK_EL1)) return 0; /* HVC returns like a call */
+        if ((insn & 0xffe0001f) == 0xd4000002 && (e->flags & HV_BLOCK_EL1)) {
+            /* HVC returns like a call, into this block. To the guest it was an exception taken and
+               returned from, which synchronises as an ISB does (see there). */
+            put(e, 0xd5033fdfu); /* isb */
+            return 0;
+        }
         put_exit(e, pc + 4);
         return 1;
     case HV_INSN_ERET:
@@ -2053,12 +2066,52 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     e->flags = b->flags;
     e->slow_mem = m->slow_mem;
     e->page = b->va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
+    e->page_pa = b->pa & ~((1ull << HV_TLB_PAGE_BITS) - 1);
     e->no_ijc = !m->chain;
     e->m = m;
     e->nogroup = nogroup;
     e->u_live = e->u_prev = 0;
 
-    /* No prologue: hv_enter, chained exits and the indirect-branch cache all
+    /* A block of a hot page (lookup() asks with b->fwd) can be retired alone: its first word is a nop, which
+       retiring turns into a branch to this stub, an exit like any other whose slot chains to the block's
+       replacement. Whatever still enters the old block then lands in the new one. Not in the flat layout (a
+       test knob), where the stub would sit in the nop's way. */
+    int want_fwd = b->fwd != 0;
+    b->fwd = 0;
+    if (want_fwd && !e->flat) {
+        uint32_t slot_index = __atomic_fetch_add(&m->nslots, 1, __ATOMIC_RELAXED);
+        if (slot_index < m->max_slots) { /* else out of slots until the next flush: it goes with its page */
+            uint64_t *slot = &m->slots[slot_index];
+            *slot = 0;
+            m->slot_site[slot_index] = NULL;
+            m->slot_cond[slot_index] = NULL;
+            m->slot_xa[slot_index] = 0;
+            m->slot_xpa[slot_index] = e->page_pa | 2; /* as an exit within the page: only to a block of this page */
+            uint32_t at = e->n;
+            put(e, 0xd503201f); /* nop */
+            cold_on(e);
+            e->site[e->nsite].slot = slot_index;
+            e->site[e->nsite].flags = e->flags;
+            e->site[e->nsite].target = b->va;
+            e->site[e->nsite].at = at;
+            e->site[e->nsite].cold = 0;
+            e->site[e->nsite].stub = e->n;
+            e->site[e->nsite].stub_cold = 1;
+            e->site[e->nsite].has_cond = 0;
+            e->site[e->nsite++].entry = 1;
+            put(e, STR_X(30, 28, HV_CPU_X(30)));
+            put(e, LDR_X(15, 28, HV_CPU_CHAIN_THUNK));
+            if ((e->n & 1) == 0) put(e, 0xd503201f); /* nop: the data starts 8-byte aligned */
+            put(e, BLR_X(15));
+            put(e, (uint32_t)(uintptr_t)slot);
+            put(e, (uint32_t)((uintptr_t)slot >> 32));
+            put(e, (uint32_t)b->va);
+            put(e, (uint32_t)(b->va >> 32));
+            cold_off(e);
+            b->fwd = slot_index + 1;
+        }
+    }
+    /* No other prologue: hv_enter, chained exits and the indirect-branch cache all
        enter with guest x0 and x1 live. */
     uint32_t max = avail < HV_MAX_BLOCK_INSNS ? avail : HV_MAX_BLOCK_INSNS;
     plan_groups(e, code, max, b->va);
@@ -2170,6 +2223,7 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
     for (uint32_t k = 0; k < e->nsite && !m->trace; k++) { /* tracing logs every block entry */
         uint32_t slot = e->site[k].slot;
         uint64_t t = e->site[k].target;
+        if (e->site[k].entry) continue; /* the block's own forwarding stub: only retiring it patches that */
         if (m->slot_xa[slot] || e->site[k].flags != b->flags || t == m->stop_pc || t == m->stop_pc2) continue; /* the dispatcher stops there */
         const uint32_t *code = NULL;
         if (t == b->va) code = dst;

@@ -85,6 +85,7 @@ def derive(a, b, dt_ms, cpus):
     m['code_hits_s'] = d(a, b, 'code_write_hits') / dt
     m['code_forced_s'] = d(a, b, 'code_write_forced') / dt
     m['code_retrans_s'] = d(a, b, 'code_retranslates') / dt
+    m['code_kills_s'] = d(a, b, 'code_block_kills') / dt
     chained = d(a, b, 'chained')
     m['chain_far_pct'] = 100.0 * d(a, b, 'chain_far') / chained if chained else 0.0
     m['stw'] = d(a, b, 'stw_count')
@@ -145,9 +146,10 @@ SUMMARY = [
     ('  ms per second', 'inval_ms_s', '{:7.2f}'),
     ('  chains unlinked K/s', 'inval_scan_k_s', '{:7.1f}'),
     ('writes to code pages/s', 'code_writes_s', '{:8.0f}'),
-  # of them, the ones that dropped the page's blocks (the rest left them: the page holds code elsewhere)
-    ('  that dropped the page/s', 'code_hits_s', '{:7.1f}'),
+  # of them, the ones over translated code: they drop the page (code invalidations above) or retire single blocks
+    ('  that hit translated code/s', 'code_hits_s', '{:7.1f}'),
     ('  forced by misses/s', 'code_forced_s', '{:7.1f}'),
+    ('blocks retired alone/s', 'code_kills_s', '{:7.1f}'),
     ('translations redone (words changed)/s', 'code_retrans_s', '{:7.1f}'),
     ('far chains % of chained', 'chain_far_pct', '{:6.2f}'),
     ('exceptions/s', 'exc_s', '{:8.0f}'),

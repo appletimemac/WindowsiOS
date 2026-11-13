@@ -271,6 +271,9 @@ void hv_machine_free(HvMachine *m) {
         free(m->ram[i].page_gen);
         free(m->ram[i].code_grains);
         free(m->ram[i].code_miss);
+        free(m->ram[i].code_hot);
+        free(m->ram[i].block_head);
+        free(m->ram[i].page_seq);
         free(m->ram[i].diag_words);
     }
     free(m->blocks);
@@ -310,8 +313,12 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
     r->code_grains = calloc(pages * HV_CODE_GRAIN_WORDS, sizeof *r->code_grains); /* 28 MB at 7 GB, touched where code is */
     r->code_miss = calloc(pages, sizeof *r->code_miss);
+    r->code_hot = calloc(pages, 1);
+    r->block_head = calloc(pages, sizeof *r->block_head);
+    r->page_seq = calloc(pages, sizeof *r->page_seq);
     if (hv_code_diag_on()) r->diag_words = calloc(pages, (1u << HV_TLB_PAGE_BITS) / 32);
-    return r->code_pages && r->chain_in && r->page_gen && r->whint && r->code_grains && r->code_miss ? 0 : -1;
+    return r->code_pages && r->chain_in && r->page_gen && r->whint && r->code_grains && r->code_miss && r->code_hot &&
+           r->block_head && r->page_seq ? 0 : -1;
 }
 
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
@@ -493,6 +500,42 @@ int hv_code_diag_dump(HvMachine *m, const char *path) {
     return 0;
 }
 
+/* Retire the blocks of hot page pg made from bytes [off, off + len) of r, and no others. Whatever still enters
+   one (a chain from any page, the indirect-branch cache, the dispatcher's block in hand) meets its first word, now
+   a branch to its forwarding stub: an exit whose slot chains to the block's replacement. So nothing is unchained,
+   no cache starts over and nobody is asked to leave; a CPU inside one finishes it, as with a dropped page.
+   0: the page is dropped instead (a block without a stub, or the page's share of retirements used up, which also
+   bounds how many forwards an old chain can cross). Under tr_mu. */
+static int retire_blocks(HvMachine *m, HvRam *r, uint64_t pg, uint64_t off, uint64_t len) {
+    uint16_t n = __atomic_load_n(&r->code_miss[pg], __ATOMIC_RELAXED);
+    if (n >= HV_CODE_MISS_MAX || hv_knob[HV_K_GROUPS]) return 0; /* grouping reads past a block's own words */
+    uint64_t lo = r->pa + off, hi = lo + len;
+    uint32_t gen = __atomic_load_n(&r->page_gen[pg], __ATOMIC_RELAXED);
+    for (uint32_t i = r->block_head[pg]; i; i = m->blocks[i - 1].page_next) {
+        const HvBlock *b = &m->blocks[i - 1];
+        if (b->gen == gen && b->pa < hi && lo < b->pa + 4ull * b->ninsns && !b->fwd) return 0;
+    }
+    /* Before the list: a translation of these bytes not yet in it sees this at its publication and starts over. */
+    __atomic_add_fetch(&r->page_seq[pg], 1, __ATOMIC_SEQ_CST);
+    for (uint32_t *link = &r->block_head[pg]; *link;) {
+        HvBlock *b = &m->blocks[*link - 1];
+        int live = b->gen == gen;
+        if (live && b->pa < hi && lo < b->pa + 4ull * b->ninsns) {
+            uint32_t *site = m->slot_site[b->fwd - 1];
+            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[b->fwd - 1] - site) & 0x3ffffff);
+            __atomic_store_n(&b->gen, HV_GEN_DEAD, __ATOMIC_RELEASE); /* no lookup returns it from here on */
+            hv_jit_write(&m->jit, site, &insn, 4);                    /* nop to b: safe under a CPU running it */
+            hv_jit_finish(&m->jit, site, 1);
+            m->stats.code_block_kills++;
+            live = 0;
+        }
+        if (live) link = &b->page_next;
+        else *link = b->page_next; /* and stale ones leave the list on the way */
+    }
+    __atomic_store_n(&r->code_miss[pg], (uint16_t)(n + 1), __ATOMIC_RELAXED);
+    return 1;
+}
+
 /* Drop the blocks translated from the pages of [pa, pa + len): every page holding code (all), or only those
    where the bytes overlap a translated piece. */
 static void invalidate_code(HvMachine *m, uint64_t pa, uint64_t len, int all) {
@@ -519,10 +562,15 @@ static void invalidate_code(HvMachine *m, uint64_t pa, uint64_t len, int all) {
     pthread_mutex_lock(&m->tr_mu);
     int any = 0;
     for (uint64_t pg = first; pg <= last; pg++) {
-        if (!__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE) ||
-            (!all && !write_hits(r, pg, off, len) && __atomic_load_n(&r->code_miss[pg], __ATOMIC_RELAXED) < HV_CODE_MISS_MAX))
-            continue;
+        if (!__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) continue;
+        int hit = all || write_hits(r, pg, off, len);
+        if (!hit && __atomic_load_n(&r->code_miss[pg], __ATOMIC_RELAXED) < HV_CODE_MISS_MAX) continue;
+        if (!all && hit && len <= HV_CODE_PATCH_MAX && r->code_hot[pg] && retire_blocks(m, r, pg, off, len)) continue;
         __atomic_store_n(&r->code_miss[pg], 0, __ATOMIC_RELAXED);
+        r->block_head[pg] = 0; /* its blocks all go: the list with them */
+        /* A page written over its code once is likely a JIT's: from the next generation on its blocks can be
+           retired one at a time. Before the generation moves, so a translation under the new one sees it. */
+        if (hit && !all) __atomic_store_n(&r->code_hot[pg], 1, __ATOMIC_RELEASE);
         /* The marks go before the generation moves, so a translation that reads the new one marks after this
            (and a stale block's late marks only cost a needless invalidation one day). */
         uint64_t *g = r->code_grains + pg * HV_CODE_GRAIN_WORDS;
@@ -530,7 +578,8 @@ static void invalidate_code(HvMachine *m, uint64_t pa, uint64_t len, int all) {
         if (r->diag_words) memset(r->diag_words + pg * ((1u << HV_TLB_PAGE_BITS) / 32), 0, (1u << HV_TLB_PAGE_BITS) / 32);
         if (!__atomic_exchange_n(&r->code_pages[pg], 0, __ATOMIC_SEQ_CST)) continue;
         any = 1;
-        __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
+        if (__atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST) == HV_GEN_DEAD)
+            __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST); /* never a retired block's */
         m->stats.flush_smc++;
         if (hv_smc_counts && pg < hv_smc_pages) {
             hv_smc_counts[pg]++;
@@ -565,6 +614,7 @@ static void invalidate_code(HvMachine *m, uint64_t pa, uint64_t len, int all) {
     }
     if (!any) {
         pthread_mutex_unlock(&m->tr_mu);
+        m->stats.inval_ticks += mach_absolute_time() - t0; /* retiring blocks takes time too */
         return;
     }
     if (dev_depth || !hv_self) m->stats.inval_dev++;

@@ -249,8 +249,13 @@ static int test_grains(void) {
     bad += inval_check("same piece clears marks", hv_code_grains_hit(ram, 0, 0, PAGE), 0);
     bad += inval_run(&cpu[0], base + 0x100, base + 0x100, 1);
     uint32_t insn = 0xd2800040; /* mov x0, #2 */
+    /* The page is hot now (a write hit its code): a small write over code retires that block, not the page. */
+    bad += inval_check("page hot after a hit", ram->code_hot[0], 1);
+    before = m.stats;
     bad += inval_check("store over code", hv_vmem_xfer(&cpu[0], base + 0x100, &insn, 4, 1, cpu[0].el, base), 0);
-    bad += inval_check("code store drops page", ram->page_gen[0], gen + 2);
+    bad += inval_check("code store keeps the page", ram->page_gen[0], gen + 1);
+    bad += inval_check("code store retires the block", m.stats.code_block_kills - before.code_block_kills, 1);
+    bad += inval_check("code store resets no cache", m.stats.reset_why[4] - before.reset_why[4], 0);
     bad += inval_run(&cpu[0], base + 0x100, base + 0x100, 2);
 
     /* Atomics check after their store: LDADD and CAS on another piece, then on the code. */
@@ -272,7 +277,7 @@ static int test_grains(void) {
     cpu[0].x[1] = 0xd2800040, cpu[0].x[2] = 0xd2800060; /* mov x0, #2 -> mov x0, #3 */
     cpu[0].pc = base + PAGE + 0x40, m.stop_pc = base + PAGE + 0x48;
     bad += inval_check("cas run", hv_run(&cpu[0]), HV_EXIT_HALT);
-    bad += inval_check("cas over code drops page", ram->page_gen[0], gen + 1);
+    bad += inval_check("cas over code keeps the page", ram->page_gen[0], gen);
     bad += inval_run(&cpu[0], base + 0x100, base + 0x100, 3);
 
     /* An exclusive pair: STXR to another piece keeps the page, to the code drops it. */
@@ -288,13 +293,13 @@ static int test_grains(void) {
     cpu[0].x[2] = 0xd2800080, cpu[0].x[3] = base + 0x100; /* mov x0, #4 */
     cpu[0].pc = base + PAGE + 0x80, m.stop_pc = base + PAGE + 0x8c;
     bad += inval_check("stxr code run", hv_run(&cpu[0]), HV_EXIT_HALT);
-    bad += inval_check("stxr over code drops page", ram->page_gen[0], gen + 1);
+    bad += inval_check("stxr over code keeps the page", ram->page_gen[0], gen);
     bad += inval_run(&cpu[0], base + 0x100, base + 0x100, 4);
 
     /* A page written mostly as data gives up its blocks after HV_CODE_MISS_MAX misses, once. */
     gen = ram->page_gen[0];
     before = m.stats;
-    for (int i = 0; i < HV_CODE_MISS_MAX; i++)
+    for (int i = ram->code_miss[0]; i < HV_CODE_MISS_MAX; i++) /* retired blocks count toward it too */
         bad += inval_check("miss store", hv_vmem_xfer(&cpu[0], base + 0x800 + 4 * (i & 63), &v, 4, 1, cpu[0].el, base), 0);
     bad += inval_check("misses keep page", ram->page_gen[0], gen);
     bad += inval_check("miss store past the limit", hv_vmem_xfer(&cpu[0], base + 0x800, &v, 4, 1, cpu[0].el, base), 0);
@@ -323,6 +328,203 @@ static int test_grains(void) {
     return bad != 0;
 }
 
+/* On a hot page a small write over code retires only the blocks made from it. Callers chained to the old block
+   from another page, from the same page and through the indirect-branch cache all reach the new one. */
+static int test_retire(void) {
+    enum { PAGE = 1 << HV_TLB_PAGE_BITS, PAGES = 8 };
+    const uint64_t base = 0x40000000;
+    static HvMachine m;
+    static HvCpu cpu[HV_MAX_CPUS];
+    uint32_t *host = aligned_alloc(16384, PAGES * PAGE);
+    if (!host || hv_machine_init(&m, 4 << 20)) return 1;
+    memset(host, 0, PAGES * PAGE);
+    hv_machine_add_ram(&m, base, PAGES * PAGE, host, 0);
+    for (int i = 0; i < HV_MAX_CPUS; i++) hv_cpu_reset_index(&cpu[i], &m, i);
+    m.stats_interval = 1;
+    m.gen_checks = 1;
+    HvRam *ram = &m.ram[0];
+    uint32_t *p0 = host, *p1 = host + PAGE / 4;
+    const uint64_t fn = base + 0x100, far = base + PAGE, near = base + 0x400, ind = base + PAGE + 0x40;
+    int bad = 0;
+    p0[0x100 / 4] = 0xd2800020; /* fn: mov x0, #1 */
+    p0[0x104 / 4] = 0xd65f03c0; /* ret */
+    p0[0x200 / 4] = 0xd2800540; /* an unrelated function in the same page: mov x0, #42 */
+    p0[0x204 / 4] = 0xd65f03c0;
+    p1[0] = 0x94000000u | (uint32_t)(((int64_t)fn - (int64_t)far) / 4 & 0x3ffffff); /* far: bl fn (another page) */
+    p1[1] = 0x14000001;
+    p0[0x400 / 4] = 0x94000000u | (uint32_t)(((int64_t)fn - (int64_t)near) / 4 & 0x3ffffff); /* near: bl fn (same page) */
+    p0[0x404 / 4] = 0x14000001;
+    p1[0x40 / 4] = 0xd63f0120; /* ind: blr x9 */
+    p1[0x44 / 4] = 0x14000001;
+    p1[0x80 / 4] = 0x94000000u | (uint32_t)(((int64_t)(base + 0x200) - (int64_t)(far + 0x80)) / 4 & 0x3ffffff); /* bl other */
+    p1[0x84 / 4] = 0x14000001;
+    cpu[0].x[9] = fn;
+#define RUN3(value)                                           \
+    do {                                                      \
+        for (int twice = 0; twice < 2; twice++) {             \
+            bad += inval_run(&cpu[0], far, far, value);       \
+            bad += inval_run(&cpu[0], near, near, value);     \
+            bad += inval_run(&cpu[0], ind, ind, value);       \
+        }                                                     \
+    } while (0)
+    RUN3(1);
+    bad += inval_run(&cpu[0], far + 0x80, far + 0x80, 42);
+    /* The first write over the page's code drops it whole, and makes it hot. */
+    uint32_t insn = 0xd2800060; /* mov x0, #3 */
+    uint32_t gen = ram->page_gen[0];
+    bad += inval_check("first hit", hv_vmem_xfer(&cpu[0], fn, &insn, 4, 1, cpu[0].el, base), 0);
+    bad += inval_check("first hit drops the page", ram->page_gen[0], gen + 1);
+    bad += inval_check("first hit makes it hot", ram->code_hot[0], 1);
+    RUN3(3);
+    bad += inval_run(&cpu[0], far + 0x80, far + 0x80, 42);
+    bad += inval_run(&cpu[0], far + 0x80, far + 0x80, 42);
+    bad += inval_check("hot page lists its blocks", ram->block_head[0] != 0, 1);
+    /* From here a patch retires just fn's block. */
+    for (uint32_t value = 7; value < 10; value++) {
+        insn = 0xd2800000u | value << 5;
+        HvStats before = m.stats;
+        uint64_t resets = m.stats.ijc_resets;
+        bad += inval_check("patch", hv_vmem_xfer(&cpu[0], fn, &insn, 4, 1, cpu[0].el, base), 0);
+        bad += inval_check("patch keeps the page", ram->page_gen[0], gen + 1);
+        bad += inval_check("patch retires one block", m.stats.code_block_kills - before.code_block_kills, 1);
+        bad += inval_check("patch drops no page", m.stats.flush_smc - before.flush_smc, 0);
+        bad += inval_check("patch resets no branch cache", m.stats.ijc_resets - resets, 0);
+        bad += inval_check("patch kicks nobody", m.stats.kick_src[2] - before.kick_src[2], 0);
+        before = m.stats;
+        RUN3(value);
+        bad += inval_check("only the patched function is translated again", m.stats.translations - before.translations, 1);
+        bad += inval_run(&cpu[0], far + 0x80, far + 0x80, 42);
+        bad += inval_check("the other function's block is reused", m.stats.translations - before.translations, 1);
+    }
+    /* A long write is code replaced wholesale: the page goes, as before. */
+    uint32_t body[4] = {0xd2800160, 0xd65f03c0, 0, 0}; /* mov x0, #11; ret */
+    HvStats before = m.stats;
+    bad += inval_check("long write", hv_vmem_xfer(&cpu[0], fn, body, 16, 1, cpu[0].el, base), 0);
+    bad += inval_check("long write drops the page", m.stats.flush_smc - before.flush_smc, 1);
+    bad += inval_check("long write empties the list", ram->block_head[0], 0);
+    RUN3(11);
+    /* The page's share of retirements, then it is dropped once and starts over. */
+    gen = ram->page_gen[0];
+    before = m.stats;
+    for (int i = ram->code_miss[0]; i < HV_CODE_MISS_MAX; i++) {
+        insn = 0xd2800000u | (uint32_t)(20 + (i & 1)) << 5;
+        bad += inval_check("patch within the share", hv_vmem_xfer(&cpu[0], fn, &insn, 4, 1, cpu[0].el, base), 0);
+        bad += inval_run(&cpu[0], ind, ind, 20 + (i & 1)); /* translated again, so the next patch has a block to retire */
+    }
+    bad += inval_check("share used without dropping", ram->page_gen[0], gen);
+    insn = 0xd28003e0; /* mov x0, #31 */
+    bad += inval_check("patch past the share", hv_vmem_xfer(&cpu[0], fn, &insn, 4, 1, cpu[0].el, base), 0);
+    bad += inval_check("past the share the page drops", ram->page_gen[0], gen + 1);
+    RUN3(31);
+    hv_flush_blocks(&m);
+    bad += inval_check("flush forgets hot pages", ram->code_hot[0], 0);
+    bad += inval_check("flush empties block lists", ram->block_head[0], 0);
+    RUN3(31);
+    /* A forward chains only to a block of its own physical page: by the time the dispatcher looks the address
+       up it may be mapped elsewhere, and the retired block is shared by every address space on the old page. */
+    insn = 0xd2800400; /* mov x0, #32 */
+    bad += inval_check("hit to make it hot again", hv_vmem_xfer(&cpu[0], fn, &insn, 4, 1, cpu[0].el, base), 0);
+    RUN3(32);
+    HvBlock *live = NULL;
+    for (int i = 0; i < m.nblocks; i++)
+        if (m.blocks[i].va == fn && m.blocks[i].gen == ram->page_gen[0]) live = &m.blocks[i];
+    bad += inval_check("the function's block has a forward", live && live->fwd, 1);
+    if (live && live->fwd) {
+        uint32_t slot = live->fwd - 1;
+        bad += inval_check("a forward names its physical page", m.slot_xpa[slot], base | 2);
+        m.slot_xpa[slot] = (base + 2 * PAGE) | 2; /* as if the block had come from another page */
+        insn = 0xd2800420; /* mov x0, #33 */
+        bad += inval_check("patch", hv_vmem_xfer(&cpu[0], fn, &insn, 4, 1, cpu[0].el, base), 0);
+        RUN3(33);
+        bad += inval_check("a forward to another page's block is refused", m.slots[slot], 0);
+    }
+#undef RUN3
+    /* Retiring a block asks no CPU to leave, so what a guest uses to synchronise with new code has to make this
+       core fetch again: a guest ISB, and an HVC answered in place, each carry a host isb. */
+    uint32_t *p3 = host + 3 * PAGE / 4;
+    const uint64_t sync = base + 3 * PAGE;
+    p3[0] = 0xd5033fdf;        /* isb */
+    p3[1] = 0xd28000e0;        /* mov x0, #7 */
+    p3[2] = 0x14000001;
+    p3[0x40 / 4] = 0xd2b08000; /* mov x0, #0x84000000 (PSCI_VERSION) */
+    p3[0x44 / 4] = 0xd4000002; /* hvc #0 */
+    p3[0x48 / 4] = 0x14000001;
+    bad += inval_run(&cpu[0], sync, sync + 4, 7);
+    bad += inval_run(&cpu[0], sync + 0x40, sync + 0x44, 0x10000);
+    for (int which = 0; which < 2; which++) {
+        const HvBlock *b = NULL;
+        for (int i = 0; i < m.nblocks; i++)
+            if (m.blocks[i].va == sync + (which ? 0x40 : 0)) b = &m.blocks[i];
+        int isb = 0;
+        for (int k = 0; b && k < (which ? 24 : 8); k++) isb |= b->code[k] == 0xd5033fdfu;
+        bad += inval_check(which ? "an HVC answered in place synchronises the host" : "a guest ISB is a host isb", isb, 1);
+    }
+    printf("block retirement on hot pages: %s\n", bad ? "FAIL" : "ok");
+    hv_machine_free(&m);
+    free(host);
+    return bad != 0;
+}
+
+/* A write that lands while lookup() is making a block from the same bytes, at the two moments nothing else
+   covers: after the words are copied (the check after marking must see it), and after that check on a hot page
+   (the page's sequence must stop the publication). */
+static struct { int stage, armed; uint64_t pa; uint32_t insn; } race;
+static void race_hook(HvMachine *m, int stage) {
+    if (!race.armed || stage != race.stage) return;
+    race.armed = 0;
+    hv_phys_write(m, race.pa, &race.insn, 4);
+}
+
+static int test_lookup_races(void) {
+    enum { PAGE = 1 << HV_TLB_PAGE_BITS, PAGES = 4 };
+    const uint64_t base = 0x40000000, fn = base + 0x100;
+    static HvMachine m;
+    static HvCpu cpu[HV_MAX_CPUS];
+    uint32_t *host = aligned_alloc(16384, PAGES * PAGE);
+    if (!host || hv_machine_init(&m, 4 << 20)) return 1;
+    memset(host, 0, PAGES * PAGE);
+    hv_machine_add_ram(&m, base, PAGES * PAGE, host, 0);
+    for (int i = 0; i < HV_MAX_CPUS; i++) hv_cpu_reset_index(&cpu[i], &m, i);
+    m.stats_interval = 1;
+    m.gen_checks = 1;
+    m.lookup_hook = race_hook;
+    HvRam *ram = &m.ram[0];
+    int bad = 0;
+    host[0x100 / 4] = 0xd2800020; /* mov x0, #1 */
+    host[0x104 / 4] = 0x14000001;
+    /* The first translation of the page: no mark yet, so the write passes unnoticed and the check must catch it. */
+    race = (__typeof__(race)){.stage = 0, .armed = 1, .pa = fn, .insn = 0xd28000a0}; /* mov x0, #5 */
+    HvStats before = m.stats;
+    bad += inval_run(&cpu[0], fn, fn, 5);
+    bad += inval_check("write under the first translation: made again", m.stats.code_retranslates - before.code_retranslates, 1);
+    bad += inval_check("the hook fired", race.armed, 0);
+    /* Make the page hot, then write after a translation's check: its sequence must hold the block back. */
+    uint32_t insn = 0xd28000c0; /* mov x0, #6 */
+    bad += inval_check("first hit", hv_vmem_xfer(&cpu[0], fn, &insn, 4, 1, cpu[0].el, base), 0);
+    bad += inval_check("hot", ram->code_hot[0], 1);
+    race = (__typeof__(race)){.stage = 1, .armed = 1, .pa = fn, .insn = 0xd2800100}; /* mov x0, #8 */
+    before = m.stats;
+    bad += inval_run(&cpu[0], fn, fn, 8);
+    bad += inval_check("write before a hot page's publication: made again", m.stats.code_retranslates - before.code_retranslates, 1);
+    bad += inval_check("the second hook fired", race.armed, 0);
+    /* The same moment on a page that is not hot: the write drops the page, so the block is born stale. Its
+       maker runs it once (it had the old words in hand before the write, like a fetched instruction), and never
+       again. */
+    host[PAGE / 4] = 0xd2800020;
+    host[PAGE / 4 + 1] = 0x14000001;
+    race = (__typeof__(race)){.stage = 1, .armed = 1, .pa = base + PAGE, .insn = 0xd2800120}; /* mov x0, #9 */
+    uint32_t gen1 = ram->page_gen[1];
+    bad += inval_run(&cpu[0], base + PAGE, base + PAGE, 1);
+    bad += inval_check("the third hook fired", race.armed, 0);
+    bad += inval_check("the write dropped the page", ram->page_gen[1], gen1 + 1);
+    bad += inval_run(&cpu[0], base + PAGE, base + PAGE, 9);
+    m.lookup_hook = NULL;
+    printf("writes during translation: %s\n", bad ? "FAIL" : "ok");
+    hv_machine_free(&m);
+    free(host);
+    return bad != 0;
+}
+
 /* Two CPUs: one rewrites a function (and data beside it in the same page), then publishes the new value and
    waits for the other to make a round; the other reads the value, synchronizes (ISB) and calls the function, which
    must never be older. Under the old invalidate-then-store order this failed in 5 runs of 6. */
@@ -345,8 +547,11 @@ static void *stress_watchdog(void *arg) {
     return NULL;
 }
 
-static int test_smc_stress(void) {
-    enum { PAGE = 1 << HV_TLB_PAGE_BITS, PAGES = 8, WRITES = 20000 };
+/* paced: the writer waits for a reader round after each write (every write meets a translated function);
+   else it runs free (writes land while the reader is translating, publishing and chaining). */
+static int smc_stress(int paced) {
+    enum { PAGE = 1 << HV_TLB_PAGE_BITS, PAGES = 8 };
+    const uint32_t WRITES = paced ? 20000 : 60000;
     const uint64_t base = 0x40000000;
     static HvMachine m;
     static HvCpu cpu[HV_MAX_CPUS];
@@ -391,12 +596,25 @@ static int test_smc_stress(void) {
         0xd2800024, /* mov x4, #1 */
         0xf9000944, /* str x4, [x10, #16]: done */
     };
+    static const uint32_t writer_free[] = {
+        0x531b68c7, /* 0: lsl w7, w6, #5 */
+        0x2a0900e7, /* orr w7, w7, w9 */
+        0xb9000167, /* str w7, [x11] */
+        0xb90001c6, /* str w6, [x14] */
+        0x889ffd46, /* stlr w6, [x10] */
+        0x110004c6, /* add w6, w6, #1 */
+        0x6b0f00df, /* cmp w6, w15 */
+        0x54ffff21, /* b.ne 0 */
+        0xd2800024, /* mov x4, #1 */
+        0xf9000944, /* str x4, [x10, #16] */
+    };
     memcpy(rd, reader, sizeof reader);
-    memcpy(wr, writer, sizeof writer);
+    if (paced) memcpy(wr, writer, sizeof writer);
+    else memcpy(wr, writer_free, sizeof writer_free);
     cpu[0].pc = rd_pa, cpu[0].x[10] = flag_pa, cpu[0].x[11] = fn_pa, cpu[0].x[12] = 0, cpu[0].x[13] = 0;
     cpu[1].pc = wr_pa, cpu[1].x[6] = 1, cpu[1].x[9] = 0x52800000, cpu[1].x[10] = flag_pa, cpu[1].x[11] = fn_pa;
     cpu[1].x[14] = fn_pa + 0x800, cpu[1].x[15] = WRITES;
-    m.stop_pc = rd_pa + 52, m.stop_pc2 = wr_pa + 56;
+    m.stop_pc = rd_pa + 52, m.stop_pc2 = wr_pa + (paced ? sizeof writer : sizeof writer_free);
     StressRun runs[2] = {{&cpu[0], -1}, {&cpu[1], -1}};
     pthread_t t[2], dog;
     pthread_attr_t attr;
@@ -416,12 +634,17 @@ static int test_smc_stress(void) {
     bad += inval_check("stress reader at its end", cpu[0].pc, rd_pa + 52);
     bad += inval_check("stress never ran stale code", cpu[0].x[13], 0);
     bad += inval_check("stress data written", fn[0x800 / 4], WRITES - 1);
-    printf("two-CPU code rewriting (%llu rounds, %llu writes to code pages, %llu dropped the page, %llu retranslated): %s\n",
-           (unsigned long long)cpu[0].x[12], (unsigned long long)m.stats.code_writes, (unsigned long long)m.stats.code_write_hits,
+    printf("two-CPU code rewriting, %s (%llu rounds, %llu writes to code pages, %llu blocks retired, %llu pages dropped, %llu retranslated): %s\n",
+           paced ? "paced" : "free", (unsigned long long)cpu[0].x[12], (unsigned long long)m.stats.code_writes,
+           (unsigned long long)m.stats.code_block_kills, (unsigned long long)m.stats.flush_smc,
            (unsigned long long)m.stats.code_retranslates, bad ? "FAIL" : "ok");
     hv_machine_free(&m);
     free(host);
     return bad != 0;
+}
+
+static int test_smc_stress(void) {
+    return smc_stress(1) + smc_stress(0);
 }
 
 int main(void) {
@@ -495,6 +718,8 @@ int main(void) {
     }
     failed += test_invalidation();
     failed += test_grains();
+    failed += test_retire();
+    failed += test_lookup_races();
     failed += test_smc_stress();
     printf("%zu programs x 2 seeds + invalidation, %d failures, %d blocks translated\n", count, failed, m.nblocks);
     return failed != 0;

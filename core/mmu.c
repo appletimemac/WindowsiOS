@@ -1001,7 +1001,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     /* This CPU's small cache in front of the block hash first (as the dispatcher's lookup). */
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     HvBlock *b = pcs->jc[j].va == va ? pcs->jc[j].b : NULL;
-    if (!(b && b->pa == pa && b->flags == flags && b->gen == gen)) {
+    if (!(b && b->pa == pa && b->flags == flags && __atomic_load_n(&b->gen, __ATOMIC_RELAXED) == gen)) {
         b = hv_block_find(m, hv_block_hash(va, pa, flags), va, pa, flags, gen);
         if (!b) FAIL(3);
 #undef FAIL

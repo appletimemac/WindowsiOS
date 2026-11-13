@@ -16,6 +16,11 @@
 #define HV_CODE_MISS_MAX 1024
 /* code_pages: protected. 1 to HV_MAX_CPUS: that CPU (index plus 1) is dropping the page's write tags. */
 #define HV_CODE_PROTECTED 0xff
+/* A write of at most this many bytes over translated code of a hot page (one a write hit before) retires just the
+   blocks made from those bytes: a guest JIT re-pointing a branch it runs (Edge: 99% of such writes, 200 blocks a
+   page). Longer writes are code being replaced wholesale, and drop the page. */
+#define HV_CODE_PATCH_MAX 8
+#define HV_GEN_DEAD 0xffffffffu /* HvBlock.gen of a retired block: no page generation */
 
 /* Guest physical memory: RAM regions backed by host memory, and MMIO regions
    handled by device callbacks. The fast path only ever sees RAM. */
@@ -30,6 +35,12 @@ typedef struct HvRam {
     /* Per page: writes that missed its translated pieces since it was last protected. Past HV_CODE_MISS_MAX the
        page's blocks go anyway, so a page mostly written as data stops trapping every store (until it runs again). */
     uint16_t *code_miss;
+    /* Pages whose code a write has hit: their blocks carry a forwarding stub (HvBlock.fwd) and are listed
+       (block_head, HvBlock.page_next), so that a small write retires only the blocks it changes. page_seq moves
+       at each such write, so a translation of those bytes in flight is not published. Under tr_mu, but for
+       lookup()'s reads. */
+    uint8_t *code_hot;
+    uint32_t *block_head, *page_seq;
     uint32_t *chain_in; /* per page: the first cross-page chain slot into it, plus 1 (0: none); under tr_mu */
     uint8_t *diag_words; /* HV_CODE_DIAG only: one bit per guest word a live translation was made from */
     uint32_t pages_log2;
@@ -52,10 +63,13 @@ typedef struct HvMmio {
 
 typedef struct HvBlock {
     uint32_t jit_gen; /* full flushes when it was made */
+    uint32_t fwd;     /* on a hot page: its forwarding slot plus 1 (its first word is a nop that retiring turns into a
+                         branch to that slot's stub); 0: none, the block goes only with its page */
     uint64_t va, pa;
     uint32_t flags;      /* HV_BLOCK_* state the translation depends on */
     uint32_t ninsns;
-    uint32_t gen;        /* page_gen of its page when translated */
+    uint32_t gen;        /* page_gen of its page when translated; HV_GEN_DEAD once retired */
+    uint32_t page_next;  /* the next block of its hot page (index plus 1) */
     struct HvRam *ram;   /* where its page lives, for a quick staleness check */
     uint64_t pg;
     uint32_t *code;
@@ -131,6 +145,7 @@ typedef struct HvStats {
        blocks (overlapping translated pieces, or HV_CODE_MISS_MAX misses: forced), and translations dropped because
        their words changed meanwhile. */
     uint64_t code_writes, code_write_hits, code_retranslates, code_write_forced;
+    uint64_t code_block_kills; /* blocks retired alone (their page's other blocks stayed) */
     /* HV_CODE_DIAG only, of the writes that dropped a page: on translated words (not just their 32-byte pieces),
        storing what was there already, storing zeros, from EL1, from a device, 256 bytes or more. */
     uint64_t diag_word, diag_same, diag_zero, diag_el1, diag_dev, diag_big, diag_g8, diag_g16;
@@ -254,6 +269,9 @@ typedef struct HvMachine {
 
     uint64_t stop_pc;    /* tests: leave the dispatcher when pc reaches this */
     void (*stop_hook)(HvCpu *cpu); /* debugging: call this there instead of leaving */
+    /* Tests: called while lookup() makes a block, once its words are copied (0) and once they are checked but
+       the block is not yet published (1), to put a write exactly there. */
+    void (*lookup_hook)(struct HvMachine *m, int stage);
     uint64_t stop_pc2;   /* debugging: a second such place */
     uint32_t jit_gen;    /* full flushes so far, as blocks see them (HV_JIT_POISON checks) */
     int gen_checks;
@@ -310,7 +328,7 @@ static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {
 /* Lock-free: blocks are only added (release store) until a flush, which stops every CPU. */
 static inline HvBlock *hv_block_find(HvMachine *m, uint32_t h, uint64_t va, uint64_t pa, uint32_t flags, uint32_t gen) {
     for (HvBlock *b = __atomic_load_n(&m->hash[h], __ATOMIC_ACQUIRE); b; b = __atomic_load_n(&b->next, __ATOMIC_ACQUIRE))
-        if (b->va == va && b->pa == pa && b->flags == flags && b->gen == gen) return b;
+        if (b->va == va && b->pa == pa && b->flags == flags && __atomic_load_n(&b->gen, __ATOMIC_RELAXED) == gen) return b; /* retiring stores it */
     return NULL;
 }
 

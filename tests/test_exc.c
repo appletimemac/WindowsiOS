@@ -166,6 +166,7 @@ int main(void) {
         const TestProgram *p = smc_progs[i];
         size_t len = (const char *)p->end - (const char *)p->start + 4;
         memcpy(code, p->start, len);
+        hv_ram_written(&m, ADDR(code), len); /* a host write, like a device's: blocks left from the program before go */
         TestProgram copy = {p->name, NULL, code, code + ((const char *)p->end - (const char *)p->start)};
         if (!run(&copy, &c, 0)) check(p->name, "1 then 2 after patching", c.x[1], 3);
     }

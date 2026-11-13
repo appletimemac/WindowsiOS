@@ -574,6 +574,7 @@ void hv_winvm_perf_snapshot(HvPerfSnap *s) {
     s->inval_scanned = st->inval_scanned;
     s->code_writes = st->code_writes, s->code_write_hits = st->code_write_hits;
     s->code_write_forced = st->code_write_forced, s->code_retranslates = st->code_retranslates;
+    s->code_block_kills = st->code_block_kills;
     s->diag_word = st->diag_word, s->diag_same = st->diag_same, s->diag_zero = st->diag_zero;
     s->diag_el1 = st->diag_el1, s->diag_dev = st->diag_dev, s->diag_big = st->diag_big;
     s->diag_g8 = st->diag_g8, s->diag_g16 = st->diag_g16;
