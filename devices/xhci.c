@@ -991,7 +991,7 @@ static uint64_t bar_read(HvPciDev *d, int bar, uint64_t off, unsigned size) {
             0,
         };
         uint32_t i = (uint32_t)off / 4;
-        v = cap[i];
+        v = i < 8 ? cap[i] : 0; /* 0x20 to 0x3f is reserved */
         if (size == 8 && i + 1 < 8) v |= (uint64_t)cap[i + 1] << 32;
         v >>= 8 * (off & 3);
     } else if (off >= XECP && off < XECP + 16) {

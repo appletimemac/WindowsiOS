@@ -435,6 +435,19 @@ static void test_descriptor(const uint8_t *d, int len) {
 
 /* ---- the checks ---- */
 
+/* The capability window is 0x40 bytes but eight registers: the rest of it is reserved. */
+static void test_capability_window(void) {
+    static const uint32_t cap[8] = {0x01000040, 0x03000408, 0x10, 0, 0x02000001, 0x2000, 0x1000, 0};
+    for (uint64_t i = 0; i < 8; i++) check("capability register", mmio_r(4 * i, 4), cap[i]);
+    check("a wide read of the last one stops at the table", mmio_r(0x1c, 8), 0);
+    check("reserved 0x20", mmio_r(0x20, 4), 0);
+    check("reserved 0x24", mmio_r(0x24, 4), 0);
+    check("reserved 0x38", mmio_r(0x38, 4), 0);
+    check("reserved 0x3c", mmio_r(0x3c, 4), 0);
+    check("reserved 0x20, wide", mmio_r(0x20, 8), 0);
+    check("reserved 0x38, wide", mmio_r(0x38, 8), 0);
+}
+
 static void test_root_hub(void) {
     uint32_t hcs1 = (uint32_t)mmio_r(4, 4);
     check("HCSPARAMS1 ports", hcs1 >> 24, 3);
@@ -880,6 +893,8 @@ int main(void) {
     mmio_w(OP, 1 | 4, 4); /* run, interrupts on: raises the port status change events */
     drain();
 
+    printf("== capability registers\n");
+    test_capability_window();
     printf("== root hub\n");
     test_root_hub();
     printf("== enumeration\n");
