@@ -4,6 +4,9 @@
 #
 #   scripts/duo_perf.sh launch ['{"HV_QOS":"ui","HV_ENGINE_STATS":"1"}']   (re)launch the app with environment
 #                                    variables; the JIT then comes from StikDebug as with a Home Screen launch
+#   scripts/duo_perf.sh env '{"WINIOS_CMD":"1"}'   the same variables for every later launch, however the app is
+#                                    started (after an install StikDebug restarts it without the launch's own):
+#                                    written to Documents/launch_env.json. '{}' turns them off again
 #   scripts/duo_perf.sh pull [DIR]   copy perf.csv, perf.csv.1, boot_status.txt and Shared/diag-*.txt to DIR
 #                                    (default work/duo_perf/<date-time>) and print the report
 #   scripts/duo_perf.sh watch MINUTES [DIR]   pull every minute for MINUTES, then report
@@ -56,6 +59,15 @@ launch)
     args=(--terminate-existing --device "$UDID")
     [ -n "$env_json" ] && args+=(--environment-variables "$env_json")
     xcrun devicectl device process launch "${args[@]}" "$BUNDLE" 2>&1 | tail -1
+    ;;
+env)
+    tmp="$(mktemp -d)"
+    printf '%s\n' "${2:?a JSON object of variables, or '{}'}" > "$tmp/launch_env.json"
+    python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d, dict) and all(isinstance(v, str) for v in d.values())' \
+        "$tmp/launch_env.json" || { echo "duo_perf: not a JSON object of strings" >&2; exit 1; }
+    xcrun devicectl device copy to --device "$UDID" --domain-type appDataContainer --domain-identifier "$BUNDLE" \
+        --source "$tmp/launch_env.json" --destination Documents/launch_env.json 2>&1 | tail -1
+    rm -f "$tmp/launch_env.json"; rmdir "$tmp"
     ;;
 pull)
     dir="${2:-$ROOT/work/duo_perf/$(date +%Y%m%d-%H%M%S)}"

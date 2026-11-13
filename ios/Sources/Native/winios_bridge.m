@@ -141,6 +141,22 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     });
 }
 
+/* Test settings for a launch that cannot carry an environment: after an install StikDebug restarts the
+   app without the one devicectl gave it, so the remote command file and the engine statistics were off
+   until somebody shut Windows down by hand. Documents/launch_env.json is a flat object of strings; only
+   HV_ and WINIOS_ names are taken, and never over a variable the launch did set. */
+static void apply_launch_env_file(NSString *docs) {
+    NSData *data = [NSData dataWithContentsOfFile:[docs stringByAppendingPathComponent:@"launch_env.json"]];
+    if (!data) return;
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![json isKindOfClass:[NSDictionary class]]) return;
+    [(NSDictionary *)json enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+        if (![key isKindOfClass:[NSString class]] || ![value isKindOfClass:[NSString class]]) return;
+        if (![key hasPrefix:@"HV_"] && ![key hasPrefix:@"WINIOS_"]) return;
+        setenv([key UTF8String], [value UTF8String], 0);
+    }];
+}
+
 @implementation WinIOSBridge
 
 + (WinIOSBridge *)shared {
@@ -153,6 +169,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 
 - (instancetype)init {
     if ((self = [super init])) {
+        apply_launch_env_file([self documentsPath]); /* before anything reads the environment */
         _vmStatus = @"Idle";
         _metricsLock = OS_UNFAIR_LOCK_INIT;
         _screenSizePts = CGSizeZero;
