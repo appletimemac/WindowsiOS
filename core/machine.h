@@ -8,14 +8,29 @@
 #include "cpu.h"
 #include "jit_region.h"
 
+#define HV_CODE_GRAIN_BITS 5 /* 32 bytes: on Edge, 3% of writes to code pages hit translated pieces (64: 29%) */
+#define HV_CODE_GRAINS (1u << (HV_TLB_PAGE_BITS - HV_CODE_GRAIN_BITS))
+#define HV_CODE_GRAIN_WORDS ((HV_CODE_GRAINS + 63) / 64)
+/* A trapped store costs about 0.5 us and dropping a page's blocks about 1 ms with what follows: past this many
+   misses giving up the page costs at most twice the best choice. */
+#define HV_CODE_MISS_MAX 1024
+/* code_pages: protected. 1 to HV_MAX_CPUS: that CPU (index plus 1) is dropping the page's write tags. */
+#define HV_CODE_PROTECTED 0xff
+
 /* Guest physical memory: RAM regions backed by host memory, and MMIO regions
    handled by device callbacks. The fast path only ever sees RAM. */
 typedef struct HvRam {
     uint64_t pa, size;
     uint8_t *host;
     int readonly;
-    uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here (2^pages_log2 of them) */
-    uint8_t *inval_pages; /* batch membership bitmap, under tr_mu */
+    uint8_t *code_pages; /* per page: a translated block came from here: HV_CODE_PROTECTED, or being protected (2^pages_log2 of them) */
+    /* Per page, HV_CODE_GRAIN_WORDS words of one bit per 32-byte piece a translation was made from: a write that
+       misses them all leaves the page's blocks alone (guest JITs write next to code they run, rarely over it). */
+    uint64_t *code_grains;
+    /* Per page: writes that missed its translated pieces since it was last protected. Past HV_CODE_MISS_MAX the
+       page's blocks go anyway, so a page mostly written as data stops trapping every store (until it runs again). */
+    uint16_t *code_miss;
+    uint32_t *chain_in; /* per page: the first cross-page chain slot into it, plus 1 (0: none); under tr_mu */
     uint32_t pages_log2;
     uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
     /* Per page and CPU: up to three TLB entries (slot << 2 | table, plus 1;
@@ -111,6 +126,10 @@ typedef struct HvStats {
        stop-the-world flushes (count, ticks from the request to the restart, largest since read). */
     uint64_t chain_far;
     uint64_t inval_ticks, inval_scanned, inval_dev;
+    /* Always counted: writes to pages holding code (each took the slow path), those that dropped the page's
+       blocks (overlapping translated pieces, or HV_CODE_MISS_MAX misses: forced), and translations dropped because
+       their words changed meanwhile. */
+    uint64_t code_writes, code_write_hits, code_retranslates, code_write_forced;
     uint64_t stw_count, stw_ticks, stw_max_ticks;
 } HvStats;
 
@@ -119,6 +138,7 @@ typedef struct HvStats {
 #else
 #define HV_MAX_CPUS 8
 #endif
+_Static_assert(HV_MAX_CPUS < HV_CODE_PROTECTED, "code_pages names the protecting CPU");
 #define HV_WHINT_MANY (1ull << 63) /* whint: more than three; else up to three TLB codes + 1, 16 bits each */
 
 /* What each CPU has to itself and keeps across hv_cpu_reset (tests copy HvCpu
@@ -249,9 +269,10 @@ typedef struct HvMachine {
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
-       (| 1) so that invalidating its code can unchain it. xchained lists them. */
+       (| 1) so that invalidating its code can unchain it. They are listed by that page: HvRam.chain_in heads
+       the list, slot_xnext links it (slot plus 1, 0 ends it); nxchained counts them. Under tr_mu. */
     uint64_t *slot_xa, *slot_xpa;
-    uint32_t *xchained, nxchained;
+    uint32_t *slot_xnext, nxchained;
     uint32_t nslots;
     HvCpu *cpu;              /* CPU 0: the one that polls devices */
     HvCpu *cpus[HV_MAX_CPUS]; /* every CPU, so device and invalidation code can ask them to leave */
@@ -299,8 +320,14 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
                         void (*write)(void *, uint64_t, uint64_t, unsigned), const char *name);
 
 HvRam *hv_ram_lookup(HvMachine *m, uint64_t pa);
-/* Drop the translations made from the RAM page holding pa (it was written, or the guest invalidated it). */
+/* Drop every translation made from the RAM page holding pa (HV_IC_IVAU: the guest invalidated it). */
 void hv_invalidate_code(HvMachine *m, uint64_t pa);
+/* Guest RAM [pa, pa + len) was just written, by a CPU or a device: drop the translations made from bytes it
+   overlaps. After the write, never before (lookup() checks the words it translated against a write it missed). */
+void hv_ram_written(HvMachine *m, uint64_t pa, uint64_t len);
+/* The 32-byte pieces of page pg holding bytes [lo, hi) of it: mark them translated, or ask if any is. */
+void hv_code_grains_mark(HvRam *r, uint64_t pg, uint32_t lo, uint32_t hi);
+int hv_code_grains_hit(const HvRam *r, uint64_t pg, uint32_t lo, uint32_t hi);
 void hv_ret_clear(HvCpu *cpu);
 int hv_ic_ivau_drops(void);
 /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
@@ -313,8 +340,6 @@ int hv_knob_set(HvMachine *m, const char *name, int value);
 extern uint32_t *hv_smc_counts;
 extern uint64_t *hv_smc_last;
 extern uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
-/* A device wrote guest memory directly: translations made from it are out of date. Any thread. */
-void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len);
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa);
 /* Host pointer for `len` bytes of guest RAM at pa, or NULL. */
 void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len);

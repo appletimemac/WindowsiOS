@@ -81,6 +81,10 @@ def derive(a, b, dt_ms, cpus):
     m['inval_dev_s'] = d(a, b, 'inval_dev') / dt
     m['inval_ms_s'] = d(a, b, 'inval_ns') / 1e6 / dt
     m['inval_scan_k_s'] = d(a, b, 'inval_scanned') / 1e3 / dt
+    m['code_writes_s'] = d(a, b, 'code_writes') / dt
+    m['code_hits_s'] = d(a, b, 'code_write_hits') / dt
+    m['code_forced_s'] = d(a, b, 'code_write_forced') / dt
+    m['code_retrans_s'] = d(a, b, 'code_retranslates') / dt
     chained = d(a, b, 'chained')
     m['chain_far_pct'] = 100.0 * d(a, b, 'chain_far') / chained if chained else 0.0
     m['stw'] = d(a, b, 'stw_count')
@@ -139,7 +143,12 @@ SUMMARY = [
     ('code invalidations/s', 'smc_s', '{:7.1f}'),
     ('  from devices/s', 'inval_dev_s', '{:7.1f}'),
     ('  ms per second', 'inval_ms_s', '{:7.2f}'),
-    ('  chains scanned K/s', 'inval_scan_k_s', '{:7.1f}'),
+    ('  chains unlinked K/s', 'inval_scan_k_s', '{:7.1f}'),
+    ('writes to code pages/s', 'code_writes_s', '{:8.0f}'),
+  # of them, the ones that dropped the page's blocks (the rest left them: the page holds code elsewhere)
+    ('  that dropped the page/s', 'code_hits_s', '{:7.1f}'),
+    ('  forced by misses/s', 'code_forced_s', '{:7.1f}'),
+    ('translations redone (words changed)/s', 'code_retrans_s', '{:7.1f}'),
     ('far chains % of chained', 'chain_far_pct', '{:6.2f}'),
     ('exceptions/s', 'exc_s', '{:8.0f}'),
     ('interrupts/s', 'irq_s', '{:8.0f}'),

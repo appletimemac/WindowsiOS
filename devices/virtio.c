@@ -269,6 +269,7 @@ void hv_virtq_push(HvVirtio *v, int qi, const HvVirtqElem *e, uint32_t written) 
     __atomic_thread_fence(__ATOMIC_RELEASE);
     idx++;
     memcpy(used + 2, &idx, 2);
+    hv_ram_written(v->m, q->used, 4 + 8u * q->size);
 }
 
 static uint32_t copy(HvVirtio *v, const HvVirtqElem *e, int writable, uint32_t off, uint8_t *buf, uint32_t len) {
@@ -284,8 +285,12 @@ static uint32_t copy(HvVirtio *v, const HvVirtqElem *e, int writable, uint32_t o
         if (n > len - done) n = len - done;
         uint8_t *p = hv_phys_ptr(v->m, g->addr + off, n);
         if (!p) break;
-        if (writable) memcpy(p, buf + done, n);
-        else memcpy(buf + done, p, n);
+        if (writable) {
+            memcpy(p, buf + done, n);
+            hv_ram_written(v->m, g->addr + off, n); /* like any write: a translation from these bytes goes */
+        } else {
+            memcpy(buf + done, p, n);
+        }
         done += n;
         off = 0;
     }
