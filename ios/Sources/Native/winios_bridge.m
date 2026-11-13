@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #import "winios_bridge.h"
 
+#include "disk.h"
 #include "hvsparse.h"
 #include "share.h"
 #include "winios_jit.h"
@@ -489,6 +490,10 @@ static size_t jit_region_bytes(void) {
     NSString *codePath = [dir stringByAppendingPathComponent:@"code.fd"];
     NSString *varsPath = [dir stringByAppendingPathComponent:@"vars.fd"];
     NSString *diskPath = [dir stringByAppendingPathComponent:@"windows11.img"];
+    /* Windows gets a 64 GB disk: the file grows sparse (no space is used up front) and the guest extends C:
+       into the new space (scripts/winios_extend_c.ps1). Before the disk is opened; a failure leaves the
+       image as it was, which still boots. */
+    hv_disk_grow(diskPath.fileSystemRepresentation, HV_DISK_GROW_TARGET);
     /* The "WindowsiOS Tools" disk (the display driver, posture agent and their installer for Windows) rides as the
        second NVMe disk whenever it has been copied in. */
     NSString *toolsImage = [dir stringByAppendingPathComponent:@"tools.img"];

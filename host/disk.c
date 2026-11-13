@@ -3,7 +3,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/fcntl.h>
+#include <sys/file.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -23,6 +26,34 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
                     st.st_blksize > 0 ? (uint32_t)st.st_blksize : 4096u;
     d->readonly = readonly;
     return 0;
+}
+
+int hv_disk_grow(const char *path, uint64_t target) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return -1;
+    struct stat st;
+    char magic[8];
+    int rc = -1;
+    /* Two launches growing one image take turns, so the size read here is the size cut to below: without the
+       lock one could cut back what another, with a larger target, had just added. Released by close. */
+    if (flock(fd, LOCK_EX) != 0) goto done;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) goto done;
+    uint64_t size = (uint64_t)st.st_size;
+    target &= ~511ull; /* whole 512-byte NVMe blocks */
+    if (size >= target) { /* a disk that is big enough, or a larger one, is never touched */
+        rc = 0;
+        goto done;
+    }
+    /* A packed image is not a disk: growing it would only append zeros after its end record. */
+    if (pread(fd, magic, sizeof magic, 0) == (ssize_t)sizeof magic && !memcmp(magic, "HVSPARSE", sizeof magic)) goto done;
+    if (ftruncate(fd, (off_t)target) != 0) goto done; /* extends with a hole: no space is used */
+    const char *name = strrchr(path, '/');
+    fprintf(stderr, "winvm: grew disk image %s from %llu to %llu MiB (sparse)\n", name ? name + 1 : path,
+            (unsigned long long)(size >> 20), (unsigned long long)(target >> 20));
+    rc = 1;
+done:
+    close(fd);
+    return rc;
 }
 
 void hv_disk_close(HvDisk *d) {

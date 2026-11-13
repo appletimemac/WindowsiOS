@@ -13,6 +13,14 @@ typedef struct HvDisk {
     int readonly;
 } HvDisk;
 
+/* The size the iPhone app grows Windows' disk to; the guest then extends C: into the new space. */
+#define HV_DISK_GROW_TARGET (64ull << 30)
+
+/* Make the raw image at path at least target bytes (rounded down to 512). ftruncate extends it with a
+   hole, so no space is used until the guest writes there. A file already that big is left alone (never
+   shrinks), as is a packed HVSPARSE file. Logs one line when it grows. Call before hv_disk_open.
+   Returns 1 if the file grew, 0 if it was left alone, -1 on an error (the file is untouched). */
+int hv_disk_grow(const char *path, uint64_t target);
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly);
 void hv_disk_close(HvDisk *d);
 /* Return 0, or -1 on an I/O error or an access past the end. */

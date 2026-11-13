@@ -40,6 +40,7 @@ call :step_settings
 call :step_updates
 call :step_hibernate
 call :step_tune
+call :step_extend
 rem Last, back to back: while the driver runs and Basic Display is still on, Windows extends the
 rem desktop onto the virtio-gpu screen and this window stays on the other one, which the app does not show.
 call :step_driver
@@ -51,8 +52,18 @@ set /a FAILS+=1
 echo   FAILED: %~1
 exit /b
 
+:step_extend
+echo [8/10] Disk space (C: grows into the free space after it)
+if exist "%SRC%winios_extend_c.ps1" goto :ext_go
+call :fail "winios_extend_c.ps1 is missing from the tools disk"
+exit /b
+:ext_go
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%winios_extend_c.ps1"
+if errorlevel 1 call :fail "C: was not extended, see the messages above"
+exit /b
+
 :step_driver
-echo [8/9] Display driver (virtio-gpu)
+echo [9/10] Display driver (virtio-gpu)
 echo   The screen may change for a moment. Once the sharp display is set up, Windows restarts by itself.
 if exist "%SRC%drivers\viogpudo\viogpudo.inf" goto :drv_go
 call :fail "viogpudo.inf is missing from the tools disk"
@@ -68,7 +79,7 @@ call :fail "pnputil returned %RC% for viogpudo.inf"
 exit /b
 
 :step_files
-echo [1/9] Program files in %DEST%
+echo [1/10] Program files in %DEST%
 if not exist "%DEST%" mkdir "%DEST%"
 sc stop vgpusrv >nul 2>&1
 taskkill /f /im vgpusrv.exe >nul 2>&1
@@ -88,7 +99,7 @@ if errorlevel 1 call :fail "could not copy %~2"
 exit /b
 
 :step_service
-echo [2/9] Display resolution service (vgpusrv)
+echo [2/10] Display resolution service (vgpusrv)
 sc query vgpusrv >nul 2>&1
 if not errorlevel 1 goto :svc_have
 "%DEST%\vgpusrv.exe" -i >nul 2>&1
@@ -105,7 +116,7 @@ sc start vgpusrv >nul 2>&1
 exit /b
 
 :step_task
-echo [3/9] Posture agent (scheduled task "%TASK%")
+echo [3/10] Posture agent (scheduled task "%TASK%")
 schtasks /create /f /sc onlogon /rl highest /tn "%TASK%" /tr "\"%DEST%\WinIOSAgent.exe\"" >nul
 if not errorlevel 1 goto :task_ok
 call :fail "schtasks /create failed"
@@ -118,11 +129,11 @@ if errorlevel 1 call :fail "could not start the agent now, it starts at next sig
 exit /b
 
 :step_settings
-echo [4/9] Tablet mode
+echo [4/10] Tablet mode
 call :regdword "HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl" ConvertibilityEnabled 1
 exit /b
 :step_updates
-echo [5/9] Windows Update on demand
+echo [5/10] Windows Update on demand
 rem The image's optimizer disabled these services. Manual start lets Settings check for and
 rem install updates when asked, while the NoAutoUpdate policy keeps it from running on its own.
 call :svc_manual wuauserv
@@ -130,7 +141,7 @@ call :svc_manual UsoSvc
 call :svc_manual DoSvc
 exit /b
 :step_hibernate
-echo [6/9] Hibernation (the app's Hibernate action)
+echo [6/10] Hibernation (the app's Hibernate action)
 powercfg /h on >nul 2>&1
 if errorlevel 1 goto :hib_fail
 rem The default "reduced" hiberfile only serves Fast Startup; shutdown /h needs a full one.
@@ -152,7 +163,7 @@ if errorlevel 1 call :fail "could not set the %1 service to manual start"
 exit /b
 
 :step_tune
-echo [7/9] Performance tuning
+echo [7/10] Performance tuning
 if exist "%SRC%winios_tune.ps1" goto :tune_go
 call :fail "winios_tune.ps1 is missing from the tools disk"
 exit /b
@@ -162,7 +173,7 @@ if errorlevel 1 call :fail "performance tuning reported failures; see C:\Program
 exit /b
 
 :step_display
-echo [9/9] Display adapter
+echo [10/10] Display adapter
 rem Basic Display drives the firmware framebuffer as a second monitor. It is in the System class on ARM64,
 rem so it is found by instance id, as is the virtio-gpu (no setup class until its driver binds). @() keeps
 rem one device an array: .Count on a lone CimInstance is empty in Windows PowerShell. Basic Display

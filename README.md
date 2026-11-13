@@ -235,6 +235,8 @@ HV_OAUTH_BRIDGE=1 ./build/winvm \
   --disk work/windows11_lite.img
 ```
 
+`--disk-size 64` grows the image to 64 GB first (sparse: no space is used until Windows writes; it never shrinks). The iPhone app always does this at launch. Windows then extends C: into the new space: "Install WindowsiOS Tools" runs `scripts/winios_extend_c.ps1` (elevated, safe to run again).
+
 ### 4. Build, Install & Launch on Physical iOS 26/27 TXM Hardware (iPhone Duo)
 ```bash
 # Generate Xcode project from ios/project.yml and build Release iphoneos bundle

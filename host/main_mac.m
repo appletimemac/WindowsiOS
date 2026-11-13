@@ -20,6 +20,7 @@
 
 #include "winvm.h"
 #include "cmdfile.h"
+#include "disk.h"
 
 /* macOS virtual key codes (kVK_*) -> Linux EV_KEY codes (mapped to USB HID by hv_winvm_key_linux) */
 static const uint16_t kMacToLinuxKey[128] = {
@@ -500,6 +501,8 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s --code <code.fd> --vars <vars.fd> [options]\n"
             "  --disk <img|hvsparse>     Primary NVMe disk image (read/write)\n"
+            "  --disk-size <GB>          Grow the --disk image to at least this many GB first (sparse, never\n"
+            "                            shrinks; off by default; Windows then extends C: with scripts/winios_extend_c.ps1)\n"
             "  --disk1 <img|dmg>         Secondary/installer NVMe image (read-only)\n"
             "  --cpus <N>                Number of vCPUs (default: 4)\n"
             "  --ram <MB>                Guest RAM in MB (default: 4096)\n"
@@ -551,6 +554,7 @@ int main(int argc, char **argv) {
     cfg.ram_mb = 4096;
 
     int headless = 0;
+    uint64_t disk_gb = 0;
     TimerArgs targs = {NULL, 0, 0};
     const char *cmd_file = getenv("HV_INPUT_FILE");
     const char *perf_path = NULL;
@@ -567,6 +571,10 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--code"))              cfg.code_fd = argv[++i];
         else if (!strcmp(argv[i], "--vars"))         cfg.vars_fd = argv[++i];
         else if (!strcmp(argv[i], "--disk"))         cfg.disk0 = argv[++i];
+        else if (!strcmp(argv[i], "--disk-size")) {
+            disk_gb = strtoull(argv[++i], NULL, 0);
+            if (disk_gb > 16384) usage(argv[0]);
+        }
         else if (!strcmp(argv[i], "--disk1"))        cfg.disk1 = argv[++i];
         else if (!strcmp(argv[i], "--cpus"))         cfg.ncpus = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ram"))          cfg.ram_mb = strtoull(argv[++i], NULL, 0);
@@ -592,6 +600,11 @@ int main(int argc, char **argv) {
     if (cfg.share_dir && *cfg.share_dir) {
         snprintf(share_sock_buf, sizeof share_sock_buf, "%s/.winvm_webdav.sock", cfg.share_dir);
         cfg.share_sock = share_sock_buf;
+    }
+
+    if (disk_gb && cfg.disk0 && hv_disk_grow(cfg.disk0, disk_gb << 30) < 0) {
+        fprintf(stderr, "winvm: cannot grow %s to %llu GB\n", cfg.disk0, (unsigned long long)disk_gb);
+        return 1;
     }
 
     char err[256] = {0};

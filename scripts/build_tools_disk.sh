@@ -3,7 +3,7 @@
 # Builds work/tools.img: a small raw disk (MBR, one FAT32 volume labeled WINIOSTOOLS) that Windows mounts
 # with the guest pieces on it: the virtio-gpu display driver and its resolution service from the virtio-win
 # ISO, WinIOSAgent.exe, WinIOSBrowser.exe and "Install WindowsiOS Tools.cmd" (one UAC prompt installs all),
-# plus performance tuning (winios_tune.ps1) and the read-only CPU diagnostics:
+# plus performance tuning (winios_tune.ps1), the C: extend step (winios_extend_c.ps1) and the read-only CPU diagnostics:
 # "Run WindowsiOS Diagnostics.cmd" and winios_diag.ps1.
 #
 #   scripts/build_tools_disk.sh [OUT]        OUT defaults to work/tools.img
@@ -23,6 +23,7 @@ CMD_SRC="scripts/install_windowsios_tools.cmd"
 DIAG_CMD_SRC="scripts/run_windowsios_diagnostics.cmd"
 DIAG_PS_SRC="scripts/winios_diag.ps1"
 TUNE_PS_SRC="scripts/winios_tune.ps1"
+EXT_PS_SRC="scripts/winios_extend_c.ps1"
 
 AGENT="build/winios_agent_arm64.exe"
 BROWSER="build/winios_browser_arm64.exe"
@@ -30,7 +31,7 @@ BROWSER="build/winios_browser_arm64.exe"
 if [ ! -f "$AGENT" ] || [ ! -f "$BROWSER" ]; then
     make -s guest-tools
 fi
-for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC" "$ISO"; do
+for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC" "$EXT_PS_SRC" "$ISO"; do
     [ -f "$f" ] || { echo "build_tools_disk: missing $f" >&2; exit 1; }
 done
 
@@ -60,7 +61,7 @@ for f in "${DRIVER_FILES[@]}"; do
     [ -f "$DRV/$f" ] || { echo "build_tools_disk: $DRV_DIR/$f is not on the ISO" >&2; exit 1; }
 done
 need=0
-for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC"; do need=$((need + $(stat -f %z "$f"))); done
+for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC" "$EXT_PS_SRC"; do need=$((need + $(stat -f %z "$f"))); done
 for f in "${DRIVER_FILES[@]}"; do need=$((need + $(stat -f %z "$DRV/$f"))); done
 if [ $((need * 2)) -gt $((SIZE_MB * 1024 * 1024 / 2)) ]; then
     echo "build_tools_disk: $need bytes of files do not leave headroom in $SIZE_MB MiB; raise TOOLS_IMG_MB" >&2
@@ -88,6 +89,7 @@ sed 's/\r$//; s/$/\r/' "$DIAG_CMD_SRC" > "$MNT/Run WindowsiOS Diagnostics.cmd"
 # PowerShell reads LF scripts fine
 cp -X "$DIAG_PS_SRC" "$MNT/winios_diag.ps1"
 cp -X "$TUNE_PS_SRC" "$MNT/winios_tune.ps1"
+cp -X "$EXT_PS_SRC" "$MNT/winios_extend_c.ps1"
 
 # What macOS leaves on a FAT volume: AppleDouble files, Spotlight and FSEvents state
 find "$MNT" -name '._*' -delete

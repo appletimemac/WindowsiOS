@@ -23,7 +23,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
                  -framework AudioToolbox
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-             $(B)/test_mmu $(B)/test_exc $(B)/test_virtio_gpu $(B)/test_xhci_touch $(B)/test_its $(B)/test_nvme
+             $(B)/test_mmu $(B)/test_exc $(B)/test_virtio_gpu $(B)/test_xhci_touch $(B)/test_its $(B)/test_nvme $(B)/test_disk_grow
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -65,6 +65,9 @@ $(B)/test_its: tests/test_its.c $(ENGINE) $(B)/gicv3.o
 	$(CC) $(CFLAGS) tests/test_its.c $(ENGINE) $(B)/gicv3.o -o $@
 $(B)/test_nvme: tests/test_nvme.c $(ENGINE) $(B)/nvme.o $(B)/pcie.o $(B)/gicv3.o
 	$(CC) $(CFLAGS) tests/test_nvme.c $(ENGINE) $(B)/nvme.o $(B)/pcie.o $(B)/gicv3.o -o $@
+
+$(B)/test_disk_grow: tests/test_disk_grow.c $(ENGINE)
+	$(CC) $(CFLAGS) tests/test_disk_grow.c $(ENGINE) -o $@
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
