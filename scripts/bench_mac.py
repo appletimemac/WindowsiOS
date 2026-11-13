@@ -42,6 +42,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(os.path.expanduser('~'), 'build', 'windowsios', 'work')
 BENCH_PS1 = os.path.join(ROOT, 'scripts', 'bench', 'winios_bench.ps1')
 RESULT_NAME = 'winios_bench_result.txt'
+RUNNER_OWN_ENV = ('HV_QOS',)  # set from --qos
 
 created_files = []
 created_dirs = []
@@ -120,10 +121,17 @@ def qos_name(text):
     return text
 
 
+def env_token(name, value):
+    """One setting in a config id: the name without a leading HV_, and its value unless that is 1."""
+    short = name[3:] if name.startswith('HV_') else name
+    return short.lower() if value == '1' else '%s=%s' % (short.lower(), value)
+
+
 def config_id(c):
     name = 'jit%d_%dx%d_c%d_%s' % (c['jit'], c['size'][0], c['size'][1], c['cpus'], c['qos'])
     if c.get('env'):
-        name += '_' + '+'.join(n.lower().replace('hv_', '', 1) + ('' if v == '1' else v) for n, v in c['env'])
+        # "env." keeps a setting apart from a runner's name, "=" a name apart from its value.
+        name += '_env.' + '+'.join(env_token(n, v) for n, v in c['env'])
     return name if c['runner'][0] == 'base' else name + '_' + c['runner'][0]
 
 
@@ -139,10 +147,25 @@ def parse_env(text):
     out = []
     for item in text.split('+'):
         name, eq, value = item.partition('=')
-        if not eq or not re.fullmatch(r'[A-Z][A-Z0-9_]*', name):
+        if not eq or not value or not re.fullmatch(r'[A-Z][A-Z0-9_]*', name):
             raise argparse.ArgumentTypeError('env must be none or NAME=VALUE[+NAME=VALUE]: %r' % text)
+        if name in RUNNER_OWN_ENV:
+            raise argparse.ArgumentTypeError('%s has its own option, it is not an --env setting' % name)
+        if name in (n for n, _ in out):
+            raise argparse.ArgumentTypeError('%s is set twice in %r' % (name, text))
         out.append((name, value))
     return tuple(out)
+
+
+def runner_env(cfg, configs):
+    """The runner's environment for one config: the caller's, without any setting that some config of this
+    run sets (a variable left over in the shell would otherwise be in every config, 'none' included, and the
+    comparison would be of a setting with itself), then this config's own."""
+    compared = {n for c in configs for n, _ in c.get('env', ())}
+    env = {k: v for k, v in os.environ.items() if k not in compared}
+    env['HV_QOS'] = cfg['qos']
+    env.update(dict(cfg.get('env', ())))
+    return env
 
 
 def parse_runners(text):
@@ -254,7 +277,7 @@ def guest_ms(stamp):
     return d.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000.0
 
 
-def run_one(cfg, n, total, rnd, args, outdir, tools_img):
+def run_one(cfg, n, total, rnd, args, outdir, tools_img, configs):
     cid = config_id(cfg)
     rid = 'r%02d_%s' % (rnd, cid)
     rdir = os.path.join(outdir, rid)
@@ -273,7 +296,7 @@ def run_one(cfg, n, total, rnd, args, outdir, tools_img):
     cmd = [cfg['runner'][1], '--headless', '--code', args.code, '--vars', vars_, '--disk', img, '--disk1', tools_img,
            '--cpus', str(cfg['cpus']), '--ram', str(args.ram), '--jit', str(cfg['jit']), '--share', share,
            '--perf-csv', perf, '--perf-ms', str(args.perf_ms), '--cmd-file', cmds, '--timeout', str(deadline_s + 90)]
-    env = dict(os.environ, HV_QOS=cfg['qos'], **dict(cfg.get('env', ())))
+    env = runner_env(cfg, configs)
     res = {'id': rid, 'round': rnd, 'config': cfg, 'cid': cid, 'flags': [], 'metrics': {}}
     result_path = os.path.join(share, RESULT_NAME)
     first = last = None  # (mtime_ms, guest clock ms) of the first and the latest state of the result file
@@ -656,7 +679,7 @@ def main():
 
     results = []
     for i, (rnd, cfg) in enumerate(plan, 1):
-        results.append(run_one(cfg, i, len(plan), rnd, args, outdir, tools_img))
+        results.append(run_one(cfg, i, len(plan), rnd, args, outdir, tools_img, configs))
         summarize(results, outdir)
     print(summarize(results, outdir), end='', flush=True)
     log('summary: %s' % os.path.join(outdir, 'summary.txt'))
