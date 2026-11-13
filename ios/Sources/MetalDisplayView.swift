@@ -24,10 +24,6 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     /// Touches Windows knows about, with the HID contact id each was given. Windows' own touch
     /// gestures apply, so press and hold is the right click.
     private var contacts: [ObjectIdentifier: Contact] = [:]
-    private var pendingSizeRequest: DispatchWorkItem?
-    private var requestedGuestSize: CGSize = .zero
-    /// Guest pixels per point: on a 3x panel this is exactly 2 device pixels per Windows pixel.
-    private static let guestPixelsPerPoint: CGFloat = 1.5
     private static let maxContacts = 5
 
     private struct Contact {
@@ -103,24 +99,6 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     override func layoutSubviews() {
         super.layoutSubviews()
         updateDrawableScale()
-        requestGuestSizeWhenSettled()
-    }
-
-    /// Ask the guest (virtio-gpu) to render at this view's shape, once the size stops changing,
-    /// so a fold or posture animation does not trigger a burst of Windows mode changes.
-    private func requestGuestSizeWhenSettled() {
-        let factor = Self.guestPixelsPerPoint
-        let target = CGSize(width: (bounds.width * factor / 2).rounded() * 2,
-                            height: (bounds.height * factor / 2).rounded() * 2)
-        guard target.width >= 640, target.height >= 480, target != requestedGuestSize else { return }
-        pendingSizeRequest?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.requestedGuestSize = target
-            WinIOSBridge.shared.requestDisplayWidth(UInt32(target.width), height: UInt32(target.height))
-        }
-        pendingSizeRequest = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     // MARK: - Raw touches to the guest touchscreen
@@ -199,8 +177,9 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         let scale = window.screen.scale
         contentScaleFactor = scale
         metalLayer.contentsScale = scale
-        let w = max(1.0, bounds.width * scale)
-        let h = max(1.0, bounds.height * scale)
+        // The canvas frame is a whole number of device pixels (GuestPicture), so this is exact.
+        let w = max(1.0, (bounds.width * scale).rounded())
+        let h = max(1.0, (bounds.height * scale).rounded())
         metalLayer.drawableSize = CGSize(width: w, height: h)
         if window.bounds.width > 0 {
             WinIOSBridge.shared.updateScreenSize(window.bounds.size, scale: scale)

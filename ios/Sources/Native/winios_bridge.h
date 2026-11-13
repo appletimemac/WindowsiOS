@@ -51,6 +51,8 @@ typedef struct WinIOSTouchContact {
 
 - (void)updateScreenSize:(CGSize)size scale:(CGFloat)scale;
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees;
+/// The window's resolved geometry as "key: value" lines, appended to Documents/boot_status.txt.
+- (void)updateGeometryReport:(NSString *)report;
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel;
 /// The full set of contacts for one frame (at most 5), lifting contacts once with tip 0.

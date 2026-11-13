@@ -82,6 +82,8 @@ final class VMViewModel: ObservableObject {
     private var lastJITAttempt = Date.distantPast
     private var activeObserver: NSObjectProtocol? = nil
     private var oauthPollTimer: Timer? = nil
+    private var guestSizeRequest: Task<Void, Never>?
+    private var appliedGuestSize: GuestSize?
 
     init() {
         let bridge = WinIOSBridge.shared
@@ -154,6 +156,23 @@ final class VMViewModel: ObservableObject {
         }
         if postureMode == .auto && new == .partiallyOpen && old != .unknown {
             UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+        }
+    }
+
+    /// The one place the guest's display size is requested, for the canvas that is showing. It goes
+    /// out once the size stops changing, so a fold or posture animation does not cause a burst of
+    /// Windows mode changes, and never for the size already applied. A pending request is dropped
+    /// first, including when the new target is the applied size (a layout that came back).
+    func requestGuestSize(_ target: GuestSize?) {
+        guestSizeRequest?.cancel()
+        guestSizeRequest = nil
+        guard let target, target != appliedGuestSize else { return }
+        guestSizeRequest = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, let self else { return }
+            appliedGuestSize = target
+            guestSizeRequest = nil
+            WinIOSBridge.shared.requestDisplayWidth(UInt32(target.width), height: UInt32(target.height))
         }
     }
 

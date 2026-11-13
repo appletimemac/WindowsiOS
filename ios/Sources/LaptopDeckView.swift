@@ -307,6 +307,9 @@ private enum KeyboardStyle {
 
 struct LaptopDeckView: View {
     @ObservedObject var vm: VMViewModel
+    /// Where the keys and trackpad stay clear of the display's rounded corners and cameras; the
+    /// deck surface itself runs to the edges.
+    var insets = PictureInsets()
 
     @State private var shiftLatched: Bool = false
     @State private var ctrlLatched: Bool = false
@@ -425,16 +428,18 @@ struct LaptopDeckView: View {
         GeometryReader { geo in
             let w = geo.size.width
             let h = geo.size.height
-            let bottomLip: CGFloat = max(6.0, geo.safeAreaInsets.bottom * 0.45)
+            let topLip: CGFloat = max(9.0, insets.top)
+            let bottomLip: CGFloat = max(6.0, insets.bottom)
+            let contentW = max(0, w - insets.left - insets.right)
 
             ZStack(alignment: .bottom) {
                 KeyboardStyle.deck
 
                 VStack(spacing: 0) {
                     Color.clear
-                        .frame(height: 9)
+                        .frame(height: topLip)
 
-                    let bodyH = max(140.0, h - 9.0 - bottomLip)
+                    let bodyH = max(140.0, h - topLip - bottomLip)
 
                     switch vm.deckLayout {
                     case .split:
@@ -445,14 +450,14 @@ struct LaptopDeckView: View {
                                 .frame(height: kbdH)
                                 .padding(.horizontal, 10)
 
-                            flushSurfaceHapticTouchpad(width: w, height: padH, expanded: false)
+                            flushSurfaceHapticTouchpad(width: contentW, height: padH, expanded: false)
                                 .frame(height: padH)
                         }
                         .padding(.top, 4)
 
                     case .trackpad:
                         ZStack(alignment: .topTrailing) {
-                            flushSurfaceHapticTouchpad(width: w, height: bodyH - 12.0, expanded: true)
+                            flushSurfaceHapticTouchpad(width: contentW, height: bodyH - 12.0, expanded: true)
                                 .frame(height: bodyH - 12.0)
                                 .padding(.top, 6)
 
@@ -477,6 +482,8 @@ struct LaptopDeckView: View {
 
                     Spacer(minLength: 0)
                 }
+                .padding(.leading, insets.left)
+                .padding(.trailing, insets.right)
             }
             .frame(width: w, height: h)
         }

@@ -52,6 +52,8 @@ static WinIOSBridge *s_shared_bridge = nil;
     CGFloat _screenScale;
     NSInteger _hingeStatus;
     double _hingeAngleDegrees;
+    NSString *_geometryReport;
+    uint32_t _requestedGuestW, _requestedGuestH;
 }
 - (void)handleVMExitWithReason:(NSString *)reason;
 - (void)updateUnpackProgress:(double)frac;
@@ -229,6 +231,13 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     _screenSizePts = size;
     if (scale > 0.0) _screenScale = scale;
     os_unfair_lock_unlock(&_metricsLock);
+}
+
+- (void)updateGeometryReport:(NSString *)report {
+    os_unfair_lock_lock(&_metricsLock);
+    _geometryReport = [report copy];
+    os_unfair_lock_unlock(&_metricsLock);
+    dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
 }
 
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees {
@@ -782,6 +791,8 @@ static int sysctl_int(const char *name) {
     CGFloat scale = _screenScale;
     NSInteger hingeStatus = _hingeStatus;
     double hingeDeg = _hingeAngleDegrees;
+    NSString *geometry = _geometryReport ?: @"";
+    uint32_t requestW = _requestedGuestW, requestH = _requestedGuestH;
     os_unfair_lock_unlock(&_metricsLock);
 
     NSString *txt = [NSString stringWithFormat:
@@ -810,6 +821,7 @@ static int sysctl_int(const char *name) {
         @"hinge_status: %ld\n"
         @"hinge_angle_deg: %.1f\n"
         @"screen_pts: %.0fx%.0f @%.0fx\n"
+        @"guest_request: %ux%u\n"
         @"guest_ram_mb: %llu\n"
         @"phys_mb: %llu\n",
         running ? @"true" : @"false",
@@ -837,8 +849,10 @@ static int sysctl_int(const char *name) {
         (long)hingeStatus,
         hingeDeg,
         pt.width, pt.height, scale,
+        requestW, requestH,
         self.guestRAMMB,
         (unsigned long long)(NSProcessInfo.processInfo.physicalMemory >> 20)];
+    txt = [txt stringByAppendingString:geometry];
     [txt writeToFile:statusFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
@@ -868,7 +882,12 @@ static int sysctl_int(const char *name) {
 }
 
 - (void)requestDisplayWidth:(uint32_t)width height:(uint32_t)height {
+    os_unfair_lock_lock(&_metricsLock);
+    _requestedGuestW = width;
+    _requestedGuestH = height;
+    os_unfair_lock_unlock(&_metricsLock);
     hv_winvm_request_display_size(width, height);
+    dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
 }
 
 - (void)setLaptopPosture:(BOOL)laptop {
