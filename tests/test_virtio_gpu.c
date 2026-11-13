@@ -886,7 +886,9 @@ static void test_threads(void) {
 }
 
 /* A value to the thousandth of a drawable pixel, so fractions compare exactly. */
+/* Thousandths of a pixel. A negative place is never right, and must not pass for zero. */
 static uint64_t milli(double fraction, double pixels) {
+    if (fraction < 0) return UINT64_MAX;
     return (uint64_t)(fraction * pixels * 1000.0 + 0.5);
 }
 
@@ -902,9 +904,20 @@ static void test_fit(void) {
     check("pillarbox: w", milli(q.w, 2000), 1333333);
     check("pillarbox: x", milli(q.x, 2000), 333333);
     check("pillarbox: h", milli(q.h, 1000), 1000000);
+    check("pillarbox: y", milli(q.y, 1000), 0);
     q = hv_fb_fit(1000, 2000, 800, 600, whole); /* a taller one: bars above and below */
     check("letterbox: h", milli(q.h, 2000), 750000);
     check("letterbox: y", milli(q.y, 2000), 625000);
+    check("letterbox: x", milli(q.x, 1000), 0);
+    check("letterbox: w", milli(q.w, 1000), 1000000);
+    /* Bars above and below inside a place that is not the whole drawable: pixels 100 to 900 across and 400
+       to 1400 down take an 800 by 600 picture at 100, 600. */
+    HvFbRect inset = {0.1, 0.2, 0.8, 0.5};
+    q = hv_fb_fit(1000, 2000, 800, 600, inset);
+    check("letterbox in a place: x", milli(q.x, 1000), 100000);
+    check("letterbox in a place: y", milli(q.y, 2000), 600000);
+    check("letterbox in a place: w", milli(q.w, 1000), 800000);
+    check("letterbox in a place: h", milli(q.h, 2000), 600000);
     /* The phone: a 2853 by 2007 drawable, the picture's place 49 pixels in from every edge except 50 on the
        left (the pixel grid), and Windows at 1376 by 954: exactly two drawable pixels per guest pixel. */
     HvFbRect place = {50.0 / 2853, 49.0 / 2007, 2752.0 / 2853, 1908.0 / 2007};
@@ -918,11 +931,18 @@ static void test_fit(void) {
     check("firmware: h fills the place", milli(q.h, 2007), 1908000);
     check("firmware: w keeps 4:3", milli(q.w, 2853), 2544000);
     check("firmware: centred in the place", milli(q.x, 2853), 50000 + (2752000 - 2544000) / 2);
+    check("firmware: y is the place's", milli(q.y, 2007), 49000);
     /* Nothing to fit, or nowhere to fit it: the place comes back as given. */
     q = hv_fb_fit(2853, 2007, 0, 954, place);
     check("no picture: unchanged", milli(q.w, 2853), 2752000);
     q = hv_fb_fit(0, 0, 1376, 954, whole);
     check("no drawable: unchanged", milli(q.w, 1000), 1000000);
+    q = hv_fb_fit(2853, 2007, 1376, 0, place);
+    check("no picture height: unchanged", milli(q.h, 2007), 1908000);
+    q = hv_fb_fit(2853, 2007, 1376, 954, (HvFbRect){0.1, 0.1, 0, 0.5});
+    check("a place with no width: unchanged", milli(q.h, 2007), 1003500);
+    q = hv_fb_fit(2853, 2007, 1376, 954, (HvFbRect){0.1, 0.1, 0.5, 0});
+    check("a place with no height: unchanged", milli(q.w, 2853), 1426500);
 }
 
 int main(void) {
