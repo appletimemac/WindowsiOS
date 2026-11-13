@@ -136,7 +136,7 @@ SETUPAPI_IMPORTS = SetupDiDestroyDeviceInfoList SetupDiEnumDeviceInterfaces Setu
                    SetupDiGetDeviceInterfaceDetailW
 OLE32_IMPORTS = CoCreateInstance CoInitializeEx
 OLEAUT32_IMPORTS = SafeArrayAccessData SafeArrayUnaccessData VariantClear
-USER32_IMPORTS = SetProcessDpiAwarenessContext
+USER32_IMPORTS = GetDpiForSystem SetProcessDpiAwarenessContext
 
 empty :=
 space := $(empty) $(empty)
@@ -161,7 +161,7 @@ $(B)/opt_hive_arm64.exe: tools/opt_hive_arm64.c $(WL)/kernel32.lib $(WL)/advapi3
 	$(WIN_CC) -Wl,/entry:mainCRTStartup -Wl,/subsystem:console $< $(WL)/kernel32.lib $(WL)/advapi32.lib -o $@
 $(B)/winios_browser_arm64.exe: tools/winios_browser_arm64.c $(WL)/kernel32.lib $(WL)/ws2_32.lib
 	$(WIN_CC) -Wl,/entry:WinMainCRTStartup -Wl,/subsystem:windows $< $(WL)/kernel32.lib $(WL)/ws2_32.lib -o $@
-$(B)/winios_agent_arm64.exe: tools/winios_agent_arm64.c $(WL)/kernel32.lib $(WL)/advapi32.lib $(WL)/ws2_32.lib $(WL)/setupapi.lib \
+$(B)/winios_agent_arm64.exe: tools/winios_agent_arm64.c tools/winios_agent_scale.h $(WL)/kernel32.lib $(WL)/advapi32.lib $(WL)/ws2_32.lib $(WL)/setupapi.lib \
     $(WL)/ole32.lib $(WL)/oleaut32.lib $(WL)/user32.lib
 	$(WIN_CC) -Wl,/entry:WinMainCRTStartup -Wl,/subsystem:windows $< $(WL)/kernel32.lib $(WL)/advapi32.lib \
 	    $(WL)/ws2_32.lib $(WL)/setupapi.lib $(WL)/ole32.lib $(WL)/oleaut32.lib $(WL)/user32.lib -o $@

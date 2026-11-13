@@ -211,7 +211,8 @@ rem Windows may count its only running display adapter as critical system functi
 pnputil /disable-device /deviceid "ROOT\BasicDisplay" /force >nul
 set "RC=%errorlevel%"
 exit /b
-rem 150 percent makes one Windows pixel one iOS point at the 1.5 pixels per point the app asks for.
+rem 150 percent makes one Windows pixel one iOS point at the 1.5 pixels per point the app asks for
+rem unless its display settings say otherwise; from then on the agent keeps these values at what the app asks.
 rem Only with the virtio-gpu display: at the firmware's 800x600 it would leave no room.
 :scaling
 call :regdword "HKCU\Control Panel\Desktop" LogPixels 144
