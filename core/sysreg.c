@@ -39,6 +39,25 @@ static int undefined(HvCpu *cpu, uint64_t pc) {
     return 1;
 }
 
+/* The kernel touching a register or operation this model lacks gets an undefined-instruction exception, which
+   Windows treats as fatal: say which, once each. */
+static int unimplemented(HvCpu *cpu, uint64_t pc, const char *what, uint32_t reg) {
+    static uint32_t seen[64];
+    static unsigned nseen; /* atomic; may pass 64, slots past the end are not stored */
+    uint32_t key = (uint32_t)what[0] << 16 | reg;
+    int fresh = cpu->el != 0;
+    unsigned n = __atomic_load_n(&nseen, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; fresh && i < n && i < 64; i++)
+        if (__atomic_load_n(&seen[i], __ATOMIC_RELAXED) == key) fresh = 0;
+    if (fresh) {
+        unsigned slot = __atomic_fetch_add(&nseen, 1, __ATOMIC_ACQ_REL);
+        if (slot < 64) __atomic_store_n(&seen[slot], key, __ATOMIC_RELAXED);
+        fprintf(stderr, "sysreg: %s S%u_%u_C%u_C%u_%u not implemented (pc %llx el%u): undefined instruction\n", what,
+                reg >> 14, (reg >> 11) & 7, (reg >> 7) & 15, (reg >> 3) & 15, reg & 7, (unsigned long long)pc, cpu->el);
+    }
+    return undefined(cpu, pc);
+}
+
 /* Timer control: ISTATUS (bit 2) reflects the compare right now. */
 static uint64_t timer_ctl(uint64_t ctl, uint64_t cval, uint64_t now) {
     ctl &= 3;
@@ -311,7 +330,7 @@ int hv_sysreg_mrs(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     if (cpu->el == 0 && !el0_allowed(cpu, reg, 0)) return undefined(cpu, pc);
     uint64_t v;
     if (is_pauth_key(reg)) v = 0;
-    else if (read_reg(cpu, reg, &v) != 0) return undefined(cpu, pc);
+    else if (read_reg(cpu, reg, &v) != 0) return unimplemented(cpu, pc, "mrs", reg);
     if (cpu->m->log >= 3)
         fprintf(stderr, "mrs S%u_%u_C%u_C%u_%u = %llx pc %llx el%u\n", reg >> 14, (reg >> 11) & 7, (reg >> 7) & 15,
                 (reg >> 3) & 15, reg & 7, (unsigned long long)v, (unsigned long long)pc, cpu->el);
@@ -358,7 +377,7 @@ int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 (reg >> 3) & 15, reg & 7, (unsigned long long)(rt == 31 ? 0 : cpu->x[rt]), (unsigned long long)pc,
                 cpu->el);
     if (cpu->el == 0 && !el0_allowed(cpu, reg, 1)) return undefined(cpu, pc);
-    if (write_reg(cpu, reg, rt == 31 ? 0 : cpu->x[rt]) != 0) return undefined(cpu, pc);
+    if (write_reg(cpu, reg, rt == 31 ? 0 : cpu->x[rt]) != 0) return unimplemented(cpu, pc, "msr", reg);
     irq_check(cpu);
     return 0;
 }
@@ -523,5 +542,5 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         return 0;
     }
     if (crn == 7) return 0; /* other cache maintenance: caches are coherent here */
-    return undefined(cpu, pc);
+    return unimplemented(cpu, pc, "sys", 1u << 14 | op1 << 11 | crn << 7 | crm << 3 | op2);
 }

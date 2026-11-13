@@ -55,6 +55,14 @@ void hv_take_exception(HvCpu *cpu, int type, uint32_t esr, uint64_t far, int set
     if (cpu->m->trace || cpu->m->log >= 2)
         fprintf(stderr, "exception type %d esr %08x far %llx from pc %llx el%u\n", type, esr, (unsigned long long)far,
                 (unsigned long long)ret, cpu->el);
+    else if (type == HV_EXC_SYNC && cpu->el == 1) {
+        /* HV_EXC_LOG: the kernel's own faults (Windows bug-checks on the ones it cannot handle). */
+        static int on = -1;
+        if (on < 0) on = getenv("HV_EXC_LOG") != NULL;
+        if (on)
+            fprintf(stderr, "el1 exception cpu %u ec %02x esr %08x far %llx pc %llx\n", cpu->index, esr >> 26, esr,
+                    (unsigned long long)far, (unsigned long long)ret);
+    }
     uint64_t offset = cpu->el == 0 ? 0x400 : cpu->spsel ? 0x200 : 0x000;
     cpu->spsr_el1 = spsr;
     cpu->elr_el1 = ret;
