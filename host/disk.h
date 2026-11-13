@@ -10,7 +10,8 @@ typedef struct HvDisk {
     uint64_t offset;
     uint64_t size;   /* bytes visible to the guest */
     uint32_t block_size;
-    int readonly;
+    int readonly;    /* the file is never written: guest writes land in a RAM overlay that dies with the VM */
+    void *overlay;
 } HvDisk;
 
 /* The size the iPhone app grows Windows' disk to; the guest then extends C: into the new space. */

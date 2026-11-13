@@ -225,34 +225,54 @@ static void test_zeroes(void) {
     }
 }
 
-static void identify(int readonly) {
+static void identify(void) {
     uint8_t cmd[64] = {0x06};
     wr32(cmd + 4, 1);
     wr64(cmd + 24, DATA);
     check("Identify Namespace", submit(0, cmd), 0);
-    check("NSATTR write protected", host(DATA)[99] & 1, readonly);
+    check("NSATTR never write protected", host(DATA)[99] & 1, 0);
 }
 
+/* A read-only image takes writes into a RAM overlay (Windows mounts it read-write and NTFS retries refused
+   writes forever, which stalls shutdown): the guest reads its writes back, the file stays untouched. */
 static void test_readonly(const char *path) {
-    uint64_t trim_n = nv->trim_n, trim_bytes = nv->trim_bytes;
     fill();
-    identify(0);
+    identify();
     hv_disk_close(&disk);
     check("open read-only image", hv_disk_open(&disk, path, IMAGE_OFFSET, 1), 0);
-    identify(1);
-    check("read-only Write", io(0x01, 0, 1, 0), 0x20);
-    check("read-only Write Zeroes", io(0x08, 0, 1, 0), 0x20);
-    check("read-only Write Zeroes DEAC", io(0x08, 0, 1, 1u << 25), 0x20);
+    identify();
+
+    memset(host(DATA), 0x5c, 1024);
+    check("read-only Write", io(0x01, 7, 2, 0), 0); /* sectors 7 and 8 cross the 4 KB overlay page boundary */
+    memset(host(DATA), 0, 2048);
+    check("read-only Read", io(0x02, 6, 4, 0), 0);
+    int ok = 1;
+    for (int i = 0; i < 2048; i++) {
+        uint8_t want = i >= 512 && i < 1536 ? 0x5c : 0xa5;
+        if (host(DATA)[i] != want) ok = 0;
+    }
+    check("read-only Write reads back, neighbours intact", ok, 1);
+    check_image(); /* the file is untouched */
+
+    check("read-only Write Zeroes", io(0x08, 7, 1, 0), 0);
+    memset(host(DATA), 0xcc, 1024);
+    check("read-only Read after Write Zeroes", io(0x02, 7, 2, 0), 0);
+    ok = 1;
+    for (int i = 0; i < 1024; i++)
+        if (host(DATA)[i] != (i < 512 ? 0 : 0x5c)) ok = 0;
+    check("read-only Write Zeroes reads back", ok, 1);
+
     uint8_t ranges[16];
-    range(ranges, 0, 1);
-    check("read-only DSM AD", trim(ranges, 1, 1), 0x20);
-    check("read-only DSM hints", trim(ranges, 1, 0), 0);
-    memset(host(DATA), 0, 512);
-    check("read-only Read", io(0x02, 0, 1, 0), 0);
-    check("read-only Read data", memcmp(host(DATA), expected + IMAGE_OFFSET, 512), 0);
+    range(ranges, 40, 1);
+    check("read-only Write Zeroes DEAC", io(0x08, 40, 1, 1u << 25), 0);
+    check("read-only DSM AD", trim(ranges, 1, 1), 0);
+    memset(host(DATA), 0xcc, 512);
+    check("read-only Read after deallocate", io(0x02, 40, 1, 0), 0);
+    ok = 1;
+    for (int i = 0; i < 512; i++)
+        if (host(DATA)[i] != 0) ok = 0;
+    check("read-only deallocated blocks read as zeros", ok, 1); /* as DLFEAT says, from the overlay */
     check_image();
-    check("read-only discard count unchanged", nv->trim_n, trim_n);
-    check("read-only discard bytes unchanged", nv->trim_bytes, trim_bytes);
 }
 
 int main(void) {

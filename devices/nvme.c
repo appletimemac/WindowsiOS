@@ -159,7 +159,7 @@ static uint16_t handle_identify(HvNvme *nv, const NvmeCmd *cmd) {
         buf[25] = 0;                  /* NLBAF = 0 (1 format) */
         buf[26] = 0;                  /* FLBAS = format 0 */
         buf[33] = 0x09;               /* DLFEAT: Write Zeroes takes DEAC (bit 3); deallocated blocks read as 0 (001b, hv_disk_discard) */
-        buf[99] = nv->disk->readonly ? 1 : 0; /* NSATTR: write protected */
+        buf[99] = 0;                  /* NSATTR: never write protected: Windows ignores it, mounts read-write and retries refused writes forever (hv_disk overlay) */
         /* LBAF 0 at byte 128: MS=0, LBADS=9 (2^9 = 512 bytes), RP=0 */
         buf[130] = 9;
     } else if (cns == 0x01) { /* Identify Controller */
@@ -404,12 +404,6 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
 
     if (cmd->nsid != 1 && cmd->nsid != 0xffffffffu) {
         post_cqe(nv, sq, sqid, cmd->cid, 0, 0x000b);
-        return;
-    }
-
-    if (nv->disk->readonly && (cmd->opc == 0x01 || cmd->opc == 0x08 ||
-                              (cmd->opc == 0x09 && (cmd->cdw11 & 4)))) {
-        post_cqe(nv, sq, sqid, cmd->cid, 0, 0x0020); /* Namespace is Write Protected */
         return;
     }
 
