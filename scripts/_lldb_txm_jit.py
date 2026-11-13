@@ -69,8 +69,15 @@ def bless_txm_region(debugger, process, rx_addr: int, size: int):
         off = wrote
         while off < size:
             cur = min(chunk_size, size - off)
-            w = process.WriteMemory(rx_addr + off, payload[:cur], err)
-            if not err.Success() or w != cur:
+            # Over wireless debugging a packet send can fail transiently; retry the chunk.
+            for attempt in range(1, 5):
+                err = lldb.SBError()  # a failed attempt must not leave its error on the retry
+                w = process.WriteMemory(rx_addr + off, payload[:cur], err)
+                if err.Success() and w == cur:
+                    break
+                print(f"[txm-jit] WriteMemory at +{off:#x} failed (attempt {attempt}): {err.GetCString()}", flush=True)
+                time.sleep(0.5 * attempt)
+            else:
                 raise RuntimeError(f"WriteMemory failed at +{off:#x}: {err.GetCString()}")
             off += w
         dt = time.time() - t0

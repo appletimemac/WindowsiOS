@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Launch WindowsiOS (`me.ammaar.windowsios`) on Ammaar's physical iPhone Duo
-(`00008160-000E05D036C0000A`), service the iOS 26/27 TXM BreakpointJIT traps
+Launch WindowsiOS (`com.RRGSyndicate.WindowsiOS`) on Alan's physical iPhone Duo
+(UDID from --device, $WINIOS_DUO_UDID or ~/.config/windowsios/duo-udid), service the iOS 26/27 TXM BreakpointJIT traps
 (`brk #0x69` probe, `brk #0xf00d` RX allocation + 16 KiB page blessing + clean detach),
 and let Windows 11 ARM64 run natively at full speed with zero debugger attached.
 """
@@ -24,8 +24,16 @@ import lldb  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / "work"
-DEFAULT_UDID = "00008160-000E05D036C0000A"
-DEFAULT_BUNDLE_ID = "me.ammaar.windowsios"
+DEFAULT_BUNDLE_ID = "com.RRGSyndicate.WindowsiOS"
+
+
+def configured_duo_udid() -> str:
+    """$WINIOS_DUO_UDID, else ~/.config/windowsios/duo-udid; kept out of the repo."""
+    udid = os.environ.get("WINIOS_DUO_UDID", "").strip()
+    if not udid:
+        cfg = Path.home() / ".config" / "windowsios" / "duo-udid"
+        udid = cfg.read_text().strip() if cfg.exists() else ""
+    return udid
 
 
 def run_cmd(debugger, cmd: str) -> str:
@@ -80,9 +88,11 @@ def bless_txm_region(debugger, process, rx_addr: int, size: int):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default=DEFAULT_UDID)
+    ap.add_argument("--device", default=configured_duo_udid())
     ap.add_argument("--bundle-id", default=DEFAULT_BUNDLE_ID)
     args = ap.parse_args()
+    if not args.device:
+        ap.error("pass --device or set WINIOS_DUO_UDID")
 
     WORK.mkdir(parents=True, exist_ok=True)
     launch_json = WORK / "duo_launch.json"
@@ -109,9 +119,11 @@ def main():
         raise RuntimeError("devicectl device process launch failed after 5 attempts")
     info = json.loads(launch_json.read_text())
     pid = info["result"]["process"]["processIdentifier"]
+    # devicectl JSON v5 reports the CoreDevice id as result.deviceIdentifier; older builds nest it.
     core_device_id = (
-        info.get("result", {}).get("device", {}).get("identifier")
-        or "FB6341E2-5109-505C-9A11-CFF7BE9973C3"
+        info.get("result", {}).get("deviceIdentifier")
+        or info.get("result", {}).get("device", {}).get("identifier")
+        or args.device
     )
     print(f"[duo] Launched stopped PID = {pid} on CoreDevice {core_device_id}; attaching LLDB...", flush=True)
 
@@ -119,6 +131,8 @@ def main():
     debugger = lldb.SBDebugger.Create(True)
     debugger.SetAsync(False)
 
+    # Xcode 27's LLDB resolves `device select` only after `device list` has populated its registry.
+    run_cmd(debugger, "device list")
     run_cmd(debugger, f"device select {core_device_id}")
     run_cmd(debugger, f"device process attach -p {pid}")
     target = debugger.GetSelectedTarget()

@@ -1,0 +1,195 @@
+{
+  "color-space-for-untagged-svg-colors": "display-p3",
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "display-p3:0.09000,0.32000,0.78000,1.00000",
+          "display-p3:0.00000,0.06000,0.28000,1.00000"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0.5,
+            "y": 0
+          },
+          "stop": {
+            "x": 0.5,
+            "y": 1
+          }
+        }
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "display-p3:0.03000,0.08000,0.22000,1.00000",
+          "display-p3:0.00000,0.02000,0.09000,1.00000"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0.5,
+            "y": 0
+          },
+          "stop": {
+            "x": 0.5,
+            "y": 1
+          }
+        }
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "Logo",
+      "lighting": "individual",
+      "shadow-specializations": [
+        {
+          "value": {
+            "kind": "layer-color",
+            "opacity": 0.7
+          }
+        },
+        {
+          "appearance": "tinted",
+          "value": {
+            "kind": "neutral",
+            "opacity": 0.8
+          }
+        }
+      ],
+      "specular": true,
+      "translucency-specializations": [
+        {
+          "value": {
+            "enabled": true,
+            "value": 0.45
+          }
+        },
+        {
+          "appearance": "tinted",
+          "value": {
+            "enabled": true,
+            "value": 0.25
+          }
+        }
+      ],
+      "blur-material-specializations": [
+        {
+          "value": 0.6
+        },
+        {
+          "appearance": "tinted",
+          "value": 0.45
+        }
+      ],
+      "layers": [
+        {
+          "glass": true,
+          "image-name": "tile_br.svg",
+          "name": "Tile BR",
+          "fill-specializations": [
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-gray:0.900,1.0"
+              }
+            }
+          ]
+        },
+        {
+          "glass": true,
+          "image-name": "tile_bl.svg",
+          "name": "Tile BL",
+          "fill-specializations": [
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-gray:0.960,1.0"
+              }
+            }
+          ]
+        },
+        {
+          "glass": true,
+          "image-name": "tile_tr.svg",
+          "name": "Tile TR",
+          "fill-specializations": [
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-gray:0.960,1.0"
+              }
+            }
+          ]
+        },
+        {
+          "glass": true,
+          "image-name": "tile_tl.svg",
+          "name": "Tile TL",
+          "fill-specializations": [
+            {
+              "appearance": "tinted",
+              "value": {
+                "solid": "extended-gray:1.000,1.0"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Background",
+      "specular": false,
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.0
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0.5
+      },
+      "layers": [
+        {
+          "glass": false,
+          "image-name": "bloom.svg",
+          "name": "Bloom",
+          "opacity-specializations": [
+            {
+              "value": 1.0
+            },
+            {
+              "appearance": "dark",
+              "value": 0.4
+            },
+            {
+              "appearance": "tinted",
+              "value": 0.0
+            }
+          ]
+        },
+        {
+          "glass": false,
+          "image-name": "underglow.svg",
+          "name": "Underglow",
+          "opacity-specializations": [
+            {
+              "value": 1.0
+            },
+            {
+              "appearance": "dark",
+              "value": 0.5
+            },
+            {
+              "appearance": "tinted",
+              "value": 0.0
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

@@ -39,6 +39,25 @@ static int undefined(HvCpu *cpu, uint64_t pc) {
     return 1;
 }
 
+/* The kernel touching a register or operation this model lacks gets an undefined-instruction exception, which
+   Windows treats as fatal: say which, once each. */
+static int unimplemented(HvCpu *cpu, uint64_t pc, const char *what, uint32_t reg) {
+    static uint32_t seen[64];
+    static unsigned nseen; /* atomic; may pass 64, slots past the end are not stored */
+    uint32_t key = (uint32_t)what[0] << 16 | reg;
+    int fresh = cpu->el != 0;
+    unsigned n = __atomic_load_n(&nseen, __ATOMIC_ACQUIRE);
+    for (unsigned i = 0; fresh && i < n && i < 64; i++)
+        if (__atomic_load_n(&seen[i], __ATOMIC_RELAXED) == key) fresh = 0;
+    if (fresh) {
+        unsigned slot = __atomic_fetch_add(&nseen, 1, __ATOMIC_ACQ_REL);
+        if (slot < 64) __atomic_store_n(&seen[slot], key, __ATOMIC_RELAXED);
+        fprintf(stderr, "sysreg: %s S%u_%u_C%u_C%u_%u not implemented (pc %llx el%u): undefined instruction\n", what,
+                reg >> 14, (reg >> 11) & 7, (reg >> 7) & 15, (reg >> 3) & 15, reg & 7, (unsigned long long)pc, cpu->el);
+    }
+    return undefined(cpu, pc);
+}
+
 /* Timer control: ISTATUS (bit 2) reflects the compare right now. */
 static uint64_t timer_ctl(uint64_t ctl, uint64_t cval, uint64_t now) {
     ctl &= 3;
@@ -207,20 +226,19 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 1, 0, 2): cpu->cpacr_el1 = v; return 0;
     case R(3, 0, 2, 0, 0): { /* a process switch */
         uint64_t old = cpu->ttbr0_el1, old_ukey = hv_mmu_ukey(cpu);
+        int old_asid = hv_mmu_asid(cpu);
         cpu->ttbr0_el1 = v;
         uint64_t new_ukey = hv_mmu_ukey(cpu);
         if (old_ukey != new_ukey) hv_tlb_switch_user(cpu, old_ukey, new_ukey);
         else if (old != v) hv_tlb_flush_user(cpu);
         if (old != v) hv_ijc_switch(cpu);
+        if (hv_mmu_asid(cpu) != old_asid) hv_tlb_drop_kernel_asid(cpu); /* without TCR.A1 the ASID is here */
         return 0;
     }
     case R(3, 0, 2, 0, 1): { /* TTBR1: Windows switches TTBR1 per process (with TCR.A1 == 1) and on KVA shadow transitions */
         uint64_t old = cpu->ttbr1_el1, old_ukey = hv_mmu_ukey(cpu);
         cpu->ttbr1_el1 = v;
-        if (old != v) {
-            hv_tlb_flush_kernel(cpu);
-            hv_ijc_switch_kernel(cpu, v);
-        }
+        if (old != v) hv_tlb_switch_kernel(cpu, old);
         if ((cpu->tcr_el1 >> 22) & 1) {
             uint64_t new_ukey = hv_mmu_ukey(cpu);
             if (old_ukey != new_ukey) hv_tlb_switch_user(cpu, old_ukey, new_ukey);
@@ -264,8 +282,13 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     default: goto other;
     }
     /* Timer outputs follow their registers at once, as in hardware: a masked
-       timer must drop its line before the handler's EOI. */
-    if (m->tick) m->tick(m, cpu);
+       timer must drop its line before the handler's EOI. The new deadline is
+       published so a running CPU is kicked when it falls due. */
+    if (m->tick) {
+        uint64_t due = m->tick(m, cpu);
+        __atomic_store_n(&cpu->timer_due, due, __ATOMIC_RELEASE); /* the kicker reads it */
+        if (due && m->timer_hint) m->timer_hint(m, due);
+    }
     return 0;
 other:
     /* PAuth key registers (CRn 2, CRm 1..3): kept, never used, since signing is a no-op. */
@@ -306,7 +329,7 @@ int hv_sysreg_mrs(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     if (cpu->el == 0 && !el0_allowed(cpu, reg, 0)) return undefined(cpu, pc);
     uint64_t v;
     if (is_pauth_key(reg)) v = 0;
-    else if (read_reg(cpu, reg, &v) != 0) return undefined(cpu, pc);
+    else if (read_reg(cpu, reg, &v) != 0) return unimplemented(cpu, pc, "mrs", reg);
     if (cpu->m->log >= 3)
         fprintf(stderr, "mrs S%u_%u_C%u_C%u_%u = %llx pc %llx el%u\n", reg >> 14, (reg >> 11) & 7, (reg >> 7) & 15,
                 (reg >> 3) & 15, reg & 7, (unsigned long long)v, (unsigned long long)pc, cpu->el);
@@ -353,7 +376,7 @@ int hv_sysreg_msr(HvCpu *cpu, uint32_t insn, uint64_t pc) {
                 (reg >> 3) & 15, reg & 7, (unsigned long long)(rt == 31 ? 0 : cpu->x[rt]), (unsigned long long)pc,
                 cpu->el);
     if (cpu->el == 0 && !el0_allowed(cpu, reg, 1)) return undefined(cpu, pc);
-    if (write_reg(cpu, reg, rt == 31 ? 0 : cpu->x[rt]) != 0) return undefined(cpu, pc);
+    if (write_reg(cpu, reg, rt == 31 ? 0 : cpu->x[rt]) != 0) return unimplemented(cpu, pc, "msr", reg);
     irq_check(cpu);
     return 0;
 }
@@ -395,8 +418,8 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
             }
         } else {
             uint64_t first = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
-            for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS)
-                hv_tlb_flush_va_asid(cpu, p, all_asids ? -1 : tasid);
+            for (uint64_t o = 0; o < va + len - first; o += 1ull << HV_TLB_PAGE_BITS) /* by length: the range may end at 0 */
+                hv_tlb_flush_va_asid(cpu, first + o, all_asids ? -1 : tasid);
         }
         return;
     }
@@ -407,9 +430,7 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
     } else if (by_asid) {
         hv_tlb_flush_user(cpu);
         hv_tlb_stash_drop(cpu, tasid);
-        hv_tlb_flush_kernel(cpu);
-        hv_ijc_reset(cpu, 1);
-        cpu->m->stats.reset_why[1]++;
+        if (hv_tlb_drop_kernel_asid(cpu)) cpu->m->stats.reset_why[1]++; /* by ASID: not the global kernel mappings */
         hv_ijc_drop_asid(cpu, (uint16_t)tasid);
     } else {
         if (cpu->m->log >= 2)
@@ -518,5 +539,5 @@ int hv_sysreg_sys(HvCpu *cpu, uint32_t insn, uint64_t pc) {
         return 0;
     }
     if (crn == 7) return 0; /* other cache maintenance: caches are coherent here */
-    return undefined(cpu, pc);
+    return unimplemented(cpu, pc, "sys", 1u << 14 | op1 << 11 | crn << 7 | crm << 3 | op2);
 }

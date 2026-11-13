@@ -31,6 +31,7 @@ SRC_IMG = WORK / "windows11.img"
 LITE_IMG = WORK / "windows11_lite.img"
 PE_IMG = WORK / "_opt_pe.img"
 PE_VARS = WORK / "_opt_pe_vars.fd"
+NETKVM_SRC = WORK / "drivers" / "NetKVM"
 
 OPT_SYS_REG = r"""Windows Registry Editor Version 5.00
 
@@ -306,6 +307,11 @@ if "%WINDRV%"=="" (
 )
 
 echo [1/5] Found Windows 11 installation on %WINDRV%\ (ESP=%ESPDRV%) >> "%LOGFILE%"
+
+set "NETKVM_DIR="
+for %%N in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (
+    if exist "%%N:\NetKVM\netkvm.inf" set "NETKVM_DIR=%%N:\NetKVM"
+)
 echo [2/5] Stripping 25 consumer inbox Appx bloatware bundles... >> "%LOGFILE%"
 set /a REMOVED_COUNT=0
 for %%P in (
@@ -346,12 +352,24 @@ reg load HKLM\OFFSYS "%WINDRV%\Windows\System32\config\SYSTEM" >> "%LOGFILE%" 2>
 reg load HKLM\OFFSOFT "%WINDRV%\Windows\System32\config\SOFTWARE" >> "%LOGFILE%" 2>&1
 X:\Windows\System32\opt_hive_arm64.exe >> "%LOGFILE%" 2>&1
 reg import X:\Windows\System32\opt_soft.reg >> "%LOGFILE%" 2>&1
+rem The PL031 RTC runs in UTC; without this Windows shows UTC as local time.
+reg add "HKLM\OFFSYS\ControlSet001\Control\TimeZoneInformation" /v RealTimeIsUniversal /t REG_DWORD /d 1 /f >> "%LOGFILE%" 2>&1
+rem This WinPE cannot service offline images (DISM /Image: fails 0x80004002), so the
+rem VirtIO NetKVM driver is installed by pnputil at the first logon instead.
+if not "%NETKVM_DIR%"=="" (
+    echo [3b/5] Staging NetKVM from %NETKVM_DIR% for a first-logon pnputil install... >> "%LOGFILE%"
+    mkdir "%WINDRV%\Drivers\NetKVM" >> "%LOGFILE%" 2>&1
+    copy /y "%NETKVM_DIR%\*.*" "%WINDRV%\Drivers\NetKVM\" >> "%LOGFILE%" 2>&1
+    reg add "HKLM\OFFSOFT\Microsoft\Windows\CurrentVersion\RunOnce" /v NetKVM /t REG_SZ /d "pnputil /add-driver C:\Drivers\NetKVM\netkvm.inf /install" /f >> "%LOGFILE%" 2>&1
+) else (
+    echo [3b/5] No NetKVM driver staged; Windows will have no network adapter. >> "%LOGFILE%"
+)
 reg unload HKLM\OFFSOFT >> "%LOGFILE%" 2>&1
 reg unload HKLM\OFFSYS >> "%LOGFILE%" 2>&1
 
-echo [4/5] Applying zero-blur instant-UI settings to Ammaar and Default user hives... >> "%LOGFILE%"
-if exist "%WINDRV%\Users\Ammaar\NTUSER.DAT" (
-    reg load HKLM\OFFUSR "%WINDRV%\Users\Ammaar\NTUSER.DAT" >> "%LOGFILE%" 2>&1
+echo [4/5] Applying zero-blur instant-UI settings to Alan and Default user hives... >> "%LOGFILE%"
+if exist "%WINDRV%\Users\Alan\NTUSER.DAT" (
+    reg load HKLM\OFFUSR "%WINDRV%\Users\Alan\NTUSER.DAT" >> "%LOGFILE%" 2>&1
     reg import X:\Windows\System32\opt_usr.reg >> "%LOGFILE%" 2>&1
     reg unload HKLM\OFFUSR >> "%LOGFILE%" 2>&1
 )
@@ -454,6 +472,14 @@ def build_opt_winpe():
                 shutil.copytree(item, dest, dirs_exist_ok=True)
             else:
                 shutil.copy2(item, dest)
+
+        # virtio-win NetKVM (w11/ARM64), copied without macOS metadata so FAT gets no ._ files.
+        if (NETKVM_SRC / "netkvm.inf").exists():
+            (pe_root / "NetKVM").mkdir(exist_ok=True)
+            for name in ("netkvm.inf", "netkvm.sys", "netkvm.cat", "netkvmp.exe"):
+                shutil.copyfile(NETKVM_SRC / name, pe_root / "NetKVM" / name)
+        else:
+            print(f"[warn] {NETKVM_SRC}/netkvm.inf missing; Windows will have no network adapter", flush=True)
 
         boot_wim = pe_root / "sources" / "boot.wim"
         boot_wim.parent.mkdir(parents=True, exist_ok=True)

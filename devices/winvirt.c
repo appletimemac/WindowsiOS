@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_error.h>
+#include <mach/mach_time.h>
 #include <mach/vm_map.h>
 #include <pthread.h>
 #include <pthread/qos.h>
@@ -93,6 +94,9 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     HvWinVirt *b = m->tick_opaque;
     uint64_t deadline = hv_timer_update(b->gic, cpu);
     if (cpu->index != 0) return deadline;
+    uint64_t now = mach_absolute_time();
+    if (b->tick0_last && now - b->tick0_last > b->tick0_gap_max_ticks) b->tick0_gap_max_ticks = now - b->tick0_last;
+    b->tick0_last = now;
     hv_pl031_tick(b->rtc);
     if (b->poll) b->poll();
     hv_xhci_poll(b->usb);
@@ -194,7 +198,8 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
      *    Slot 2: NVMe 0      (1b36:0010, serial WIN11IOS01 -> matches UEFI Boot0001!)
      *    Slot 3: xHCI USB 3  (1b36:000d, Port 1 Keyboard + Port 2 Absolute Tablet)
      *    Slot 4: NVMe 1      (optional installer/secondary image)
-     *    Slot 5: VirtIO-Snd  (optional audio) */
+     *    Slot 5: VirtIO-Snd  (optional audio)
+     *    Next free slot after those (5, or 6 with the installer image): VirtIO-GPU (1af4:1050, INTx like the rest) */
     b->pcie = hv_pcie_create(m, b->gic, WINVIRT_PCIE_ECAM_PA, WINVIRT_PCIE_ECAM_SZ,
                              WINVIRT_PCIE_MMIO_PA, WINVIRT_PCIE_MMIO_SZ, WINVIRT_INTID_PCIE);
     hv_pcie_add_pio(b->pcie, WINVIRT_PCIE_PIO_PA, WINVIRT_PCIE_PIO_SZ);
@@ -207,6 +212,8 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
     if (disk0) b->nvme0 = hv_nvme_create(m, b->pcie, disk0, "WIN11IOS01");
     b->usb = hv_xhci_create(m, b->pcie);
     b->hda = hv_hda_create(m, b->pcie);
+    /* Windows draws on ramfb until viogpudo is installed (the tools disk does it), then on this. */
+    b->gpu = hv_virtio_gpu_create(m, b->pcie, b->fb);
     if (disk1) b->nvme1 = hv_nvme_create(m, b->pcie, disk1, "WIN11INST");
     (void)enable_sound;
 

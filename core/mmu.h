@@ -18,6 +18,7 @@ typedef struct HvWalk {
     uint64_t block_size; /* size of the mapping that was found */
     uint8_t r, w, x;     /* permissions at the EL that was asked about */
     uint8_t attr;        /* MAIR attribute byte */
+    uint8_t ng;          /* not global: the mapping belongs to the ASID it was walked under */
 } HvWalk;
 
 /* Fault status codes (ESR ISS DFSC/IFSC). */
@@ -35,12 +36,27 @@ void hv_tlb_flush(HvCpu *cpu);
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);
 void hv_tlb_flush_user(HvCpu *cpu);
 void hv_kva_hist_dump(FILE *f); /* HV_KVA_HIST, see mmu.c */
+/* HV_KTLB_CHECK (see mmu.c): the kernel entries kept across address-space switches, checked against the page
+   tables. The count of entries found wrong in way `why` (1 unmapped, 2 another page, 3 not writable, 4 not
+   executable, 5 not readable, 6 access flag clear, 7 not global): those the table they were filled from
+   still maps as the entry says (gone_at_source 0), or that one neither (1). */
+/* Read this file's environment settings (HV_KTLB_CHECK, HV_KTLB_FLUSH, HV_KVA_HIST); hv_machine_init does. */
+void hv_mmu_env_init(void);
+/* Check the kept kernel TLB entries at every Nth address-space switch; 0 turns it off. Not while CPUs run. */
+void hv_ktlb_check_set(int every);
+uint64_t hv_ktlb_check_count(int why, int gone_at_source);
+void hv_ktlb_check_dump(FILE *f);
 /* A big range of kernel VAs: its kernel entries and cached branch targets, not every process's entries. */
 void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len);
 void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len);
 uint64_t hv_mmu_ukey(const HvCpu *cpu);
 void hv_tlb_switch_user(HvCpu *cpu, uint64_t old_ukey, uint64_t new_ukey); /* a process switch */
-void hv_tlb_flush_kernel(HvCpu *cpu);
+/* TTBR1 was written and differs from old_ttbr1. */
+void hv_tlb_switch_kernel(HvCpu *cpu, uint64_t old_ttbr1);
+/* The kernel half's entries that belong to an ASID (not global). 1 if EL1 could run code of the ASID, and
+   the kernel's cached branch targets and returns went with it. */
+int hv_tlb_drop_kernel_asid(HvCpu *cpu);
+int hv_mmu_asid(const HvCpu *cpu); /* the current ASID, from the TTBR that TCR.A1 names */
 void hv_tlb_stash_drop(HvCpu *cpu, int asid); /* asid -1: all */
 /* Empty the indirect-branch cache for all user (0) or for kernel (1) VAs. */
 void hv_ijc_reset(HvCpu *cpu, int kernel);

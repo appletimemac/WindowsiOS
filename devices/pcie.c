@@ -186,6 +186,22 @@ void hv_pci_set_intx(HvPciDev *d, int level) {
     update_line(p, line);
 }
 
+/* For the state dump: every device's interrupt line, and how many devices hold each shared line up. */
+void hv_pcie_dump(HvPcie *p, FILE *f) {
+    for (int l = 0; l < 4; l++)
+        if (p->line_count[l]) fprintf(f, "pci line %d (intid %d): held by %d\n", l, p->intx_base + l, p->line_count[l]);
+    for (int s = 0; s < HV_PCI_SLOTS; s++) {
+        HvPciDev *d = p->dev[s];
+        if (!d) continue;
+        fprintf(f, "pci %d: %04x:%04x cmd=%04x status=%04x intx=%d line=%d msix=%d pba=%llx\n", s, get16(d->config), get16(d->config + 2),
+                get16(d->config + PCI_COMMAND), get16(d->config + PCI_STATUS), d->intx, intx_line_of(p, d), hv_pci_msix_enabled(d),
+                (unsigned long long)d->msix_pba);
+        for (int b = 0; b < 6; b++)
+            if (d->bar_size[b])
+                fprintf(f, "  bar %d: %llx, %llx bytes\n", b, (unsigned long long)hv_pci_bar_addr(d, b), (unsigned long long)d->bar_size[b]);
+    }
+}
+
 static uint64_t ecam_read(void *opaque, uint64_t off, unsigned size) {
     HvPcie *p = opaque;
     uint32_t bus = (uint32_t)(off >> 20), slot = (off >> 15) & 31, fn = (off >> 12) & 7, reg = off & 0xfff;

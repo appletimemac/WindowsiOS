@@ -404,14 +404,21 @@ static int alignment_fault(HvCpu *cpu, uint64_t va, int write, uint64_t pc) {
 }
 
 /* For atomics: a host pointer when va is RAM the guest may write, else NULL with
-   *mmio_pa set. Returns -1 after an abort. */
+   *mmio_pa set. Returns -1 after an abort. With a host pointer, *mmio_pa is the RAM's
+   pa when the page needs ram_stored() after the store (it may hold code), else HV_NO_PA. */
+#define HV_NO_PA (~0ull)
+/* After a store through rmw_target's host pointer: translations made from those bytes go. */
+static void ram_stored(HvCpu *cpu, uint64_t pa, uint32_t bytes) {
+    if (pa != HV_NO_PA) hv_ram_written(cpu->m, pa, bytes);
+}
+
 static int rmw_target(HvCpu *cpu, uint64_t va, uint32_t bytes, int el, uint64_t pc, void **host, uint64_t *mmio_pa) {
     if (!cpu->m->watch_va && !cpu->m->watch_pa && ((va & ((1u << HV_TLB_PAGE_BITS) - 1)) + bytes <= (1u << HV_TLB_PAGE_BITS))) {
         HvTlbEntry *t = hv_tlb_ent(cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), hv_tlb_table(cpu, el));
         uint64_t tag = __atomic_load_n(&t->write_tag, __ATOMIC_RELAXED);
         if (tag != HV_TLB_INVALID && tag + HV_TLB_ADJ == (va & ~((1ull << HV_TLB_PAGE_BITS) - 1))) {
             *host = (void *)(uintptr_t)(va + (uint64_t)t->addend);
-            *mmio_pa = 0;
+            *mmio_pa = HV_NO_PA; /* writable in the TLB: no code there */
             return 0;
         }
     }
@@ -428,12 +435,7 @@ static int rmw_target(HvCpu *cpu, uint64_t va, uint32_t bytes, int el, uint64_t 
         return 0;
     }
     *host = hv_phys_ptr(cpu->m, pa, bytes);
-    if (*host) {
-        /* Same rule as other writes: drop translations made from this page. */
-        uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
-        if (ram->code_pages[pg]) hv_invalidate_code(cpu->m, pa);
-    }
-    *mmio_pa = pa;
+    *mmio_pa = pa; /* RAM: the caller checks for code after its store, as every write does */
     return 0;
 }
 
@@ -487,7 +489,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         uint64_t desired = gpr(cpu, op->rt) & mask;
         if (host) {
             old = s & mask;
-            cas_host(host, size, &old, desired);
+            if (cas_host(host, size, &old, desired)) ram_stored(cpu, pa, bytes);
         } else {
             old = 0;
             if (hv_phys_read(cpu->m, pa, &old, bytes)) goto external;
@@ -500,6 +502,7 @@ static int do_atomic(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
         old = load_host(host, size);
         while (!cas_host(host, size, &old, atomic_result(op->atomic_op, size, old, s))) {
         }
+        ram_stored(cpu, pa, bytes);
     } else {
         old = 0;
         if (hv_phys_read(cpu->m, pa, &old, bytes)) goto external;
@@ -525,13 +528,14 @@ static int do_casp(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_t 
     uint64_t o0, o1;
     if (host && esize == 4) {
         uint64_t old = c0 | c1 << 32;
-        cas_host(host, 3, &old, n0 | n1 << 32);
+        if (cas_host(host, 3, &old, n0 | n1 << 32)) ram_stored(cpu, pa, bytes);
         o0 = old & mask;
         o1 = old >> 32;
     } else if (host) {
         __uint128_t old = (__uint128_t)c1 << 64 | c0;
-        __atomic_compare_exchange_n((__uint128_t *)host, &old, (__uint128_t)n1 << 64 | n0, 0, __ATOMIC_SEQ_CST,
-                                    __ATOMIC_SEQ_CST);
+        if (__atomic_compare_exchange_n((__uint128_t *)host, &old, (__uint128_t)n1 << 64 | n0, 0, __ATOMIC_SEQ_CST,
+                                        __ATOMIC_SEQ_CST))
+            ram_stored(cpu, pa, bytes);
         o0 = (uint64_t)old;
         o1 = (uint64_t)(old >> 64);
     } else {
@@ -587,6 +591,7 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
             ok = __atomic_compare_exchange_n((__uint128_t *)host, &expect, (__uint128_t)n1 << 64 | n0, 0,
                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
         }
+        if (ok && host) ram_stored(cpu, pa, bytes);
     }
     cpu->excl_addr = ~0ull;
     set_gpr(cpu, op->rs, ok ? 0 : 1);
@@ -636,6 +641,7 @@ static int do_vector(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
 
 int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     cpu->m->access_pc = pc;
+    hv_access_pc = pc;
     HvMemOp op;
     if (hv_mem_decode(insn, &op) != 0) {
         hv_raise_undef(cpu, pc);

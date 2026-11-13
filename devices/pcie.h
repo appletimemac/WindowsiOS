@@ -1,6 +1,7 @@
 #ifndef HENGEVM_PCIE_H
 #define HENGEVM_PCIE_H
 
+#include <stdio.h>
 #include <stdint.h>
 
 #include "gicv3.h"
@@ -65,6 +66,7 @@ void hv_pcie_set_gpex_swizzle(HvPcie *p, int enable);
 void hv_pcie_set_msi_doorbell(HvPcie *p, uint64_t doorbell_pa);
 void hv_pcie_set_its(HvPcie *p, HvGicIts *its, uint64_t translater_pa);
 void hv_pcie_reset(HvPcie *p);
+void hv_pcie_dump(HvPcie *p, FILE *f); /* interrupt lines, for the state dump */
 
 /* Fills in the header; the caller then adds BARs and capabilities. */
 void hv_pci_init(HvPciDev *d, uint16_t vendor, uint16_t device, uint32_t class_rev, uint16_t sub_vendor,

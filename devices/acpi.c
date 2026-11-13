@@ -424,6 +424,16 @@ static void build_dsdt(Buf *tabs, int ncpus) {
         free(ged.buf);
     }
 
+    /* Laptop/slate mode indicator (_CID PNP0C60). No GPIO resource: Windows' inbox "GPIO Laptop or Slate
+       Indicator" driver loads on the _CID and takes its state by injection from the guest agent. */
+    {
+        Buf conv = {0};
+        aml_name_str(&conv, "_HID", "WIOS0001");
+        aml_name_str(&conv, "_CID", "PNP0C60");
+        aml_device(&sb, "CONV", &conv);
+        free(conv.buf);
+    }
+
     /* Wrap in Scope (\_SB_) */
     b_u8(tabs, 0x10); /* ScopeOp */
     aml_pkg_len(tabs, 5 + sb.len);

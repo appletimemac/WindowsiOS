@@ -110,6 +110,7 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
         out->block_size = size;
         out->pa = (desc & OA_MASK & ~(size - 1)) | (va & (size - 1));
         out->attr = (cpu->mair_el1 >> (((desc >> 2) & 7) * 8)) & 0xff;
+        out->ng = (desc >> 11) & 1;
         if (!(desc & (1u << 10))) {
             out->fsc = HV_FSC_ACCESS(level);
             return;
@@ -147,6 +148,7 @@ void hv_tlb_flush(HvCpu *cpu) {
     memset(cpu->tlb, 0x80, sizeof cpu->tlb);
     cpu->nuser_fills = 0;
     cpu->nkernel_fills = 0;
+    cpu->kernel_asid_exec = 0;
     hv_tlb_stash_drop(cpu, -1);
     if (cpu->pc_state) {
         memset(cpu->pc_state->large_2m_bloom, 0, sizeof cpu->pc_state->large_2m_bloom);
@@ -405,11 +407,20 @@ void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len) {
 void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len) {
     if (cpu->m && cpu->m->stats_interval) cpu->m->stats.kernel_ranges++;
     uint64_t first = va & ~(uint64_t)PAGE_MASK;
+    uint64_t span = va + len - first; /* by length: the range may end where the address space does, at 0 */
     if (len <= (4096ull << HV_TLB_PAGE_BITS)) {
-        for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS) hv_tlb_flush_va_asid(cpu, p, -1);
+        for (uint64_t o = 0; o < span; o += 1ull << HV_TLB_PAGE_BITS) hv_tlb_flush_va_asid(cpu, first + o, -1);
         return;
     }
-    uint64_t lo = first & 0x00ffffffffffffffull, hi = (va + len) & 0x00ffffffffffffffull; /* tagged addresses: by the low 56 bits */
+    uint64_t lo = first & 0x00ffffffffffffffull, hi = lo + span; /* tagged addresses: by the low 56 bits */
+    {   /* A large mapping the range only starts or ends in is invalidated whole: its pages are cached one by one. */
+        HvPerCpu *p = cpu->pc_state;
+        uint32_t b0 = hv_large_big_bit(first), b1 = hv_large_big_bit(first + span - 1);
+        int big = p && ((p->large_big_bloom[b0 >> 6] >> (b0 & 63) & 1) || (p->large_big_bloom[b1 >> 6] >> (b1 & 63) & 1));
+        uint64_t unit = big ? 1ull << 30 : 1ull << 21;
+        lo &= ~(unit - 1);
+        hi = (hi + unit - 1) & ~(unit - 1);
+    }
     for (int t = 0; t < 3; t++)
         for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
             HvTlbEntry *e = hv_tlb_ent(cpu, i, t);
@@ -487,7 +498,8 @@ static void ijc_clear_page(HvCpu *cpu, uint64_t page, int kernel, uint64_t salt,
    them, if the filters say it has any. */
 /* remote: another CPU doing it (hv_tlbi_drop_remote_va): returns 0 instead of
    starting the user half over, which only cpu itself may do. */
-static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
+/* ran: the caller saw an entry to fetch through (1) or none (0) before it cleared the slot; -1: look here. */
+static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote, int ran) {
     int kernel = (va >> 55) & 1;
     HvMachine *m = cpu->m;
     HvPerCpu *p = cpu->pc_state;
@@ -497,7 +509,8 @@ static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
         uint64_t page = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
         uint32_t sl = (uint32_t)(va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
         const HvTlbEntry *t1 = hv_tlb_ent(cpu, sl, 1), *t2 = hv_tlb_ent(cpu, sl, 2);
-        int some = kernel ? t1->exec_tag == hv_exec_key(page, t1->addend) || t2->exec_tag == hv_exec_key(page, t2->addend) : asid < 0 || asid == current_asid(cpu) || current_asid(cpu) < 0;
+        int some = !kernel ? asid < 0 || asid == current_asid(cpu) || current_asid(cpu) < 0 :
+                   ran >= 0 ? ran : t1->exec_tag == hv_exec_key(page, t1->addend) || t2->exec_tag == hv_exec_key(page, t2->addend);
         if (some) {
             if (!remote) ret_new(cpu, kernel);
             else if (!ret_new_remote(cpu, kernel)) return 0;
@@ -547,7 +560,7 @@ static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
 }
 
 void hv_ijc_drop_va(HvCpu *cpu, uint64_t va, int asid) {
-    ijc_drop_va(cpu, va, asid, 0);
+    ijc_drop_va(cpu, va, asid, 0, -1);
 }
 
 void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
@@ -568,6 +581,9 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
             int had_exec = 0;
             for (uint32_t s = 0; s < (1u << (21 - HV_TLB_PAGE_BITS)); s++) {
                 uint32_t sl = ((uint32_t)(base >> HV_TLB_PAGE_BITS) + s) & (HV_TLB_SIZE - 1);
+                /* The kernel's cached targets in every page of the mapping, not only the page named and not
+                   only where a TLB entry is left: they are kept across address-space switches now. */
+                if ((va >> 55) & 1) ijc_drop_va(cpu, base + ((uint64_t)s << HV_TLB_PAGE_BITS), asid, 0, 0);
                 for (int el = 0; el < 3; el++) {
                     HvTlbEntry *e = hv_tlb_ent(cpu, sl, el);
                     if (e->read_tag == HV_TLB_INVALID && e->exec_tag == HV_TLB_INVALID && e->write_tag == HV_TLB_INVALID) continue;
@@ -583,6 +599,8 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
             if (had_exec) {
                 if ((va >> 55) & 1) hv_ijc_reset(cpu, 1);
                 else hv_ijc_drop_range(cpu, base, 1ull << 21, asid);
+            } else if ((va >> 55) & 1) {
+                ret_new(cpu, 1); /* once for the mapping: a return may lead into any page of it */
             }
         }
         uint32_t hb = hv_large_big_bit(va);
@@ -684,15 +702,9 @@ static uint64_t KVA_BASE = 0xfffffe0000000000ull;
 static int kva_shift = 30;
 static uint64_t kva_fills[KVA_GBS], kva_pages_n[KVA_GBS], kva_below, kva_above;
 static uint8_t *kva_seen; /* one bit per page */
-static int kva_on = -1;
+static int kva_on;        /* set by hv_mmu_env_init */
 static void kva_note(uint64_t va) {
-    if (kva_on < 0) {
-        kva_on = getenv("HV_KVA_HIST") != NULL;
-        if (getenv("HV_KVA_BASE")) KVA_BASE = strtoull(getenv("HV_KVA_BASE"), NULL, 16);
-        if (getenv("HV_KVA_SHIFT")) kva_shift = atoi(getenv("HV_KVA_SHIFT"));
-    }
     if (!kva_on) return;
-    if (!kva_seen) kva_seen = calloc((size_t)KVA_GBS << (kva_shift - HV_TLB_PAGE_BITS - 3), 1);
     if (va < KVA_BASE) { __atomic_add_fetch(&kva_below, 1, __ATOMIC_RELAXED); return; }
     uint64_t off = va - KVA_BASE, gb = off >> kva_shift;
     if (gb >= KVA_GBS) { __atomic_add_fetch(&kva_above, 1, __ATOMIC_RELAXED); return; }
@@ -703,13 +715,25 @@ static void kva_note(uint64_t va) {
 }
 
 void hv_kva_hist_dump(FILE *f) {
-    if (kva_on <= 0) return;
+    if (!kva_on) return;
     fprintf(f, "kva below %llu above %llu (outside %d buckets of 2^%d bytes from %llx)\n", (unsigned long long)kva_below, (unsigned long long)kva_above, KVA_GBS, kva_shift, (unsigned long long)KVA_BASE);
     for (int g = 0; g < KVA_GBS; g++)
         if (kva_fills[g]) fprintf(f, "kva gb %d fills %llu pages %llu\n", g, (unsigned long long)kva_fills[g], (unsigned long long)kva_pages_n[g]);
 }
 
+/* HV_KTLB_FLUSH: every TTBR1 change empties the kernel half of the TLB and takes that TTBR1 value's own set
+   of cached kernel branch targets, as before global mappings were told apart (for comparison). */
+static int kernel_flush_all; /* set by hv_mmu_env_init */
+static int kernel_flush_always(void) { return kernel_flush_all; }
+
+static void kt_note_fill(HvCpu *cpu, uint32_t code); /* HV_KTLB_CHECK */
+
 static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
+    /* EL1 can run code from a kernel page that belongs to the ASID (not global). Branch targets in the
+       kernel half are cached by address alone, so those go with the ASID (hv_tlb_drop_kernel_asid). Here,
+       before the returns below: what counts is that the page can be fetched, not that it gets an entry.
+       (EL1 code in the process half caches no branch target: the fills check the half.) */
+    if (el && w->x && w->ng && ((va >> 55) & 1)) cpu->kernel_asid_exec = 1;
     if ((va >> 55) & 1) kva_note(va & ~(uint64_t)PAGE_MASK);
     if (w->block_size < (1ull << HV_TLB_PAGE_BITS)) return; /* smaller guest pages: slow path only */
     HvRam *ram = ram_of(cpu->m, w->pa);
@@ -724,10 +748,13 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     if (!((page_va >> 55) & 1)) {
         if (cpu->nuser_fills < HV_USER_FILLS) cpu->user_fills[cpu->nuser_fills] = (uint16_t)hv_tlb_code(slot, table);
         if (cpu->nuser_fills <= HV_USER_FILLS) cpu->nuser_fills++;
-    } else {
+    } else if (w->ng || kernel_flush_always()) {
+        /* A kernel page of this ASID alone (Windows: the window onto the process's own page tables). The
+           global ones, nearly all, are not listed: they outlive every address-space switch. */
         if (cpu->nkernel_fills < HV_KERNEL_FILLS) cpu->kernel_fills[cpu->nkernel_fills] = (uint16_t)hv_tlb_code(slot, table);
         if (cpu->nkernel_fills <= HV_KERNEL_FILLS) cpu->nkernel_fills++;
     }
+    if ((page_va >> 55) & 1) kt_note_fill(cpu, hv_tlb_code(slot, table));
     e->addend = (int64_t)((uint64_t)(uintptr_t)(ram->host + (page_pa - ram->pa)) - page_va);
     e->read_tag = w->r ? page_va - HV_TLB_ADJ : HV_TLB_INVALID;
     /* Writes to ROM or to pages we translated from take the slow path. */
@@ -795,7 +822,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     /* Its cached branch targets in the page too: a cache fill checks the TLB
        entry first (hv_ijc_fill_checked), so one after this sees it gone, and one
        during it changed ijc_seq. */
-    if (!ijc_drop_va(target, va, asid, 1)) return -1; /* only target can do it: no use trying again */
+    if (!ijc_drop_va(target, va, asid, 1, fetched)) return -1; /* only target can do it: no use trying again */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int ok = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
              __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
@@ -1001,7 +1028,7 @@ static void *ijc_resolve(HvCpu *cpu, uint64_t va, uint32_t flags) {
     /* This CPU's small cache in front of the block hash first (as the dispatcher's lookup). */
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     HvBlock *b = pcs->jc[j].va == va ? pcs->jc[j].b : NULL;
-    if (!(b && b->pa == pa && b->flags == flags && b->gen == gen)) {
+    if (!(b && b->pa == pa && b->flags == flags && __atomic_load_n(&b->gen, __ATOMIC_RELAXED) == gen)) {
         b = hv_block_find(m, hv_block_hash(va, pa, flags), va, pa, flags, gen);
         if (!b) FAIL(3);
 #undef FAIL
@@ -1058,10 +1085,17 @@ static int kernel_entry(const HvTlbEntry *e) {
     return (int)((tag >> 55) & 1);
 }
 
-void hv_tlb_flush_kernel(HvCpu *cpu) {
-    if (cpu->m) cpu->m->stats.tlb_flushes++;
+int hv_mmu_asid(const HvCpu *cpu) {
+    return current_asid((HvCpu *)cpu);
+}
+
+/* The listed kernel entries: the ones that belong to an ASID, or every kernel entry under HV_KTLB_FLUSH.
+   A slot may hold a global page by now; dropping that one too only costs its refill. */
+static void drop_kernel_fills(HvCpu *cpu) {
     uint32_t n = cpu->nkernel_fills;
     cpu->nkernel_fills = 0;
+    if (!n) return;
+    if (cpu->m) cpu->m->stats.tlb_flushes++;
     if (n <= HV_KERNEL_FILLS) {
         for (uint32_t k = 0; k < n; k++) {
             HvTlbEntry *e = &cpu->tlb[0] + cpu->kernel_fills[k];
@@ -1074,6 +1108,202 @@ void hv_tlb_flush_kernel(HvCpu *cpu) {
             HvTlbEntry *e = hv_tlb_ent(cpu, i, t);
             if (kernel_entry(e)) memset(e, 0x80, sizeof *e);
         }
+}
+
+int hv_tlb_drop_kernel_asid(HvCpu *cpu) {
+    drop_kernel_fills(cpu);
+    if (!kernel_flush_always() && !cpu->kernel_asid_exec) return 0;
+    /* EL1 ran, or could run, code from a kernel page of the ASID: the targets cached by its address may
+       name another ASID's page from here on. (In Windows only while it boots; the global kernel's go too.) */
+    cpu->kernel_asid_exec = 0;
+    hv_ijc_reset(cpu, 1);
+    return 1;
+}
+
+/* HV_KTLB_CHECK=N (a diagnostic): at every Nth address-space switch that keeps the kernel half, walk the
+   page tables again for every kernel entry kept and count the ones that no longer say what the tables
+   say. An entry counts when two checks in a row find it wrong the same way: another CPU may be between
+   changing a table and its TLBI. Each is also walked under the TTBR1 it was filled under, which tells a
+   mapping that only some address spaces have from one that was taken away. Nothing is repaired. */
+enum { KT_UNMAPPED = 1, KT_MOVED, KT_WRITE, KT_EXEC, KT_READ, KT_ACCESS, KT_NOT_GLOBAL, KT_WHYS };
+static const char *const kt_why[KT_WHYS] = {"", "unmapped", "another page", "not writable", "not executable",
+                                            "not readable", "access flag clear", "not global"};
+#define KT_SUSPECTS 8192
+#define KT_SHOWN 24 /* examples printed per kind */
+typedef struct KtSuspect {
+    uint64_t va;
+    uint8_t table, why;
+} KtSuspect;
+static struct KtCheck {
+    KtSuspect prev[KT_SUSPECTS], now[KT_SUSPECTS];
+    uint32_t nprev, calls;
+    uint64_t fill_ttbr1[HV_TLB_SIZE * 4]; /* the TTBR1 each entry was filled under */
+} *kt_check[HV_MAX_CPUS];
+/* [why][0]: the table it was filled from still maps it as the entry says; [why][1]: that one does not either */
+static uint64_t kt_checks, kt_entries, kt_suspects, kt_lost, kt_stale[KT_WHYS][2], kt_shown[KT_WHYS][2];
+#define KT_REGIONS 64
+static struct {
+    uint64_t gb, n;
+} kt_region[KT_REGIONS]; /* confirmed ones by GiB of address space */
+
+static int ktlb_check_every; /* 0: off (hv_ktlb_check_set) */
+
+static int ktlb_check_period(void) { return ktlb_check_every; }
+
+/* The state is made by hv_ktlb_check_set, never here: this is on the refill path (see hv_mmu_env_init). */
+static struct KtCheck *kt_of(HvCpu *cpu) { return cpu->index < HV_MAX_CPUS ? kt_check[cpu->index] : NULL; }
+
+void hv_ktlb_check_set(int every) {
+    if (every > 0)
+        for (int i = 0; i < HV_MAX_CPUS; i++)
+            if (!kt_check[i]) kt_check[i] = calloc(1, sizeof *kt_check[0]);
+    __atomic_store_n(&ktlb_check_every, every > 0 ? every : 0, __ATOMIC_RELAXED);
+}
+
+/* This file's environment settings, read once while the machine is set up. tlb_fill is reached from the refill
+   thunk (host/enter.S) with the guest's vector registers live and only the general ones saved, and this file is
+   built without vector instructions for that reason, so nothing on that path may call into libc: getenv and
+   calloc are free to use those registers. A setting read at its first use there would do exactly that. */
+void hv_mmu_env_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    if (getenv("HV_KVA_BASE")) KVA_BASE = strtoull(getenv("HV_KVA_BASE"), NULL, 16);
+    if (getenv("HV_KVA_SHIFT")) kva_shift = atoi(getenv("HV_KVA_SHIFT"));
+    if (getenv("HV_KVA_HIST")) {
+        kva_seen = calloc((size_t)KVA_GBS << (kva_shift - HV_TLB_PAGE_BITS - 3), 1);
+        kva_on = kva_seen != NULL;
+    }
+    kernel_flush_all = getenv("HV_KTLB_FLUSH") != NULL;
+    const char *check = getenv("HV_KTLB_CHECK");
+    if (check) hv_ktlb_check_set(atoi(check) > 0 ? atoi(check) : 256);
+}
+
+static void kt_note_fill(HvCpu *cpu, uint32_t code) {
+    if (ktlb_check_period() && kt_of(cpu)) kt_of(cpu)->fill_ttbr1[code] = cpu->ttbr1_el1;
+}
+
+uint64_t hv_ktlb_check_count(int why, int gone_at_source) {
+    return why > 0 && why < KT_WHYS ? kt_stale[why][gone_at_source != 0] : 0;
+}
+
+void hv_ktlb_check_dump(FILE *f) {
+    if (!ktlb_check_period()) return;
+    fprintf(f, "ktlb check: %llu checks, %llu entries walked, %llu suspects, %llu lost\n", (unsigned long long)kt_checks,
+            (unsigned long long)kt_entries, (unsigned long long)kt_suspects, (unsigned long long)kt_lost);
+    for (int w = 1; w < KT_WHYS; w++)
+        if (kt_stale[w][0] || kt_stale[w][1])
+            fprintf(f, "ktlb check: %s: %llu still mapped that way by the table they came from, %llu not by that one either\n",
+                    kt_why[w], (unsigned long long)kt_stale[w][0], (unsigned long long)kt_stale[w][1]);
+    for (int r = 0; r < KT_REGIONS; r++)
+        if (kt_region[r].n)
+            fprintf(f, "ktlb check: region %llx: %llu\n", (unsigned long long)(kt_region[r].gb << 30), (unsigned long long)kt_region[r].n);
+}
+
+static int kt_find(const KtSuspect *a, uint32_t n, const KtSuspect *s) {
+    for (uint32_t k = 0; k < n; k++)
+        if (a[k].va == s->va && a[k].table == s->table && a[k].why == s->why) return 1;
+    return 0;
+}
+
+/* What is wrong with entry e for va under the tables in force (0: nothing). */
+static int kt_judge(HvCpu *cpu, const HvTlbEntry *e, uint64_t va, int t, HvWalk *w) {
+    hv_mmu_walk(cpu, va, HV_ACC_READ, t ? 1 : 0, w);
+    if (w->fsc && !w->block_size) return KT_UNMAPPED;
+    HvRam *ram = ram_of(cpu->m, w->pa);
+    uint64_t page_pa = w->pa & ~(uint64_t)PAGE_MASK;
+    if (!ram || (uint64_t)(uintptr_t)(ram->host + (page_pa - ram->pa)) != va + (uint64_t)e->addend) return KT_MOVED;
+    if ((w->fsc & 0x3c) == HV_FSC_ACCESS(0)) return KT_ACCESS;
+    if (e->write_tag != HV_TLB_INVALID && !w->w) return KT_WRITE;
+    if (e->exec_tag != HV_TLB_INVALID && !w->x) return KT_EXEC;
+    if (e->read_tag != HV_TLB_INVALID && !w->r) return KT_READ;
+    if (w->ng) return KT_NOT_GLOBAL;
+    return 0;
+}
+
+static void ktlb_check(HvCpu *cpu) {
+    struct KtCheck *c = kt_of(cpu);
+    if (!c || !(cpu->sctlr_el1 & 1)) return;
+    KtSuspect *now = c->now;
+    uint32_t nnow = 0;
+    uint64_t extra = cpu->pstate_extra, ttbr1 = cpu->ttbr1_el1, walked = 0;
+    for (int t = 0; t < 3; t++) {
+        /* the walk answers for the PAN state the table is for */
+        cpu->pstate_extra = t == 2 ? extra | HV_PSTATE_PAN : extra & ~(uint64_t)HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
+            const HvTlbEntry *e = hv_tlb_ent(cpu, i, t);
+            if (!kernel_entry(e)) continue;
+            uint64_t va = e->read_tag != HV_TLB_INVALID    ? e->read_tag + HV_TLB_ADJ
+                          : e->exec_tag != HV_TLB_INVALID ? hv_exec_key(e->exec_tag, e->addend)
+                                                          : e->write_tag + HV_TLB_ADJ;
+            HvWalk w;
+            int why = kt_judge(cpu, e, va, t, &w);
+            walked++;
+            if (!why) continue;
+            KtSuspect s = {va, (uint8_t)t, (uint8_t)why};
+            if (nnow < KT_SUSPECTS) now[nnow++] = s;
+            else __atomic_add_fetch(&kt_lost, 1, __ATOMIC_RELAXED);
+            if (!kt_find(c->prev, c->nprev, &s)) continue;
+            /* wrong twice running: what does the table it was filled from say? */
+            uint64_t from = c->fill_ttbr1[hv_tlb_code(i, t)];
+            HvWalk fw;
+            cpu->ttbr1_el1 = from;
+            int there = from && kt_judge(cpu, e, va, t, &fw) != 0;
+            cpu->ttbr1_el1 = ttbr1;
+            __atomic_add_fetch(&kt_stale[why][there], 1, __ATOMIC_RELAXED);
+            uint64_t gb = va >> 30;
+            for (int r = 0; r < KT_REGIONS; r++) {
+                uint64_t g = __atomic_load_n(&kt_region[r].gb, __ATOMIC_RELAXED);
+                if (!g && __atomic_compare_exchange_n(&kt_region[r].gb, &g, gb, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) g = gb;
+                if (g == gb) {
+                    __atomic_add_fetch(&kt_region[r].n, 1, __ATOMIC_RELAXED);
+                    break;
+                }
+            }
+            if (__atomic_fetch_add(&kt_shown[why][there], 1, __ATOMIC_RELAXED) >= KT_SHOWN) continue;
+            fprintf(stderr,
+                    "ktlb check: cpu%u table %d va %llx %s: entry %c%c%c host %llx; now (ttbr1 %llx) pa %llx size %llx fsc %x ng %u; "
+                    "filled under ttbr1 %llx, which %s\n",
+                    cpu->index, t, (unsigned long long)va, kt_why[why], e->read_tag != HV_TLB_INVALID ? 'r' : '-',
+                    e->write_tag != HV_TLB_INVALID ? 'w' : '-', e->exec_tag != HV_TLB_INVALID ? 'x' : '-',
+                    (unsigned long long)(va + (uint64_t)e->addend), (unsigned long long)ttbr1, (unsigned long long)w.pa,
+                    (unsigned long long)w.block_size, w.fsc, w.ng, (unsigned long long)from,
+                    !from ? "is not known" : there ? "does not map it that way either" : "still maps it that way");
+        }
+    }
+    cpu->pstate_extra = extra;
+    memcpy(c->prev, now, nnow * sizeof now[0]);
+    c->nprev = nnow;
+    __atomic_add_fetch(&kt_checks, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&kt_entries, walked, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&kt_suspects, nnow, __ATOMIC_RELAXED);
+}
+
+/* Windows gives every process its own top-level kernel table and, with TCR.A1, keeps the ASID in TTBR1
+   too, so TTBR1 is written twice on every process switch (measured: 40,000 times a second while
+   browsing). Global mappings are by definition the same under every ASID, and a TLB keeps them across
+   these writes: only a TLBI removes them. So the kernel half stays, 99% of it in Windows, with the branch
+   targets cached from it. Emptying it here made 96% of all kernel TLB fills refills (2.3 million a
+   second). What goes is what belongs to the ASID: its kernel entries, also when only the table changed
+   (Windows passes through ASID 0 with the next process's table, and nothing filled there may outlive
+   it), and the kernel's return table, as at every TTBR1 write before: a return is matched by address
+   alone, and an invalidation renews the table only for a page whose entry it still finds. */
+void hv_tlb_switch_kernel(HvCpu *cpu, uint64_t old_ttbr1) {
+    if (kernel_flush_always()) {
+        drop_kernel_fills(cpu);
+        hv_ijc_switch_kernel(cpu, cpu->ttbr1_el1);
+        return;
+    }
+    if (!(old_ttbr1 & OA_MASK) || !(cpu->ttbr1_el1 & OA_MASK)) {
+        /* The first kernel table, or none any more: nothing cached under the other is kept. */
+        cpu->nkernel_fills = HV_KERNEL_FILLS + 1; /* scan: the global entries are not listed */
+        drop_kernel_fills(cpu);
+        cpu->kernel_asid_exec = 0;
+        hv_ijc_reset(cpu, 1);
+        return;
+    }
+    if (!hv_tlb_drop_kernel_asid(cpu)) ret_new(cpu, 1);
+    if (ktlb_check_period() && kt_of(cpu) && ++kt_of(cpu)->calls % (uint32_t)ktlb_check_period() == 0) ktlb_check(cpu);
 }
 
 static int user_entry(const HvTlbEntry *e) {

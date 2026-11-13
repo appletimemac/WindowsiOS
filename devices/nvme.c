@@ -1,5 +1,6 @@
 #include "nvme.h"
 
+#include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -157,7 +158,8 @@ static uint16_t handle_identify(HvNvme *nv, const NvmeCmd *cmd) {
         buf[24] = 0;                  /* NSFEAT */
         buf[25] = 0;                  /* NLBAF = 0 (1 format) */
         buf[26] = 0;                  /* FLBAS = format 0 */
-        buf[33] = 0x08;               /* DLFEAT: read bytes from deallocated blocks are 0 */
+        buf[33] = 0x09;               /* DLFEAT: Write Zeroes takes DEAC (bit 3); deallocated blocks read as 0 (001b, hv_disk_discard) */
+        buf[99] = 0;                  /* NSATTR: never write protected: Windows ignores it, mounts read-write and retries refused writes forever (hv_disk overlay) */
         /* LBAF 0 at byte 128: MS=0, LBADS=9 (2^9 = 512 bytes), RP=0 */
         buf[130] = 9;
     } else if (cns == 0x01) { /* Identify Controller */
@@ -364,6 +366,30 @@ static void process_admin_cmd(HvNvme *nv, HvNvmeSq *sq, const NvmeCmd *cmd) {
     post_cqe(nv, sq, 0, cmd->cid, dw0, status);
 }
 
+/* lat_hist bucket limits (100 us, 1 ms, 10 ms) in mach_absolute_time ticks; set once by hv_nvme_create. */
+static uint64_t lat_limit[3];
+
+static void lat_limits_init(void) {
+    if (lat_limit[0]) return;
+    mach_timebase_info_data_t tb;
+    if (mach_timebase_info(&tb) != 0 || !tb.numer || !tb.denom) tb.numer = tb.denom = 1;
+    static const uint64_t us[3] = {100, 1000, 10000};
+    for (int i = 0; i < 3; i++) lat_limit[i] = us[i] * 1000ull * tb.denom / tb.numer;
+}
+
+static void count_rw(HvNvme *nv, int is_read, uint64_t ticks) {
+    if (is_read) {
+        nv->rd_n++;
+        nv->rd_ticks += ticks;
+        if (ticks > nv->rd_max_ticks) nv->rd_max_ticks = ticks;
+    } else {
+        nv->wr_n++;
+        nv->wr_ticks += ticks;
+        if (ticks > nv->wr_max_ticks) nv->wr_max_ticks = ticks;
+    }
+    nv->lat_hist[ticks < lat_limit[0] ? 0 : ticks < lat_limit[1] ? 1 : ticks < lat_limit[2] ? 2 : 3]++;
+}
+
 static uint8_t *ensure_io_buf(HvNvme *nv, uint32_t bytes) {
     if (bytes <= nv->io_buf_cap) return nv->io_buf;
     uint8_t *nb = realloc(nv->io_buf, bytes);
@@ -381,8 +407,12 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         return;
     }
 
+    int is_rw = cmd->opc == 0x01 || cmd->opc == 0x02;
+    uint64_t t0 = is_rw ? mach_absolute_time() : 0;
+
     switch (cmd->opc) {
     case 0x00: /* Flush */
+        nv->flush_n++;
         if (hv_disk_flush(nv->disk) != 0) status = 0x0004;
         break;
     case 0x01:   /* Write */
@@ -391,7 +421,8 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         uint32_t nlb = (cmd->cdw12 & 0xffff) + 1u;
         uint64_t off = slba * 512ull;
         uint32_t bytes = nlb * 512u;
-        if (bytes > NVME_MAX_XFER || off + bytes > nv->disk->size) {
+        uint64_t blocks = nv->disk->size / 512ull;
+        if (bytes > NVME_MAX_XFER || slba > blocks || nlb > blocks - slba) {
             status = 0x0080; /* LBA Out of Range */
             break;
         }
@@ -422,8 +453,17 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         uint32_t nlb = (cmd->cdw12 & 0xffff) + 1u;
         uint64_t off = slba * 512ull;
         uint32_t bytes = nlb * 512u;
-        if (off + bytes > nv->disk->size) {
+        uint64_t blocks = nv->disk->size / 512ull;
+        if (slba > blocks || nlb > blocks - slba) {
             status = 0x0080;
+            break;
+        }
+        if (cmd->cdw12 & (1u << 25)) {
+            if (hv_disk_discard(nv->disk, off, bytes) != 0) status = 0x0004;
+            else {
+                nv->trim_n++;
+                nv->trim_bytes += bytes;
+            }
             break;
         }
         uint8_t zero[4096] = {0};
@@ -438,14 +478,62 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         }
         break;
     }
-    case 0x09: /* Dataset Management (TRIM / Deallocate) */
-        status = 0;
+    case 0x09: { /* Dataset Management (TRIM / Deallocate) */
+        static int trim_off = -1; /* HV_NO_TRIM: accept and ignore, as before deallocation was real */
+        if (trim_off < 0) trim_off = getenv("HV_NO_TRIM") != NULL;
+        if (!(cmd->cdw11 & 4) || trim_off) break;
+        uint32_t nr = (cmd->cdw10 & 0xff) + 1u;
+        uint8_t ranges[256 * 16];
+        if (nvme_dma_prp(nv, cmd->prp1, cmd->prp2, ranges, nr * 16, 0) != 0) {
+            status = 0x0004;
+            break;
+        }
+        uint64_t blocks = nv->disk->size / 512ull;
+        for (uint32_t i = 0; i < nr; i++) {
+            uint32_t nlb;
+            uint64_t slba;
+            memcpy(&nlb, ranges + i * 16 + 4, 4);
+            memcpy(&slba, ranges + i * 16 + 8, 8);
+            if (nlb && (slba > blocks || nlb > blocks - slba)) {
+                status = 0x0080;
+                break;
+            }
+        }
+        if (status) break;
+        uint64_t bytes = 0;
+        for (uint32_t i = 0; i < nr; i++) {
+            uint32_t nlb;
+            uint64_t slba;
+            memcpy(&nlb, ranges + i * 16 + 4, 4);
+            memcpy(&slba, ranges + i * 16 + 8, 8);
+            if (!nlb) continue;
+            uint64_t len = (uint64_t)nlb * 512ull;
+            if (hv_disk_discard(nv->disk, slba * 512ull, len) != 0) {
+                status = 0x0004;
+                break;
+            }
+            bytes += len;
+            nv->trim_bytes += len;
+        }
+        if (!status && bytes) nv->trim_n++;
         break;
+    }
     default:
         status = 0x0001; /* Invalid Command Opcode */
         break;
     }
 
+    if (is_rw) count_rw(nv, cmd->opc == 0x02, mach_absolute_time() - t0);
+
+    if (status) { /* Windows turns these into paging and file system errors: say which command failed */
+        static int logged;
+        if (logged < 100) {
+            logged++;
+            fprintf(stderr, "nvme[%d] io opc=%02x sq=%u cid=%u cdw10=%08x cdw11=%08x cdw12=%08x prp1=%llx prp2=%llx: status %04x\n",
+                    nv->pci.slot, cmd->opc, sqid, cmd->cid, cmd->cdw10, cmd->cdw11, cmd->cdw12,
+                    (unsigned long long)cmd->prp1, (unsigned long long)cmd->prp2, status);
+        }
+    }
     post_cqe(nv, sq, sqid, cmd->cid, 0, status);
 }
 
@@ -595,6 +683,7 @@ HvNvme *hv_nvme_create(HvMachine *m, HvPcie *bus, HvDisk *disk, const char *seri
     nv->disk = disk;
     if (serial) snprintf(nv->serial, sizeof nv->serial, "%s", serial);
     pthread_mutex_init(&nv->mu, NULL);
+    lat_limits_init();
 
     /* CAP: MQES=1023, CQR=1, TO=20, DSTRD=0, CSS=1 (NVM), MPSMIN=0 (4KB), MPSMAX=4 (64KB) */
     nv->cap = 1023ull | (1ull << 16) | (20ull << 24) | (1ull << 37) | (0ull << 48) | (4ull << 52);

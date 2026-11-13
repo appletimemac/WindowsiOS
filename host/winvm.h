@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "perf.h"
 #include "winvirt.h"
 
 typedef struct HvWinVmConfig {
@@ -31,13 +32,24 @@ void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason));
 int hv_winvm_run_cpu0(void);
 void hv_winvm_stop(void);
 void hv_winvm_power_button(void);
+/* Windows saves its session to disk and powers off; the next boot resumes it (needs WindowsiOS Tools). */
+void hv_winvm_request_hibernate(void);
 void hv_winvm_flush_disks(void);
+/* Periodic checkpoint while running: an ordering barrier instead of a full sync. */
+void hv_winvm_checkpoint_disks(void);
+/* Posture the guest's tablet mode follows: 1 laptop, 0 tablet (the default). Any thread. */
+void hv_winvm_set_posture(int laptop);
 
 /* Display & screenshot hooks (any thread) */
 void hv_winvm_set_display_layer(void *ca_metal_layer);
+/* The picture's place in that layer (fractions of its size; see hv_fb_metal_set_content). Kept for the next VM. */
+void hv_winvm_set_display_content(double x, double y, double w, double h);
 int hv_winvm_display_size(uint32_t *w, uint32_t *h);
 uint64_t hv_winvm_display_frames(void);
 int hv_winvm_save_png(const char *path);
+/* The host window's size in pixels: the guest's virtio-gpu is told to render at it (clamped to even values in
+   640x480..3840x2160). Works before hv_winvm_create too (it is applied then). */
+void hv_winvm_request_display_size(uint32_t width, uint32_t height);
 
 /* Input hooks (any thread) */
 void hv_winvm_key_hid(uint8_t usage, int down);
@@ -45,13 +57,27 @@ void hv_winvm_key_linux(uint16_t code, int down);
 /* Normalized tablet pointer: x_norm, y_norm in [0.0, 1.0] mapped to 0..32767;
  * buttons: bit0=Left, bit1=Right, bit2=Middle; wheel: -127..127. */
 void hv_winvm_tablet(double x_norm, double y_norm, uint8_t buttons, int8_t wheel);
+/* Multi-touch frame for the USB touchscreen (see HvTouchContact in xhci.h): the full set of contacts
+ * (1..5, x and y 0..32767 across the Windows desktop), contacts lifting (tip 0) reported once. */
+void hv_winvm_touch(const HvTouchContact *contacts, int count);
+/* 1 once Windows has configured the touchscreen, so touches stop being dropped. */
+int hv_winvm_touch_ready(void);
 void hv_winvm_send_ctrl_alt_del(void);
 void hv_winvm_usb_stats(int *kbd_ready, int *tab_ready, uint64_t *delivered);
+/* jit_flushes: translation-cache flushes that happened (stats.block_flushes). */
 void hv_winvm_engine_stats(uint64_t *jit_used_bytes, uint64_t *jit_cap_bytes,
-                           uint64_t *jit_full_flushes, uint64_t *wfi_ticks);
+                           uint64_t *jit_flushes, uint64_t *wfi_ticks);
+/* One row of perf.csv (host/perf.h). Any thread; the caller fills the host fields (memory, thermal, power). */
+void hv_winvm_perf_snapshot(HvPerfSnap *out);
 int hv_winvm_share_up(void);
+uint64_t hv_winvm_display_flushes(void);
+void hv_winvm_cpu_insns(HvCpu *cpu, uint64_t pc, uint32_t words[17]);
+void hv_winvm_set_oauth_mode(int enabled);
+char *hv_winvm_take_open_url(void);
+int hv_winvm_take_oauth_done(void);
 
 HvMachine *hv_winvm_machine(void);
+void hv_winvm_dump_devices(FILE *f); /* device interrupt lines, for the state dump */
 HvWinVirt *hv_winvm_board(void);
 const char *hv_winvm_reason_name(int reason);
 

@@ -19,6 +19,7 @@
 #include "pl031.h"
 #include "pl061.h"
 #include "hda.h"
+#include "virtio_gpu.h"
 #include "virtio_net.h"
 #include "virtio_snd.h"
 #include "xhci.h"
@@ -79,9 +80,13 @@ typedef struct HvWinVirt {
     HvXhci *usb;
     HvHda *hda;
     HvVirtioSnd *snd;
+    HvVirtioGpu *gpu;
 
     uint32_t ged_events;
     void (*poll)(void);
+
+    /* Read racily from another thread (host ticks are mach_absolute_time units). */
+    uint64_t tick0_last, tick0_gap_max_ticks; /* CPU 0 device poll: last time, largest gap since the reader zeroed it */
 } HvWinVirt;
 
 uint8_t *hv_alloc_no_footprint(uint64_t size);

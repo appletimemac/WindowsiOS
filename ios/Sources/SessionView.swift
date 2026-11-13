@@ -4,653 +4,490 @@ import UIKit
 
 struct SessionView: View {
     @ObservedObject var vm: VMViewModel
-    private let uiHaptic = UIImpactFeedbackGenerator(style: .light)
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.layoutDirection) private var layoutDirection
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var toolbarOpen = false
+    @State private var showingSettings = false
+    @State private var confirmingShutDown = false
+    @State private var confirmingHibernate = false
 
     var body: some View {
-        GeometryReader { geo in
-            let size = geo.size
-            let laptopActive = vm.isLaptopLayoutActive(for: size)
-
-            ZStack {
-                Color(red: 0.02, green: 0.025, blue: 0.04).ignoresSafeArea()
-
-                // Invisible UIKit host for iOS 27.1 UIHingeInteraction & system edge-gesture deferral
-                HingeSensorView { statusRaw, angleDeg in
-                    vm.updateHinge(statusRaw: statusRaw, angleDegrees: angleDeg, viewportSize: size)
-                }
-                .frame(width: 0, height: 0)
-                .allowsHitTesting(false)
-
-                if laptopActive {
-                    surfaceLaptopClamshellLayout(geo: geo)
-                        .transition(.opacity)
-                } else {
-                    surfaceStudioOpenLayout(geo: geo)
-                        .transition(.opacity)
-                }
-
-                if !vm.isVMRunning {
-                    surfaceHeroBootOverlay(viewportSize: size, laptopActive: laptopActive)
-                        .padding(20)
-                        .frame(
-                            maxWidth: .infinity,
-                            maxHeight: laptopActive ? size.height * 0.50 : .infinity,
-                            alignment: .center
-                        )
-                        .frame(maxHeight: .infinity, alignment: laptopActive ? .top : .center)
-                }
+        // A reader that ignores the safe area reads its insets as zero (measured on the iOS 27.2
+        // simulator), so the outer reader stays inside it, for the software keyboard only: the
+        // status bar and home indicator are hidden, and the picture's margins come from the
+        // display's corners and cameras instead. The inner reader spans the whole window.
+        GeometryReader { safe in
+            let keyboardInset = vm.systemKeyboardVisible ? safe.safeAreaInsets.bottom : 0
+            GeometryReader { geo in
+                windowContent(geo: geo, keyboardInset: keyboardInset)
             }
-            .onChange(of: size) { _, newSize in
-                WinIOSBridge.shared.updateScreenSize(newSize, scale: UIScreen.main.scale)
-            }
-            .sheet(item: $vm.activeSafariURL) { item in
-                SafariSheet(url: item.url)
-                    .ignoresSafeArea()
-                    .preferredColorScheme(.dark)
-            }
+            .ignoresSafeArea()
         }
-        .ignoresSafeArea()
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .defersSystemGestures(on: .all)
     }
 
-    // MARK: - 1. Sleek Midnight-Sapphire Surface Laptop Ultra Clamshell Mode (Folded)
-
     @ViewBuilder
-    private func surfaceLaptopClamshellLayout(geo: GeometryProxy) -> some View {
-        let totalW = geo.size.width
-        let totalH = geo.size.height
-        let lidH = (totalH * 0.50).rounded(.down)
-        let deckH = max(180.0, totalH - lidH)
-        let topCameraBezel = max(geo.safeAreaInsets.top > 20 ? geo.safeAreaInsets.top - 8 : 9.0, 9.0)
-
-        VStack(spacing: 0) {
-            // TOP 50%: Razor-Bezel Obsidian-Glass Surface Display Lid
-            ZStack {
-                // Anodized Midnight-Obsidian Lid Chassis + Diamond-Cut Outer Rim
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color(red: 0.038, green: 0.046, blue: 0.072),
-                                Color(red: 0.020, green: 0.024, blue: 0.038),
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(
-                                LinearGradient(
-                                    colors: [
-                                        Color(red: 0.64, green: 0.75, blue: 0.96).opacity(0.28),
-                                        Color(red: 0.45, green: 0.56, blue: 0.78).opacity(0.10),
-                                        Color.black.opacity(0.60),
-                                    ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                ),
-                                lineWidth: 0.85
-                            )
-                    )
-
-                VStack(spacing: 0) {
-                    // Top Micro-Bezel with Windows Hello Studio Camera + IR Sensor Array
-                    ZStack {
-                        HStack(spacing: 7) {
-                            Circle()
-                                .fill(Color(red: 0.10, green: 0.12, blue: 0.18))
-                                .frame(width: 3.5, height: 3.5)
-                            ZStack {
-                                Circle()
-                                    .fill(Color(red: 0.05, green: 0.07, blue: 0.12))
-                                    .frame(width: 5.5, height: 5.5)
-                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.16), lineWidth: 0.4))
-                                Circle()
-                                    .fill(Color(red: 0.45, green: 0.65, blue: 1.0).opacity(0.55))
-                                    .frame(width: 1.6, height: 1.6)
-                                    .offset(x: -0.8, y: -0.8)
-                            }
-                            Circle()
-                                .fill(vm.isJITLive ? Color.white.opacity(0.32) : Color.orange.opacity(0.6))
-                                .frame(width: 2.4, height: 2.4)
-                        }
-                    }
-                    .frame(height: topCameraBezel)
-
-                    // Edge-to-Edge PixelSense-Style Display Glass
-                    MetalDisplayView(
-                        trackpadMode: $vm.trackpadMode,
-                        rightClickArmed: $vm.rightClickArmed,
-                        keyboardVisible: .constant(false),
-                        onThreeFingerTap: {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                                vm.postureMode = .fullScreen
-                            }
-                        }
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 5.5, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 5.5, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.07), lineWidth: 0.5)
-                    )
-                    .padding(.horizontal, 6)
-
-                    // Whisper-Minimal Lower Display Chin (zero toolbar clutter!)
-                    ZStack {
-                        HStack(spacing: 5) {
-                            WindowsLogoMark(size: 7.5, color: Color.white.opacity(0.22))
-                            Text("SURFACE")
-                                .font(.system(size: 7.5, weight: .semibold))
-                                .tracking(2.2)
-                                .foregroundStyle(Color.white.opacity(0.22))
-                        }
-
-                        HStack {
-                            Spacer()
-                            // Discreet posture switch micro-trigger in bottom-right bezel corner
-                            Button {
-                                uiHaptic.impactOccurred(intensity: 0.5)
-                                vm.cyclePostureMode(viewportSize: geo.size)
-                            } label: {
-                                Text(vm.hingeAngleDegrees.map { String(format: "%.0f°", $0) } ?? vm.postureMode.rawValue.uppercased())
-                                    .font(.system(size: 8.0, weight: .medium, design: .monospaced))
-                                    .foregroundStyle(Color.white.opacity(0.28))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 1.5)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(.horizontal, 10)
-                    }
-                    .frame(height: 15)
-                }
-            }
-            .frame(width: totalW, height: lidH)
-
-            // BOTTOM 50%: Midnight-Sapphire CNC Aluminum Surface Keyboard + Haptic Glass Touchpad Deck
-            LaptopDeckView(vm: vm)
-                .frame(width: totalW, height: deckH)
-        }
-        .frame(width: totalW, height: totalH)
-    }
-
-    // MARK: - 2. Open / Unfolded Surface Book Studio Mode (180° Flat Inner / Landscape Canvas)
-
-    @ViewBuilder
-    private func surfaceStudioOpenLayout(geo: GeometryProxy) -> some View {
-        let w = geo.size.width
-        let h = geo.size.height
-        let isPortrait = h > w
-        let safeTop = max(geo.safeAreaInsets.top + 8.0, isPortrait ? 54.0 : 12.0)
-        let safeBottom = max(geo.safeAreaInsets.bottom + 8.0, 12.0)
+    private func windowContent(geo: GeometryProxy, keyboardInset: CGFloat) -> some View {
+        let size = geo.size
+        let fold = activeFold(in: geo)
+        let laptopActive = vm.isLaptopLayoutActive(fold: fold)
+        let layout = makeLayout(geo: geo, fold: fold, laptop: laptopActive, keyboardInset: keyboardInset)
+        // The boot card lives in the pane before the crease (the lid in laptop layout), inside the
+        // picture's margins.
+        let pane = PostureResolver.primaryPane(windowSize: size, fold: fold, laptop: laptopActive)
+            .intersection(layout.margins.inset(layout.area))
 
         ZStack {
-            // Sculpted Obsidian-Sapphire Studio Backdrop (eliminates dead-flat black letterbox bars!)
-            studioObsidianBackdrop(size: geo.size)
+            Color.black.ignoresSafeArea()
 
-            if isPortrait {
-                // Unfolded Portrait Studio Canvas: Framed PixelSense Display + Sleek Studio Telemetry & Quick Deck
-                VStack(spacing: 14) {
-                    Spacer(minLength: safeTop + (vm.controlBarVisible ? 44 : 8))
+            // Invisible UIKit host for iOS 27.1 UIHingeInteraction & system edge-gesture deferral
+            HingeSensorView { statusRaw, angleDeg in
+                vm.updateHinge(statusRaw: statusRaw, angleDegrees: angleDeg)
+            }
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
 
-                    // Precision Diamond-Cut Framed Display
-                    framedStudioDisplay(
-                        maxWidth: w - 20,
-                        maxHeight: min((w - 20) * 0.76, h * 0.64)
-                    )
-
-                    // Subtle Monospaced Hardware Spec Strip + Studio Quick Pad
-                    surfaceStudioFooterStrip(viewportSize: geo.size)
-                        .padding(.horizontal, 18)
-
-                    Spacer(minLength: safeBottom)
-                }
+            if laptopActive {
+                laptopLayout(size: size, layout: layout)
+                    .transition(.opacity)
             } else {
-                // Landscape Open Canvas: Maximum Edge-to-Edge Framed Display
-                framedStudioDisplay(
-                    maxWidth: w - 16,
-                    maxHeight: h - 14
-                )
+                canvas(layout.picture, in: layout.area, keyboardVisible: $vm.systemKeyboardVisible, followsTextFocus: true)
+                    .transition(.opacity)
             }
 
-            // Floating Smoked-Obsidian Surface Command Pill
-            VStack {
-                if vm.controlBarVisible {
-                    surfaceStudioCommandPill(viewportSize: geo.size)
-                        .padding(.top, safeTop)
-                        .padding(.horizontal, 14)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                } else {
-                    HStack {
-                        Spacer()
-                        Button {
-                            uiHaptic.impactOccurred()
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                                vm.controlBarVisible = true
-                            }
-                        } label: {
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(vm.isJITLive ? Color.white.opacity(0.85) : Color.orange)
-                                    .frame(width: 5, height: 5)
-                                WindowsLogoMark(size: 10, color: .white.opacity(0.90))
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                            .background(Color(red: 0.05, green: 0.065, blue: 0.11).opacity(0.82), in: Capsule())
-                            .overlay(
-                                Capsule()
-                                    .strokeBorder(Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.24), lineWidth: 0.65)
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.top, safeTop)
-                        .padding(.trailing, 16)
-                    }
-                }
-                Spacer()
+            if !vm.isVMRunning {
+                BootCard(vm: vm)
+                    .padding(20)
+                    .frame(width: pane.width, height: pane.height)
+                    .position(x: pane.midX, y: pane.midY)
             }
+
+            SystemBarEdgeReader { edge in
+                toolbar(barEdge: edge, windowSize: size, fold: fold, laptop: laptopActive, layout: layout)
+            }
+        }
+        // Windows' tablet posture follows the layout: the deck is the keyboard.
+        .onChange(of: laptopActive, initial: true) { _, laptop in
+            WinIOSBridge.shared.setLaptopPosture(laptop)
+            vm.laptopLayoutShowing = laptop
+            // The deck is the keyboard there. Left on, the software keyboard would come back with the
+            // studio layout and its inset would be counted while nothing shows.
+            if laptop { vm.systemKeyboardVisible = false }
+        }
+        // One request for the canvas that is showing; the model debounces it.
+        .onChange(of: layout.picture?.size, initial: true) { _, guest in
+            vm.requestGuestSize(guest)
+        }
+        .onChange(of: layout.report(window: size, scale: displayScale), initial: true) { _, report in
+            WinIOSBridge.shared.updateGeometryReport(report)
+        }
+        .sheet(item: $vm.activeSafariURL) { item in
+            SafariSheet(url: item.url)
+                .ignoresSafeArea()
+                .preferredColorScheme(.dark)
+        }
+        .sheet(isPresented: $showingSettings) {
+            SettingsSheet(vm: vm)
+                .preferredColorScheme(.dark)
+        }
+        .alert("Hibernate Windows?", isPresented: $confirmingHibernate) {
+            Button("Hibernate") {
+                WinIOSBridge.shared.requestHibernate()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Windows saves your open apps and picks up where you left off next time. Needs WindowsiOS Tools.")
+        }
+        .alert("Shut down Windows?", isPresented: $confirmingShutDown) {
+            Button("Shut Down", role: .destructive) {
+                WinIOSBridge.shared.pressPowerButton()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Windows gets a power-button press and closes its apps.")
         }
     }
 
-    private func studioObsidianBackdrop(size: CGSize) -> some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.024, green: 0.030, blue: 0.050),
-                    Color(red: 0.012, green: 0.015, blue: 0.026),
-                    Color(red: 0.030, green: 0.038, blue: 0.064),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-
-            // Subtle sculpted metallic light ribbon behind the display
-            EllipticalGradient(
-                colors: [
-                    Color(red: 0.20, green: 0.28, blue: 0.46).opacity(0.22),
-                    Color(red: 0.08, green: 0.12, blue: 0.22).opacity(0.06),
-                    Color.clear,
-                ],
-                center: .init(x: 0.5, y: 0.44),
-                startRadiusFraction: 0.05,
-                endRadiusFraction: 0.62
-            )
+    /// The hinge's division reserved region (iOS 27.1), active only while the Duo is partially
+    /// folded. Read from this full-window reader; the 0x0 hinge host never intersects the fold.
+    private func activeFold(in geo: GeometryProxy) -> FoldGeometry? {
+        var divisionFrames: [CGRect] = []
+        if #available(iOS 27.1, *) {
+            divisionFrames = geo.reservedRegions(kind: .division).filter(\.isActive).map(\.frame)
         }
-        .ignoresSafeArea()
+        return PostureResolver.fold(divisionFrames: divisionFrames, hinge: vm.hingeStatus, windowSize: geo.size)
     }
 
-    private func framedStudioDisplay(maxWidth: CGFloat, maxHeight: CGFloat) -> some View {
-        let fbAspect: CGFloat = (vm.fbWidth > 0 && vm.fbHeight > 0)
-            ? CGFloat(vm.fbWidth) / CGFloat(vm.fbHeight)
-            : (4.0 / 3.0)
-        let fittedW = min(maxWidth, maxHeight * fbAspect)
-        let fittedH = fittedW / fbAspect
+    /// The display's corner radii (iOS 27.0), or a typical 55 pt where the system gives none.
+    private func displayCorners(in geo: GeometryProxy) -> (corners: DisplayCorners, fromSystem: Bool) {
+        if #available(iOS 27.0, *), let r = geo.concentricCornerRadii {
+            return (DisplayCorners(topLeading: r.topLeading, topTrailing: r.topTrailing,
+                                   bottomLeading: r.bottomLeading, bottomTrailing: r.bottomTrailing), true)
+        }
+        return (.fallback, false)
+    }
 
-        return ZStack {
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(Color.black)
-                .shadow(color: .black.opacity(0.75), radius: 26, x: 0, y: 12)
+    /// Camera cutouts (occlusion reserved regions, iOS 27.1) in window coordinates, the ones that
+    /// are off included so the geometry report shows them.
+    private func cameraRegions(in geo: GeometryProxy) -> [(frame: CGRect, isActive: Bool)] {
+        guard #available(iOS 27.1, *) else { return [] }
+        return geo.reservedRegions(kind: .occlusion, options: .includeInactive, layoutDirectionBehavior: .fixed)
+            .map { ($0.frame, $0.isActive) }
+    }
 
+    /// What the software keyboard always leaves of the picture, in points.
+    private static let leastPictureHeight: CGFloat = 120
+
+    private func makeLayout(geo: GeometryProxy, fold: FoldGeometry?, laptop: Bool, keyboardInset: CGFloat) -> SessionLayout {
+        let size = geo.size
+        let (corners, fromSystem) = displayCorners(in: geo)
+        let regions = cameraRegions(in: geo)
+        // Only a camera that is on takes room. The inner one sits under the display and shows the
+        // picture through while it is off (measured on the Duo: counting it cost a 62 pt band along
+        // the whole top edge); the picture moves aside if it ever starts.
+        let cameras = regions.filter(\.isActive).map(\.frame)
+        let split = PostureResolver.laptopSplit(height: size.height, fold: fold)
+        let window = CGRect(origin: .zero, size: size)
+        let area = laptop ? CGRect(x: 0, y: 0, width: size.width, height: split.lid) : window
+        var margins = ScreenMargins.insets(in: area, radii: corners, cameras: cameras,
+                                           mode: laptop ? .lid : .fullWindow, scale: displayScale)
+        // The software keyboard (studio only) still pushes Windows up, but not off the screen: a canvas
+        // squeezed to nothing would be removed, which dismisses the keyboard that squeezed it.
+        if !laptop {
+            let room = max(margins.bottom, area.height - margins.top - Self.leastPictureHeight)
+            margins.bottom = min(max(margins.bottom, keyboardInset), room)
+        }
+        let deckArea = CGRect(x: 0, y: split.lid + split.crease, width: size.width, height: split.deck)
+        return SessionLayout(
+            corners: corners, cornersFromSystem: fromSystem, cameras: regions.map(\.frame), camerasActive: regions.map(\.isActive),
+            area: area, margins: margins,
+            picture: GuestPicture(in: margins.inset(area), scale: displayScale),
+            deckArea: deckArea,
+            deckMargins: ScreenMargins.insets(in: deckArea, radii: corners, cameras: cameras, mode: .deck, scale: displayScale)
+        )
+    }
+
+    private func setToolbarOpen(_ open: Bool) {
+        withAnimation(.toolbar(reduceMotion: reduceMotion)) { toolbarOpen = open }
+    }
+
+    private func setPosture(_ mode: PostureMode) {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+            vm.postureMode = mode
+            if mode == .laptop { vm.systemKeyboardVisible = false }
+        }
+    }
+
+    // MARK: - Layouts
+
+    /// Windows, full screen. The canvas fills `area` (the window, or the lid) to the display's
+    /// edges. The picture inside it holds exactly the guest's pixels and stops short of the rounded
+    /// corners, so nothing Windows draws is cut off, and the canvas carries the picture's edge
+    /// pixels on to the glass, so nothing around it is black.
+    @ViewBuilder
+    private func canvas(_ picture: GuestPicture?, in area: CGRect, keyboardVisible: Binding<Bool>,
+                        followsTextFocus: Bool) -> some View {
+        if let picture {
             MetalDisplayView(
                 trackpadMode: $vm.trackpadMode,
                 rightClickArmed: $vm.rightClickArmed,
-                keyboardVisible: $vm.systemKeyboardVisible,
-                onThreeFingerTap: {
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                        vm.controlBarVisible.toggle()
-                    }
-                }
+                keyboardVisible: keyboardVisible,
+                pictureFrame: picture.frame.offsetBy(dx: -area.minX, dy: -area.minY),
+                onThreeFingerTap: { setToolbarOpen(true) },
+                onGuestTap: followsTextFocus ? { x, y in vm.canvasTapped(guestX: x, guestY: y) } : nil,
+                onReturnKey: followsTextFocus ? { vm.returnKeyTyped() } : nil
             )
-            .clipShape(RoundedRectangle(cornerRadius: 8.5, style: .continuous))
-            .padding(3.5)
+            .frame(width: area.width, height: area.height)
+            .position(x: area.midX, y: area.midY)
         }
-        .frame(width: fittedW + 7, height: fittedH + 7)
-        .overlay(
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.32),
-                            Color(red: 0.44, green: 0.54, blue: 0.74).opacity(0.12),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 0.85
-                )
-        )
     }
 
-    private func surfaceStudioFooterStrip(viewportSize: CGSize) -> some View {
-        VStack(spacing: 10) {
-            HStack {
-                Text("DEVICE_NAME = SURFACE_DUO_ULTRA")
-                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                    .tracking(1.1)
-                    .foregroundStyle(Color(red: 0.72, green: 0.80, blue: 0.95).opacity(0.55))
+    /// Windows on the lid, the keyboard deck below; the split lands on the crease when folded.
+    private func laptopLayout(size: CGSize, layout: SessionLayout) -> some View {
+        VStack(spacing: 0) {
+            canvas(layout.picture, in: layout.area, keyboardVisible: .constant(false), followsTextFocus: false)
+                .frame(width: size.width, height: layout.area.height)
 
-                Spacer()
-
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(vm.isJITLive ? Color.white.opacity(0.75) : Color.orange)
-                        .frame(width: 4.5, height: 4.5)
-                    Text("WIN11 ARM64 · 4.5 GB")
-                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color.white.opacity(0.45))
-                }
+            // The physical crease while half-folded: nothing interactive here.
+            if layout.deckArea.minY > layout.area.maxY {
+                Color.black
+                    .frame(width: size.width, height: layout.deckArea.minY - layout.area.maxY)
             }
 
-            // Quick Studio Action Strip for Portrait Open Mode
-            HStack(spacing: 8) {
-                studioQuickTile(title: "Laptop Deck", icon: "laptopcomputer", prominent: true) {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                        vm.postureMode = .laptop
-                        vm.systemKeyboardVisible = false
-                    }
-                    SceneOrientationController.alignForLaptopPostureIfLandscape(size: viewportSize)
-                }
-
-                studioQuickTile(title: "Antigravity", icon: "sparkles") {
-                    vm.launchGuestAntigravity()
-                }
-
-                studioQuickTile(title: "Edge Web", icon: "globe") {
-                    vm.launchGuestEdgeBrowser()
-                }
-
-                studioQuickTile(title: "Explorer", icon: "folder") {
-                    WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe3)], key: 0x08)
-                }
-
-                studioQuickTile(title: "Keyboard", icon: "keyboard", active: vm.systemKeyboardVisible) {
-                    vm.systemKeyboardVisible.toggle()
-                }
-            }
+            LaptopDeckView(vm: vm, insets: layout.deckMargins)
+                .frame(width: size.width, height: layout.deckArea.height)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color(red: 0.055, green: 0.070, blue: 0.115).opacity(0.72))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Color(red: 0.68, green: 0.78, blue: 0.98).opacity(0.16), lineWidth: 0.65)
-                )
-        )
+        .frame(width: size.width, height: size.height, alignment: .top)
     }
 
-    private func studioQuickTile(
-        title: String,
-        icon: String,
-        active: Bool = false,
-        prominent: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button {
-            uiHaptic.impactOccurred(intensity: 0.6)
-            action()
+    // MARK: - Toolbar
+
+    /// The bar runs down the side the system keeps its own bars on, where it keeps them on a side;
+    /// otherwise it comes from the top, clear of the Windows taskbar.
+    private func toolbar(barEdge: HorizontalEdge?, windowSize: CGSize, fold: FoldGeometry?, laptop: Bool,
+                         layout: SessionLayout) -> some View {
+        let onRight = barEdge.map { ($0 == .trailing) == (layoutDirection == .leftToRight) } ?? false
+        let outer = barEdge == nil
+            ? PostureResolver.primaryPane(windowSize: windowSize, fold: fold, laptop: laptop)
+            : PostureResolver.sidePane(windowSize: windowSize, fold: fold, laptop: laptop, onRight: onRight)
+        return SessionToolbar(isOpen: $toolbarOpen, dock: barEdge.map(ToolbarDock.side) ?? .top,
+                              outer: outer, region: outer.intersection(layout.margins.inset(layout.area)),
+                              cameras: zip(layout.cameras, layout.camerasActive).filter(\.1).map(\.0)) {
+            toolbarItems(laptopActive: laptop)
+        }
+    }
+
+    @ViewBuilder
+    private func toolbarItems(laptopActive: Bool) -> some View {
+        if vm.isVMRunning {
+            if !laptopActive {
+                ToolbarButton(title: "Keyboard",
+                              systemImage: vm.systemKeyboardVisible ? "keyboard.chevron.compact.down" : "keyboard",
+                              isOn: vm.systemKeyboardVisible) {
+                    vm.toggleSystemKeyboard()
+                }
+            }
+            ToolbarButton(title: "Trackpad", systemImage: "rectangle.and.hand.point.up.left", isOn: vm.trackpadMode) {
+                vm.trackpadMode.toggle()
+            }
+            ToolbarButton(title: "Start") {
+                WinIOSBridge.shared.sendWindowsKey()
+            } icon: {
+                StartMark()
+            }
+        }
+        Menu {
+            Picker("Screen", selection: Binding(get: { vm.postureMode }, set: { mode in
+                setToolbarOpen(false)
+                setPosture(mode)
+            })) {
+                ForEach(PostureMode.allCases, id: \.self) { mode in
+                    Label(mode.title, systemImage: mode.iconName).tag(mode)
+                }
+            }
         } label: {
-            VStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 13.5, weight: .medium))
-                Text(title)
-                    .font(.system(size: 10, weight: .medium))
-                    .lineLimit(1)
+            ToolbarItemLabel(title: "Screen") {
+                Image(systemName: (laptopActive ? PostureMode.laptop : PostureMode.fullScreen).iconName)
             }
-            .foregroundStyle(
-                active || prominent
-                    ? Color(red: 0.05, green: 0.07, blue: 0.11)
-                    : Color(red: 0.92, green: 0.95, blue: 1.0)
-            )
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 9)
-            .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(
-                        active || prominent
-                            ? Color(red: 0.88, green: 0.93, blue: 1.0)
-                            : Color(red: 0.10, green: 0.13, blue: 0.20).opacity(0.85)
-                    )
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .strokeBorder(Color.white.opacity(active || prominent ? 0.0 : 0.10), lineWidth: 0.5)
-            )
         }
-        .buttonStyle(.plain)
-    }
-
-    // MARK: - Smoked-Obsidian Surface Studio Floating Command Pill
-
-    private func surfaceStudioCommandPill(viewportSize: CGSize) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                // Authentic 4-pane Start button
-                Button {
-                    uiHaptic.impactOccurred(intensity: 0.65)
-                    WinIOSBridge.shared.sendWindowsKey()
-                } label: {
-                    HStack(spacing: 6) {
-                        WindowsLogoMark(size: 10.5, color: Color(red: 0.05, green: 0.07, blue: 0.11))
-                        Text("Start")
-                            .font(.system(size: 11.5, weight: .semibold))
-                            .foregroundStyle(Color(red: 0.05, green: 0.07, blue: 0.11))
+        .tint(.primary)
+        Menu {
+            Section {
+                if vm.isVMRunning {
+                    Button("Task Manager", systemImage: "waveform.path.ecg") {
+                        setToolbarOpen(false)
+                        WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe0), NSNumber(value: 0xe1)], key: 0x29)
                     }
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 6.5)
-                    .background(Color(red: 0.90, green: 0.94, blue: 1.0), in: Capsule())
                 }
-                .buttonStyle(.plain)
-
-                studioPillItem(icon: "laptopcomputer", label: "Laptop") {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                        vm.postureMode = .laptop
-                        vm.systemKeyboardVisible = false
+                Button("Settings", systemImage: "gearshape") {
+                    setToolbarOpen(false)
+                    showingSettings = true
+                }
+            }
+            if vm.isVMRunning {
+                Section {
+                    Button("Hibernate", systemImage: "moon.zzz") {
+                        setToolbarOpen(false)
+                        confirmingHibernate = true
                     }
-                    SceneOrientationController.alignForLaptopPostureIfLandscape(size: viewportSize)
-                }
-
-                studioPillItem(icon: "sparkles", label: "Antigravity") {
-                    vm.launchGuestAntigravity()
-                }
-
-                studioPillItem(icon: "globe", label: "Edge") {
-                    vm.launchGuestEdgeBrowser()
-                }
-
-                studioPillItem(
-                    icon: vm.useSafariForOAuth ? "safari" : "network",
-                    label: vm.useSafariForOAuth ? "OAuth: Safari" : "OAuth: Edge",
-                    active: vm.useSafariForOAuth
-                ) {
-                    vm.toggleOAuthBrowserMode()
-                }
-
-                studioPillItem(icon: "keyboard", label: "Keys", active: vm.systemKeyboardVisible) {
-                    vm.systemKeyboardVisible.toggle()
-                }
-
-                studioPillItem(
-                    icon: vm.trackpadMode ? "rectangle.and.hand.point.up.left" : "hand.tap",
-                    label: vm.trackpadMode ? "Trackpad" : "Touch",
-                    active: vm.trackpadMode
-                ) {
-                    vm.trackpadMode.toggle()
-                }
-
-                studioPillItem(icon: "computermouse", label: "R-Click", active: vm.rightClickArmed) {
-                    vm.rightClickArmed.toggle()
-                }
-
-                studioPillItem(icon: "waveform.path.ecg", label: "Task Mgr") {
-                    WinIOSBridge.shared.sendKeyCombo(withModifiers: [NSNumber(value: 0xe0), NSNumber(value: 0xe1)], key: 0x29)
-                }
-
-                studioPillItem(icon: "power", label: "") {
-                    WinIOSBridge.shared.pressPowerButton()
-                }
-
-                studioPillItem(icon: "chevron.up", label: "") {
-                    withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                        vm.controlBarVisible = false
+                    Button("Shut Down", systemImage: "power", role: .destructive) {
+                        setToolbarOpen(false)
+                        confirmingShutDown = true
                     }
                 }
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 6.5)
-            .background(
-                Capsule()
-                    .fill(Color(red: 0.045, green: 0.058, blue: 0.096).opacity(0.88))
-            )
-            .background(.ultraThinMaterial, in: Capsule())
-            .overlay(
-                Capsule()
-                    .strokeBorder(Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.22), lineWidth: 0.65)
-            )
-            .shadow(color: .black.opacity(0.55), radius: 14, x: 0, y: 6)
-        }
-    }
-
-    private func studioPillItem(
-        icon: String,
-        label: String,
-        active: Bool = false,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button {
-            uiHaptic.impactOccurred(intensity: 0.6)
-            action()
         } label: {
-            HStack(spacing: 4.5) {
-                Image(systemName: icon)
-                    .font(.system(size: 11.5, weight: .medium))
-                if !label.isEmpty {
-                    Text(label)
-                        .font(.system(size: 11.5, weight: .medium))
-                }
+            ToolbarItemLabel(title: "More") {
+                Image(systemName: "ellipsis")
             }
-            .foregroundStyle(
-                active
-                    ? Color(red: 0.05, green: 0.07, blue: 0.11)
-                    : Color(red: 0.92, green: 0.95, blue: 1.0)
-            )
-            .padding(.horizontal, label.isEmpty ? 9 : 10.5)
-            .padding(.vertical, 6.5)
-            .background(
-                Capsule().fill(
-                    active
-                        ? Color(red: 0.86, green: 0.92, blue: 1.0)
-                        : Color.white.opacity(0.07)
-                )
-            )
         }
-        .buttonStyle(.plain)
+        .tint(.primary)
+    }
+}
+
+/// The Windows mark for the Start control. Its size is read inside the toolbar, where Dynamic Type stops
+/// at the size the bar's slots stop at.
+private struct StartMark: View {
+    @ScaledMetric(relativeTo: .title3) private var size: CGFloat = 19
+
+    var body: some View {
+        WindowsLogoMark(size: size, color: .white)
+    }
+}
+
+/// The side the system keeps its own bars on in this pose (iOS 27.1: the outer display, the inner
+/// display in landscape), or nil where it keeps them across the top and bottom.
+private struct SystemBarEdgeReader<Content: View>: View {
+    @ViewBuilder var content: (HorizontalEdge?) -> Content
+
+    var body: some View {
+        if #available(iOS 27.1, *) {
+            Reader(content: content)
+        } else {
+            content(nil)
+        }
     }
 
-    // MARK: - 3. SURFACE_LAPTOP_ULTRA Boot / Portal Hero Overlay
+    @available(iOS 27.1, *)
+    private struct Reader: View {
+        @Environment(\.toolbarVerticalEdge) private var edge
+        @ViewBuilder var content: (HorizontalEdge?) -> Content
 
-    private func surfaceHeroBootOverlay(viewportSize: CGSize, laptopActive: Bool) -> some View {
-        VStack(spacing: laptopActive ? 11 : 16) {
-            HStack(spacing: 9) {
-                WindowsLogoMark(size: laptopActive ? 14 : 17, color: .white)
-                Text("SURFACE LAPTOP ULTRA")
-                    .font(.system(size: laptopActive ? 13.5 : 15.5, weight: .semibold, design: .monospaced))
-                    .tracking(2.0)
-                    .foregroundStyle(.white)
+        var body: some View { content(edge) }
+    }
+}
+
+// MARK: - Settings
+
+private struct SettingsSheet: View {
+    @ObservedObject var vm: VMViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle("Keyboard for Text Fields", isOn: $vm.autoKeyboard)
+                } footer: {
+                    Text(vm.textFocusAgentPresent
+                         ? "In full screen, the keyboard comes up when you tap a text field in Windows and goes away when you tap elsewhere."
+                         : "In full screen, the keyboard comes up when you tap a text field in Windows. This needs the latest WindowsiOS Tools installed in Windows.")
+                }
+                Section {
+                    Toggle("Sign In with Safari", isOn: Binding(get: { vm.useSafariForOAuth }, set: { on in
+                        if on != vm.useSafariForOAuth { vm.toggleOAuthBrowserMode() }
+                    }))
+                } footer: {
+                    Text("Sign-in pages that Windows apps open come up in Safari here, with your passkeys and saved passwords. When this is off they open in Edge inside Windows.")
+                }
             }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .onAppear { vm.refreshTextFocusAgent() }
+    }
+}
 
-            Text("DEVICE_NAME = IPHONE_DUO_ARM64")
-                .font(.system(size: 10, weight: .regular, design: .monospaced))
-                .tracking(1.4)
-                .foregroundStyle(Color(red: 0.72, green: 0.82, blue: 1.0).opacity(0.65))
+/// What the window's geometry resolved to: the picture's margins and canvas for the layout that
+/// is showing (the lid in laptop layout), and the deck's margins.
+private struct SessionLayout {
+    let corners: DisplayCorners
+    let cornersFromSystem: Bool
+    let cameras: [CGRect]
+    let camerasActive: [Bool]
+    /// The part of the window the picture occupies: the window, or the lid.
+    let area: CGRect
+    let margins: PictureInsets
+    let picture: GuestPicture?
+    let deckArea: CGRect
+    let deckMargins: PictureInsets
 
-            Text(vm.vmStatusText)
-                .font(.system(size: 12, weight: .regular))
-                .foregroundStyle(.white.opacity(0.82))
-                .multilineTextAlignment(.center)
+    /// Lines for Documents/boot_status.txt, so the real numbers can be read from the phone.
+    func report(window: CGSize, scale: CGFloat) -> String {
+        func f(_ v: CGFloat) -> String { String(format: "%.2f", v) }
+        func edges(_ m: PictureInsets) -> String { "top=\(f(m.top)) left=\(f(m.left)) bottom=\(f(m.bottom)) right=\(f(m.right))" }
+        func rect(_ r: CGRect) -> String { "\(f(r.minX)),\(f(r.minY)) \(f(r.width))x\(f(r.height))" }
+        let cameraText = cameras.isEmpty ? "none"
+            : zip(cameras, camerasActive).map { "\(rect($0)) active=\($1)" }.joined(separator: "; ")
+        let canvas = picture.map { rect($0.frame) } ?? "none"
+        let guest = picture.map { "\($0.size.width)x\($0.size.height)" } ?? "none"
+        return """
+        window_pts: \(f(window.width))x\(f(window.height))
+        display_scale: \(f(scale))
+        corner_radii_pts: tl=\(f(corners.topLeading)) tr=\(f(corners.topTrailing)) bl=\(f(corners.bottomLeading)) br=\(f(corners.bottomTrailing)) source=\(cornersFromSystem ? "system" : "fallback")
+        camera_frames_pts: \(cameraText)
+        picture_area_pts: \(rect(area))
+        picture_margins_pts: \(edges(margins))
+        canvas_pts: \(canvas)
+        guest_target: \(guest)
+        deck_area_pts: \(rect(deckArea))
+        deck_margins_pts: \(edges(deckMargins))
+
+        """
+    }
+}
+
+// MARK: - Boot card
+
+private struct BootCard: View {
+    @ObservedObject var vm: VMViewModel
+
+    var body: some View {
+        ViewThatFits(in: .vertical) {
+            card
+            ScrollView { card }
+                .scrollBounceBehavior(.basedOnSize)
+        }
+        .padding(24)
+        .frame(maxWidth: 420)
+        .glassEffect(.regular, in: .rect(cornerRadius: 28))
+    }
+
+    private var card: some View {
+        VStack(spacing: 18) {
+            WindowsLogoMark(size: 36, color: .white)
+                .accessibilityHidden(true)
+
+            VStack(spacing: 6) {
+                Text("Windows 11")
+                    .font(.title2.weight(.semibold))
+                Text(vm.stikDebugStatus ?? vm.vmStatusText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
 
             if vm.isUnpacking {
-                ProgressView(value: vm.unpackProgress, total: 1.0)
-                    .tint(.white)
+                ProgressView(value: vm.unpackProgress)
                     .frame(maxWidth: 260)
             }
 
-            HStack(spacing: 14) {
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(vm.isJITLive ? Color.white : Color.orange)
-                        .frame(width: 5.5, height: 5.5)
-                    Text(vm.isJITLive ? "TXM JIT LIVE" : vm.jitStatusText.uppercased())
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.white.opacity(0.80))
+            VStack(alignment: .leading, spacing: 8) {
+                Label(vm.isJITLive ? "JIT enabled" : vm.jitStatusText,
+                      systemImage: vm.isJITLive ? "bolt.fill" : "bolt.slash")
+                if vm.guestRAMMB > 0 {
+                    Label("\(Self.size(megabytes: vm.guestRAMMB)) for Windows", systemImage: "memorychip")
                 }
-
-                Text("·")
-                    .foregroundStyle(.white.opacity(0.35))
-
-                Text("\(vm.availableMemoryMB) MB HEADROOM")
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.60))
+                Label("\(Self.size(megabytes: vm.availableMemoryMB)) headroom", systemImage: "gauge.with.dots.needle.33percent")
             }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
 
             if !vm.isUnpacking {
-                HStack(spacing: 10) {
-                    if !vm.isJITLive {
-                        Button {
-                            vm.requestStikDebugJIT()
-                        } label: {
-                            Text("ENABLE JIT")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .tracking(1.0)
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 9)
-                                .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.white.opacity(0.24), lineWidth: 0.6))
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    Button {
-                        vm.startOrRetry()
-                    } label: {
-                        Text(vm.isJITLive ? "BOOT WINDOWS 11" : "RETRY BOOT")
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .tracking(1.1)
-                            .foregroundStyle(Color(red: 0.04, green: 0.05, blue: 0.09))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 9)
-                            .background(Color(red: 0.92, green: 0.95, blue: 1.0), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    }
-                    .buttonStyle(.plain)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) { buttons }
+                    VStack(spacing: 12) { buttons }
                 }
+                .controlSize(.large)
             }
         }
-        .padding(laptopActive ? 18 : 26)
-        .frame(maxWidth: 420)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(red: 0.04, green: 0.052, blue: 0.088).opacity(0.92))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.74, green: 0.84, blue: 1.0).opacity(0.32),
-                            Color(red: 0.40, green: 0.50, blue: 0.72).opacity(0.10),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 0.8
-                )
-        )
-        .shadow(color: .black.opacity(0.70), radius: 24, x: 0, y: 10)
+    }
+
+    @ViewBuilder
+    private var buttons: some View {
+        if !vm.isJITLive {
+            Button("Enable JIT", systemImage: "bolt") {
+                vm.requestStikDebugJIT()
+            }
+            .buttonStyle(.glass)
+        }
+        Button(vm.isJITLive ? "Start Windows" : "Try Again",
+               systemImage: vm.isJITLive ? "play.fill" : "arrow.clockwise") {
+            vm.startOrRetry()
+        }
+        .buttonStyle(.glassProminent)
+    }
+
+    private static func size(megabytes: UInt64) -> String {
+        Int64(megabytes << 20).formatted(.byteCount(style: .memory))
     }
 }

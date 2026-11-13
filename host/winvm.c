@@ -2,6 +2,8 @@
 #include "winvm.h"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <TargetConditionals.h>
 #include <os/lock.h>
 #include <pthread.h>
@@ -17,6 +19,7 @@
 
 #include "audio_mac.h"
 #include "dispatch.h"
+#include "mmu.h"
 #include "net_slirp.h"
 #include "share.h"
 
@@ -34,13 +37,76 @@ static _Atomic int stop_requested;
 static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
 static CFTypeRef display_layer;
 static int display_layer_set;
+static double display_content[4]; /* the picture's place in the layer; no area: all of it */
 static _Atomic(HvFbDisplay *) display_fb;
 
 static void (*exit_cb)(int reason);
 
 int hv_winvm_share_up(void) { return share_on; }
 HvMachine *hv_winvm_machine(void) { return &m; }
+
+/* What each device would raise an interrupt for, read without the devices' locks: a diagnostic of a machine
+   that is stuck, where a torn value does not matter. */
+static void dump_virtio(FILE *f, const char *name, const HvVirtio *v) {
+    fprintf(f, "%s: status=%02x isr=%u driver_ok=%d", name, v->status, v->isr, (v->status & 4) != 0);
+    for (int q = 0; q < v->nq; q++) {
+        uint16_t flags = 0xffff;
+        const HvVirtq *vq = &v->q[q];
+        /* From RAM only, as everything this dump reads from guest addresses: a device read can change state. */
+        const void *p = vq->enabled && vq->avail ? hv_phys_ptr(v->m, vq->avail, 2) : NULL;
+        if (p) memcpy(&flags, p, 2);
+        fprintf(f, " q%d: enabled=%u avail_flags=%x", q, vq->enabled, flags);
+    }
+    fprintf(f, "\n");
+}
+
+void hv_winvm_dump_devices(FILE *f) {
+    if (board.pcie) hv_pcie_dump(board.pcie, f);
+    if (board.net) dump_virtio(f, "virtio-net", &board.net->vio);
+    if (board.gpu) dump_virtio(f, "virtio-gpu", &board.gpu->vio);
+    if (board.hda) {
+        const HvHda *d = board.hda;
+        fprintf(f, "hda: gctl=%x intctl=%x wakeen=%x statests=%x rirbctl=%x rirbsts=%x", d->gctl, d->intctl, d->wakeen, d->statests, d->rirbctl, d->rirbsts);
+        for (int s = 0; s < HV_HDA_NSTREAMS; s++)
+            if (d->st[s].ctl || d->st[s].sts || d->st[s].running)
+                fprintf(f, " stream%d: ctl=%x sts=%x running=%d lpib=%x", s, d->st[s].ctl, d->st[s].sts, d->st[s].running, d->st[s].lpib);
+        fprintf(f, "\n");
+    }
+    if (board.usb) {
+        const HvXhci *x = board.usb;
+        fprintf(f, "xhci: usbcmd=%x usbsts=%x", x->usbcmd, x->usbsts);
+        for (int i = 0; i < HV_XHCI_INTRS; i++) fprintf(f, " iman%d=%x", i, x->intr[i].iman);
+        fprintf(f, "\n");
+    }
+    for (int n = 0; n < 2; n++) {
+        const HvNvme *nv = n ? board.nvme1 : board.nvme0;
+        if (!nv) continue;
+        fprintf(f, "nvme%d: cc=%x csts=%x intms=%x", n, nv->cc, nv->csts, nv->intms);
+        for (int q = 0; q < HV_NVME_MAX_QUEUES; q++)
+            if (nv->cq[q].valid) fprintf(f, " cq%d: ien=%u pending=%u head=%u tail=%u", q, nv->cq[q].ien, nv->cq[q].irq_pending, nv->cq[q].head, nv->cq[q].tail);
+        fprintf(f, "\n");
+    }
+}
 HvWinVirt *hv_winvm_board(void) { return &board; }
+
+uint64_t hv_winvm_display_flushes(void) {
+    return board.gpu ? __atomic_load_n(&board.gpu->flushes, __ATOMIC_RELAXED) : 0;
+}
+
+void hv_winvm_cpu_insns(HvCpu *cpu, uint64_t pc, uint32_t words[17]) {
+    for (int j = 0; j < 17; j++) {
+        uint64_t va = (pc & ~3ull) + (int64_t)(j * 4 - 32);
+        HvWalk w = {0};
+        hv_mmu_walk(cpu, va, HV_ACC_READ, cpu->el, &w);
+        words[j] = 0;
+        const void *p = w.fsc == 0 ? hv_phys_ptr(cpu->m, w.pa, 4) : NULL;
+        if (p) memcpy(&words[j], p, 4);
+    }
+}
+
+void hv_winvm_set_oauth_mode(int enabled) { hv_share_set_url_handler_enabled(enabled); }
+char *hv_winvm_take_open_url(void) { return hv_share_take_open_url(); }
+int hv_winvm_take_oauth_done(void) { return hv_share_take_oauth_done(); }
 
 const char *hv_winvm_reason_name(int r) {
     switch (r) {
@@ -81,10 +147,14 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
     sigaction(sig, prior, NULL);
 }
 
-static void prepare_cpu_thread(void) {
+static mach_port_t cpu_port[HV_MAX_CPUS]; /* each vCPU's host thread, for its on-core time in perf.csv */
+static uint64_t created_at;                /* mach time hv_winvm_create ran */
+
+static void prepare_cpu_thread(int index) {
     static __thread int done;
     if (done) return;
     done = 1;
+    if (index >= 0 && index < HV_MAX_CPUS) cpu_port[index] = mach_thread_self();
     stack_t ss = {.ss_sp = malloc(1u << 16), .ss_size = 1u << 16, .ss_flags = 0};
     if (ss.ss_sp) sigaltstack(&ss, NULL);
     sigset_t set;
@@ -121,6 +191,17 @@ void hv_winvm_set_display_layer(void *layer) {
     if (previous) CFRelease(previous);
 }
 
+void hv_winvm_set_display_content(double x, double y, double w, double h) {
+    os_unfair_lock_lock(&display_lock);
+    display_content[0] = x;
+    display_content[1] = y;
+    display_content[2] = w;
+    display_content[3] = h;
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    if (fb) hv_fb_metal_set_content(fb, x, y, w, h);
+    os_unfair_lock_unlock(&display_lock);
+}
+
 int hv_winvm_display_size(uint32_t *w, uint32_t *h) {
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     if (!fb) return -1;
@@ -141,6 +222,30 @@ int hv_winvm_save_png(const char *path) {
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     return fb ? hv_fb_save_png(fb, path) : -1;
 }
+
+static void kicker_timer_hint(HvMachine *mm, uint64_t due);
+
+/* The last size asked for. A running VM gets it at once and the next one when it starts: the app asks only
+   when its layout changes, so Windows started again in the same window must come up at this size, not at
+   whatever was asked before the first start. */
+static uint32_t wanted_width, wanted_height;
+
+void hv_winvm_request_display_size(uint32_t width, uint32_t height) {
+    os_unfair_lock_lock(&display_lock);
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    wanted_width = width;
+    wanted_height = height;
+    os_unfair_lock_unlock(&display_lock);
+    if (fb) hv_fb_display_request_size(fb, width, height);
+}
+
+#if !TARGET_OS_IPHONE
+/* The Mac host has no keyboard to raise: HV_FOCUS_LOG prints what the agent reports instead. */
+static void log_text_focus(unsigned long seq, int editable, int inside, void *ctx) {
+    (void)ctx;
+    fprintf(stderr, "text_focus editable=%d inside=%d seq=%lu\n", editable, inside, seq);
+}
+#endif
 
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)
@@ -176,8 +281,10 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!getenv("HV_FLUSH")) hv_knob[HV_K_FLUSH] = 1;
 #endif
 
+    created_at = mach_absolute_time();
     m.log = c->log;
     m.stats_interval = c->stats_interval;
+    m.timer_hint = kicker_timer_hint;
     if (getenv("HV_SLOW_MEM")) m.slow_mem = 1;
     ncpus = c->ncpus < 1 ? 1 : c->ncpus > HV_MAX_CPUS ? HV_MAX_CPUS : c->ncpus;
     m.big_lock_on = ncpus > 1 && getenv("HV_BIG_LOCK") != NULL;
@@ -192,6 +299,10 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
 
     share_on = 0;
     if (c->share_dir && *c->share_dir && c->share_sock && *c->share_sock) {
+        hv_share_clear_hibernate();
+#if !TARGET_OS_IPHONE
+        if (getenv("HV_FOCUS_LOG")) hv_share_set_text_focus_handler(log_text_focus, NULL);
+#endif
         if (hv_share_start(c->share_dir, c->share_sock, NULL) == 0) {
             hv_net_set_share_socket(c->share_sock);
             share_on = 1;
@@ -205,29 +316,87 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     board.poll = board_poll;
 
     os_unfair_lock_lock(&display_lock);
-    if (display_layer_set && board.fb) hv_fb_metal_set_layer(board.fb, (void *)display_layer);
+    if (display_layer_set && board.fb) {
+        hv_fb_metal_set_layer(board.fb, (void *)display_layer);
+        hv_fb_metal_set_content(board.fb, display_content[0], display_content[1], display_content[2], display_content[3]);
+    }
     atomic_store_explicit(&display_fb, board.fb, memory_order_release);
+    uint32_t want_w = wanted_width, want_h = wanted_height;
     os_unfair_lock_unlock(&display_lock);
+    if (want_w && board.fb) hv_fb_display_request_size(board.fb, want_w, want_h);
 
     return 0;
 }
 
+/* The kicker makes running CPUs leave translated code: every KICK_PERIOD so CPU 0
+   keeps polling devices, and exactly when a CPU's guest timer falls due so timer
+   interrupts are not quantized to that period. mach_absolute_time runs at 24 MHz. */
+#if TARGET_OS_IPHONE
+#define KICK_PERIOD_TICKS 60000ull /* 2.5 ms */
+#else
+#define KICK_PERIOD_TICKS 24000ull /* 1 ms */
+#endif
+
+static pthread_mutex_t kick_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t kick_cv = PTHREAD_COND_INITIALIZER;
+/* The host time the kicker sleeps until, or 0 while it plans (not waiting). Written under kick_mu. */
+static _Atomic uint64_t kick_wake_at;
+
+static void kicker_timer_hint(HvMachine *mm, uint64_t due) {
+    (void)mm;
+    uint64_t w = atomic_load_explicit(&kick_wake_at, memory_order_acquire);
+    if (w && due >= w) return; /* the kicker wakes first and re-plans with this deadline */
+    /* Holding kick_mu orders this after the kicker's plan: it either waits already
+       (and this wakes it) or has not read timer_due yet. */
+    pthread_mutex_lock(&kick_mu);
+    pthread_cond_signal(&kick_cv);
+    pthread_mutex_unlock(&kick_mu);
+}
+
 static void *kicker_thread(void *unused) {
     (void)unused;
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    uint64_t next_all = mach_absolute_time() + KICK_PERIOD_TICKS;
+    pthread_mutex_lock(&kick_mu);
     while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
-#if TARGET_OS_IPHONE
-        usleep(2500);
-#else
-        usleep(1000);
-#endif
-        hv_machine_kick_all(&m);
+        uint64_t now = mach_absolute_time();
+        uint64_t wake = next_all;
+        for (int i = 0; i < ncpus; i++) {
+            uint64_t due = __atomic_load_n(&cpus[i].timer_due, __ATOMIC_RELAXED);
+            if (due > now && due < wake) wake = due;
+        }
+        if (wake > now) {
+            atomic_store_explicit(&kick_wake_at, wake, memory_order_release);
+            uint64_t d = wake - now;
+            struct timespec ts = {(time_t)(d / 24000000), (long)(d % 24000000) * 1000 / 24};
+            pthread_cond_timedwait_relative_np(&kick_cv, &kick_mu, &ts);
+            atomic_store_explicit(&kick_wake_at, 0, memory_order_release);
+        }
+        now = mach_absolute_time();
+        if (now >= next_all) {
+            next_all = now + KICK_PERIOD_TICKS;
+            hv_machine_kick_all(&m);
+            continue;
+        }
+        /* A CPU parked in WFI keeps a stale deadline; kicking it only sets a flag, and
+           it times its own sleep. */
+        int kicked = 0;
+        for (int i = 0; i < ncpus; i++) {
+            uint64_t due = __atomic_load_n(&cpus[i].timer_due, __ATOMIC_RELAXED);
+            if (due && due <= now) {
+                __atomic_store_n(&cpus[i].exit_req, 1, __ATOMIC_SEQ_CST);
+                kicked = 1;
+            }
+        }
+        if (kicked) __asm__ volatile("sev" ::: "memory");
     }
+    pthread_mutex_unlock(&kick_mu);
     return NULL;
 }
 
 static void *secondary_thread(void *arg) {
     HvCpu *c = arg;
-    prepare_cpu_thread();
+    prepare_cpu_thread((int)c->index);
     int r = hv_run(c);
     if (!c->halted) {
         fprintf(stderr, "winvm: cpu %u stopped (%s) at pc=%llx el=%u\n",
@@ -264,8 +433,12 @@ void hv_winvm_flush_disks(void) {
     if (disk0.fd >= 0) hv_disk_sync(&disk0);
 }
 
+void hv_winvm_checkpoint_disks(void) {
+    if (disk0.fd >= 0) hv_disk_barrier(&disk0);
+}
+
 int hv_winvm_run_cpu0(void) {
-    prepare_cpu_thread();
+    prepare_cpu_thread(0);
     for (;;) {
         int r = hv_run(&cpus[0]);
         hv_winvm_flush_disks();
@@ -299,6 +472,16 @@ int hv_winvm_run_cpu0(void) {
                 board.flash1->status = 0x80;
             }
             if (board.fb) board.fb->active = 0;
+            if (board.gpu) hv_virtio_gpu_reset(board.gpu); /* the scanout must not outlive the guest that set it */
+            /* Devices that write guest memory on their own (received frames, input reports, audio) would
+               otherwise keep using the rings of the OS that just rebooted, in memory the firmware and the
+               next kernel now own, until a driver resets them. */
+            hv_dev_lock(&m);
+            if (board.net) hv_virtio_reset(&board.net->vio);
+            if (board.snd) hv_virtio_reset(&board.snd->vio);
+            if (board.usb) hv_xhci_reset(board.usb);
+            if (board.hda) hv_hda_reset(board.hda);
+            hv_dev_unlock(&m);
             hv_winvirt_reset_cpu(&board);
             m.flush_pending = 1;
             spawn_secondaries();
@@ -347,6 +530,14 @@ void hv_winvm_power_button(void) {
     hv_winvirt_power_button(&board);
 }
 
+void hv_winvm_request_hibernate(void) {
+    hv_share_request_hibernate();
+}
+
+void hv_winvm_set_posture(int laptop) {
+    hv_share_set_posture(laptop);
+}
+
 void hv_winvm_key_hid(uint8_t usage, int down) {
     if (board.usb) hv_xhci_key(board.usb, usage, down);
 }
@@ -364,6 +555,14 @@ void hv_winvm_tablet(double x_norm, double y_norm, uint8_t buttons, int8_t wheel
     int ax = (int)(x_norm * 32767.0 + 0.5);
     int ay = (int)(y_norm * 32767.0 + 0.5);
     hv_xhci_tablet(board.usb, ax, ay, buttons, wheel);
+}
+
+void hv_winvm_touch(const HvTouchContact *contacts, int count) {
+    if (board.usb) hv_xhci_touch(board.usb, contacts, count);
+}
+
+int hv_winvm_touch_ready(void) {
+    return board.usb ? hv_xhci_touch_ready(board.usb) : 0;
 }
 
 void hv_winvm_send_ctrl_alt_del(void) {
@@ -395,9 +594,133 @@ void hv_winvm_usb_stats(int *kbd_ready, int *tab_ready, uint64_t *delivered) {
 }
 
 void hv_winvm_engine_stats(uint64_t *jit_used_bytes, uint64_t *jit_cap_bytes,
-                           uint64_t *jit_full_flushes, uint64_t *wfi_ticks) {
+                           uint64_t *jit_flushes, uint64_t *wfi_ticks) {
     if (jit_used_bytes) *jit_used_bytes = (uint64_t)m.jit.used * 4ull;
     if (jit_cap_bytes) *jit_cap_bytes = (uint64_t)m.jit.capacity * 4ull;
-    if (jit_full_flushes) *jit_full_flushes = m.stats.flush_full;
+    if (jit_flushes) *jit_flushes = m.stats.block_flushes;
     if (wfi_ticks) *wfi_ticks = m.stats.wfi_ticks;
+}
+
+static uint64_t ticks_ns(uint64_t t) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return t * tb.numer / tb.denom;
+}
+
+/* Largest-since-last-read values: take and zero (a racing update may be lost, which is fine here). */
+static uint64_t take_max_us(uint64_t *v) { return ticks_ns(__atomic_exchange_n(v, 0, __ATOMIC_RELAXED)) / 1000; }
+
+static uint64_t thread_run_ns(mach_port_t port) {
+    if (!port) return 0;
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+    if (thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &n) != KERN_SUCCESS) return 0;
+    return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000000ull +
+           ((uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds) * 1000ull;
+}
+
+/* Reads every counter racily: a snapshot for rates, not an audit. Host-side fields (memory, thermal) are the caller's. */
+void hv_winvm_perf_snapshot(HvPerfSnap *s) {
+    memset(s, 0, sizeof *s);
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    s->t_ms = (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+    if (created_at) s->uptime_ms = ticks_ns(mach_absolute_time() - created_at) / 1000000ull;
+
+    HvStats *st = &m.stats;
+    s->translations = st->translations;
+    s->blocks = st->blocks;
+    s->block_flushes = st->block_flushes;
+    s->flush_full = st->flush_full;
+    s->flush_smc = st->flush_smc;
+    s->flush_ic = st->flush_ic;
+    s->code_protects = st->code_protects;
+    s->chained = st->chained;
+    s->chain_far = st->chain_far;
+    s->xchained_now = m.nxchained;
+    s->nblocks_now = m.nblocks;
+    s->jit_used_kb_now = (uint64_t)m.jit.used * 4ull / 1024ull;
+    s->jit_cap_kb_now = (uint64_t)m.jit.capacity * 4ull / 1024ull;
+    s->inval_dev = st->inval_dev;
+    s->inval_scanned = st->inval_scanned;
+    s->code_writes = st->code_writes, s->code_write_hits = st->code_write_hits;
+    s->code_write_forced = st->code_write_forced, s->code_retranslates = st->code_retranslates;
+    s->code_block_kills = st->code_block_kills;
+    s->diag_word = st->diag_word, s->diag_same = st->diag_same, s->diag_zero = st->diag_zero;
+    s->diag_el1 = st->diag_el1, s->diag_dev = st->diag_dev, s->diag_big = st->diag_big;
+    s->diag_g8 = st->diag_g8, s->diag_g16 = st->diag_g16;
+    s->inval_ns = ticks_ns(st->inval_ticks);
+    s->stw_count = st->stw_count;
+    s->stw_ns = ticks_ns(st->stw_ticks);
+    s->stw_max_us = take_max_us(&st->stw_max_ticks);
+    s->exceptions = st->exceptions;
+    s->interrupts = st->interrupts;
+    s->tlb_flushes = st->tlb_flushes;
+    s->fetch_walks = st->fetch_walks;
+    s->proc_switches = st->stash_saves;
+    /* Indirect-branch cache: resets and light resolves always count; fills, TLB refills and dispatcher
+       entries by cause only with engine stats on (stats_interval != 0). */
+    s->ijc_resets = st->ijc_resets;
+    s->ijc_light = st->ijc_light;
+    s->ijc_fills = st->ijc_fills;
+    s->tlb_refills = st->refills;
+    uint64_t *disp[6] = {&s->disp_chainfill, &s->disp_kick, &s->disp_exc, &s->disp_irq, &s->disp_cached, &s->disp_miss};
+    for (int i = 0; i < 6; i++) *disp[i] = st->why[i];
+    s->wfi = st->wfi;
+    s->wfi_ns = ticks_ns(st->wfi_ticks);
+    uint64_t *wfi_cpu[4] = {&s->wfi0_ns, &s->wfi1_ns, &s->wfi2_ns, &s->wfi3_ns};
+    uint64_t *run_cpu[4] = {&s->run0_ns, &s->run1_ns, &s->run2_ns, &s->run3_ns};
+    for (int i = 0; i < ncpus && i < 4; i++) {
+        *wfi_cpu[i] = ticks_ns(m.percpu[i].wfi_ticks);
+        *run_cpu[i] = thread_run_ns(cpu_port[i]);
+    }
+    s->translate_ns = ticks_ns(st->translate_ticks);
+    s->dev_wait_ns = ticks_ns(st->dev_wait_ticks);
+    s->tr_wait_ns = ticks_ns(st->tr_wait_ticks);
+    s->tlbi_wait_ns = ticks_ns(st->sync_ticks);
+
+    HvVirtioGpu *g = board.gpu;
+    if (g) {
+        s->gpu_cmds = g->cmds;
+        s->gpu_transfers = g->transfers;
+        s->gpu_flushes = g->flushes;
+        s->gpu_flush_px = g->flush_px;
+        s->gpu_xfer_bytes = g->xfer_bytes;
+        s->gpu_xfer_ns = ticks_ns(g->xfer_ticks);
+        s->gpu_rect_small = g->rect_small;
+        s->gpu_rect_mid = g->rect_mid;
+        s->gpu_rect_big = g->rect_big;
+        _Static_assert(HV_VGPU_GRID_W * HV_VGPU_GRID_H == HV_PERF_GRID, "perf.csv grid matches the GPU's");
+        for (int i = 0; i < HV_PERF_GRID; i++) s->gpu_grid[i] = g->grid[i];
+    }
+    s->frames_presented = hv_winvm_display_frames();
+    uint32_t fw = 0, fh = 0;
+    if (hv_winvm_display_size(&fw, &fh) == 0) {
+        s->fb_w_now = fw;
+        s->fb_h_now = fh;
+    }
+    HvNvme *nv = board.nvme0;
+    if (nv) {
+        s->nvme_rd_n = nv->rd_n;
+        s->nvme_rd_bytes = nv->rd_bytes;
+        s->nvme_rd_ns = ticks_ns(nv->rd_ticks);
+        s->nvme_rd_max_us = take_max_us(&nv->rd_max_ticks);
+        s->nvme_wr_n = nv->wr_n;
+        s->nvme_wr_bytes = nv->wr_bytes;
+        s->nvme_wr_ns = ticks_ns(nv->wr_ticks);
+        s->nvme_wr_max_us = take_max_us(&nv->wr_max_ticks);
+        s->nvme_flush_n = nv->flush_n;
+        s->nvme_lat_100us = nv->lat_hist[0];
+        s->nvme_lat_1ms = nv->lat_hist[1];
+        s->nvme_lat_10ms = nv->lat_hist[2];
+        s->nvme_lat_slow = nv->lat_hist[3];
+    }
+    HvXhci *x = board.usb;
+    if (x) {
+        s->usb_delivered = x->delivered;
+        s->in_n = x->in_n;
+        s->in_q_ns = ticks_ns(x->in_q_ticks);
+        s->in_q_max_us = take_max_us(&x->in_q_max_ticks);
+    }
+    s->tick0_gap_max_us = take_max_us(&board.tick0_gap_max_ticks);
 }

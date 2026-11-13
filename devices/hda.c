@@ -837,6 +837,10 @@ typedef struct HdaBdlEntry {
     uint32_t flags;
 } HdaBdlEntry;
 
+void hv_hda_reset(HvHda *d) {
+    if (d) controller_reset(d);
+}
+
 void hv_hda_poll(HvHda *d) {
     if (!d || !(d->gctl & 1u)) return;
 

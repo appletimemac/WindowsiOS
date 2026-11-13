@@ -241,7 +241,7 @@ void hv_virtio_snd_poll(HvVirtioSnd *d) {
         any = 1;
     }
     if (any) {
-        hv_virtio_interrupt(v);
+        hv_virtio_interrupt(v, TXQ);
         take_tx(d); /* room for more */
     }
 }
@@ -276,7 +276,7 @@ static void notify(HvVirtio *v, int q) {
             hv_virtq_push(v, q, &e, control(d, &e));
             any = 1;
         }
-        if (any) hv_virtio_interrupt(v);
+        if (any) hv_virtio_interrupt(v, q);
         hv_virtio_snd_poll(d); /* a release may have freed buffers */
     } else if (q == TXQ) {
         take_tx(d);
@@ -289,7 +289,7 @@ static void notify(HvVirtio *v, int q) {
             hv_virtq_push(v, q, &e, 8);
             any = 1;
         }
-        if (any) hv_virtio_interrupt(v);
+        if (any) hv_virtio_interrupt(v, q);
     } /* event queue: kept for events we never send */
 }
 

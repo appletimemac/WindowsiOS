@@ -37,6 +37,9 @@ static HvInsnKind classify_system(uint32_t insn) {
             (void)op2;
             return HV_INSN_BARRIER;
         }
+        /* CFINV (FEAT_FlagM, which ID_AA64ISAR0 advertises; xtajit64's x64 output uses it). PSTATE.C is the host's
+           own carry while a block runs, so it runs as it is. XAFLAG and AXFLAG (FlagM2) stay undefined. */
+        if (insn == 0xd500401fu) return HV_INSN_COPY;
         if (l == 0 && crn == 4) return HV_INSN_SYSREG; /* MSR (immediate) to PSTATE */
         if (l == 0 && crn == 1 && op1 == 3 && (insn & 0x1f) == 0x1f) {
             /* WFET, WFIT (FEAT_WFxT) live in CRn=1. */

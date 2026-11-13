@@ -129,6 +129,8 @@ typedef struct HvHda {
 
 HvHda *hv_hda_create(HvMachine *m, HvPcie *bus);
 void hv_hda_poll(HvHda *d);
+/* Machine reset: as the guest clearing GCTL.CRST. Call with the device lock held. */
+void hv_hda_reset(HvHda *d);
 
 /* Host CoreAudio Output render callback: pulls S16LE interleaved stereo/mono at stream rate. */
 uint32_t hv_hda_pull_playback(HvHda *d, void *dst, uint32_t bytes);

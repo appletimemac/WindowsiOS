@@ -37,7 +37,7 @@ static int seg_io(HvVirtioBlk *b, const HvVirtqElem *e, int writable, uint32_t o
         void *p = hv_phys_ptr(b->vio.m, g->addr + off, n);
         if (!p) return -1;
         int r = writable ? hv_disk_read(b->disk, disk_off, p, n) : hv_disk_write(b->disk, disk_off, p, n);
-        if (writable && r == 0) hv_dma_written(b->vio.m, g->addr + off, n);
+        if (writable && r == 0) hv_ram_written(b->vio.m, g->addr + off, n);
         if (r != 0) return -1;
         disk_off += n;
         len -= n;
@@ -173,7 +173,7 @@ static void notify(HvVirtio *v, int q) {
             uint8_t st = S_IOERR;
             if (hv_virtq_writable(&r->e)) hv_virtq_write(v, &r->e, hv_virtq_writable(&r->e) - 1, &st, 1);
             hv_virtq_push(v, q, &r->e, 1);
-            hv_virtio_interrupt(v);
+            hv_virtio_interrupt(v, q);
             continue;
         }
         if (got == 0) break;
@@ -211,7 +211,7 @@ void hv_virtio_blk_poll(HvVirtioBlk *b) {
         b->published++;
     }
     if (q < 0) return;
-    hv_virtio_interrupt(&b->vio);
+    hv_virtio_interrupt(&b->vio, q);
     notify(&b->vio, q); /* requests that waited for room in the ring */
 }
 

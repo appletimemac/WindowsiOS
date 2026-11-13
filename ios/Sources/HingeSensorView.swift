@@ -96,11 +96,10 @@ final class PointerController {
     }
 }
 
-/// Manages scene geometry orientation so Clamshell Laptop Mode aligns horizontally across the iPhone Duo fold.
+/// The F11 deck key's scene rotation. Layout never asks for an orientation: the iPhone Duo inner
+/// display ignores supported orientations, and the fold's reserved region decides the posture.
 @MainActor
 enum SceneOrientationController {
-    private static var currentPreferred: UIInterfaceOrientationMask = .portrait
-
     static func activeWindowScene() -> UIWindowScene? {
         UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
@@ -108,20 +107,11 @@ enum SceneOrientationController {
             ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
     }
 
-    /// When entering Laptop Mode on the unfolded iPhone Duo inner canvas (951x669 -> 669x951),
-    /// rotate to Portrait so the physical hinge runs horizontally between the top screen and bottom keyboard deck.
-    static func alignForLaptopPostureIfLandscape(size: CGSize) {
-        guard size.width > size.height, max(size.width, size.height) > 780 else { return }
-        guard let scene = activeWindowScene() else { return }
-        currentPreferred = .portrait
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait)) { _ in }
-    }
-
     /// Cycles scene orientation 90°/180° even when system Orientation Lock is active.
     static func rotateDeckOrientation() {
         guard let scene = activeWindowScene() else { return }
         let next: UIInterfaceOrientationMask
-        switch scene.interfaceOrientation {
+        switch scene.effectiveGeometry.interfaceOrientation {
         case .portrait:
             next = .portraitUpsideDown
         case .portraitUpsideDown:
@@ -131,7 +121,6 @@ enum SceneOrientationController {
         default:
             next = .portrait
         }
-        currentPreferred = next
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: next)) { _ in }
     }
 }

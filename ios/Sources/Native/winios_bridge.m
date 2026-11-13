@@ -1,16 +1,25 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #import "winios_bridge.h"
 
+#include "disk.h"
 #include "hvsparse.h"
 #include "share.h"
 #include "winios_jit.h"
 #include "winvm.h"
+#include "cmdfile.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
 #include <mach/mach_time.h>
 #include <os/lock.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 static WinIOSBridge *s_shared_bridge = nil;
 
@@ -25,22 +34,89 @@ static WinIOSBridge *s_shared_bridge = nil;
     uint64_t _configuredRamMB;
     int _configuredCPUs;
     CAMetalLayer *__weak _pendingLayer;
+    CGRect _pictureRect; /* the picture's place in _pendingLayer, as fractions of it; null: all of it */
     uint64_t _diagTickCount;
     uint64_t _lastMachTicks;
     uint64_t _lastWfiTicks;
     double _lastWfiIdlePct;
+    dispatch_source_t _perfTimer;
+    HvPerfCsv _perfCsv;
+    BOOL _engineStats;
+    NSThread *_cmdThread;
+    uint64_t _vmStartNS;
+    uint64_t _perfLastExceptions, _perfLastUptime;
+    unsigned _exceptionStormRows;
+    BOOL _hangStateWritten;
 
     os_unfair_lock _metricsLock;
     CGSize _screenSizePts;
     CGFloat _screenScale;
     NSInteger _hingeStatus;
     double _hingeAngleDegrees;
+    NSString *_geometryReport;
+    uint32_t _requestedGuestW, _requestedGuestH;
 }
 - (void)handleVMExitWithReason:(NSString *)reason;
 - (void)updateUnpackProgress:(double)frac;
 - (void)startDiagTimer;
 - (void)stopDiagTimer;
+- (void)startCommandFile;
+- (void)commandMark:(const char *)label;
+- (void)commandPerfRow;
 @end
+
+static uint64_t command_mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+typedef struct IOSCmdCtx {
+    __unsafe_unretained WinIOSBridge *bridge;
+    const char *docs;
+    FILE *log;
+    int quit;
+} IOSCmdCtx;
+
+static int ios_cmd_path(void *opaque, const char *name, char *path, size_t size) {
+    IOSCmdCtx *ctx = opaque;
+    if (!*name || strchr(name, '/') || !strcmp(name, ".") || !strcmp(name, "..")) return -1;
+    int n = snprintf(path, size, "%s/%s", ctx->docs, name);
+    return n < 0 || (size_t)n >= size ? -1 : 0;
+}
+
+static void ios_cmd_mark(void *opaque, const char *label) {
+    IOSCmdCtx *ctx = opaque;
+    [ctx->bridge commandMark:label];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    fprintf(ctx->log, "MARK %llu %s\n", (unsigned long long)ms, label);
+}
+
+static void ios_cmd_perf_row(void *opaque) {
+    IOSCmdCtx *ctx = opaque;
+    [ctx->bridge commandPerfRow];
+}
+
+static void ios_cmd_quit(void *opaque) {
+    ((IOSCmdCtx *)opaque)->quit = 1;
+}
+
+static int ios_cmd_stopped(void *opaque) {
+    return ((IOSCmdCtx *)opaque)->quit || NSThread.currentThread.cancelled;
+}
+
+static uint64_t ios_cmd_seq(const char *text) {
+    if (!text || *text < '0' || *text > '9') return 0;
+    char *end;
+    errno = 0;
+    uint64_t seq = strtoull(text, &end, 10);
+    if (errno) return 0;
+    if (*end == '\r') end++;
+    if (*end == '\n') end++;
+    return *end ? 0 : seq;
+}
 
 static void vm_exit_trampoline(int reason) {
     NSString *r = [NSString stringWithUTF8String:hv_winvm_reason_name(reason)];
@@ -66,6 +142,22 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     });
 }
 
+/* Test settings for a launch that cannot carry an environment: after an install StikDebug restarts the
+   app without the one devicectl gave it, so the remote command file and the engine statistics were off
+   until somebody shut Windows down by hand. Documents/launch_env.json is a flat object of strings; only
+   HV_ and WINIOS_ names are taken, and never over a variable the launch did set. */
+static void apply_launch_env_file(NSString *docs) {
+    NSData *data = [NSData dataWithContentsOfFile:[docs stringByAppendingPathComponent:@"launch_env.json"]];
+    if (!data) return;
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![json isKindOfClass:[NSDictionary class]]) return;
+    [(NSDictionary *)json enumerateKeysAndObjectsUsingBlock:^(id key, id value, __unused BOOL *stop) {
+        if (![key isKindOfClass:[NSString class]] || ![value isKindOfClass:[NSString class]]) return;
+        if (![key hasPrefix:@"HV_"] && ![key hasPrefix:@"WINIOS_"]) return;
+        setenv([key UTF8String], [value UTF8String], 0);
+    }];
+}
+
 @implementation WinIOSBridge
 
 + (WinIOSBridge *)shared {
@@ -78,6 +170,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 
 - (instancetype)init {
     if ((self = [super init])) {
+        apply_launch_env_file([self documentsPath]); /* before anything reads the environment */
         _vmStatus = @"Idle";
         _metricsLock = OS_UNFAIR_LOCK_INIT;
         _screenSizePts = CGSizeZero;
@@ -100,7 +193,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 - (void)configureAudioSessionAndMicPermission {
     AVAudioSession *session = [AVAudioSession sharedInstance];
     AVAudioSessionCategoryOptions opts = AVAudioSessionCategoryOptionDefaultToSpeaker |
-                                         AVAudioSessionCategoryOptionAllowBluetooth |
+                                         AVAudioSessionCategoryOptionAllowBluetoothHFP |
                                          AVAudioSessionCategoryOptionAllowBluetoothA2DP |
                                          AVAudioSessionCategoryOptionMixWithOthers;
     NSError *err = nil;
@@ -158,6 +251,13 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     os_unfair_lock_unlock(&_metricsLock);
 }
 
+- (void)updateGeometryReport:(NSString *)report {
+    os_unfair_lock_lock(&_metricsLock);
+    _geometryReport = [report copy];
+    os_unfair_lock_unlock(&_metricsLock);
+    dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
+}
+
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees {
     os_unfair_lock_lock(&_metricsLock);
     _hingeStatus = status;
@@ -169,13 +269,20 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     winios_jit_install_trap_handler();
     [[UIApplication sharedApplication] setIdleTimerDisabled:YES];
     [self configureAudioSessionAndMicPermission];
-    UIScreen *mainScreen = [UIScreen mainScreen];
-    [self updateScreenSize:mainScreen.bounds.size scale:mainScreen.scale];
     [self notifyChanged];
 }
 
+/* The translated-code region: 768 MiB unless the launch asks for another size (WINIOS_JIT_MB, or the
+   winios.jitMB default) between 128 and WINIOS_JIT_MAX_BYTES, for measuring the trade-off on the device. */
+static size_t jit_region_bytes(void) {
+    const char *env = getenv("WINIOS_JIT_MB");
+    long mb = env ? strtol(env, NULL, 10) : (long)[[NSUserDefaults standardUserDefaults] integerForKey:@"winios.jitMB"];
+    if (mb < 128 || (size_t)mb << 20 > WINIOS_JIT_MAX_BYTES) return WINIOS_JIT_DEFAULT_BYTES;
+    return (size_t)mb << 20;
+}
+
 - (BOOL)tryAcquireJIT:(BOOL)detachAfter {
-    BOOL ok = winios_jit_acquire(WINIOS_JIT_DEFAULT_BYTES, detachAfter);
+    BOOL ok = winios_jit_acquire(jit_region_bytes(), detachAfter);
     dispatch_async(_diagQueue, ^{
         [self writeDiagnosticsSnapshot];
     });
@@ -229,6 +336,13 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 
 - (uint64_t)availableMemoryMB {
     return (uint64_t)(winios_available_memory_bytes() >> 20);
+}
+
+- (uint64_t)guestRAMMB {
+    if (_configuredRamMB) return _configuredRamMB;
+    uint64_t bytes = 0;
+    winios_jit_guest_ram(&bytes);
+    return bytes >> 20;
 }
 
 - (BOOL)usbKeyboardReady {
@@ -301,9 +415,23 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 
 - (void)bindMetalLayer:(nullable CAMetalLayer *)layer {
     _pendingLayer = layer;
+    _pictureRect = CGRectNull; /* the canvas says where its picture goes right after binding */
     if (_vmRunning) {
         hv_winvm_set_display_layer((__bridge void *)layer);
+        hv_winvm_set_display_content(0, 0, 0, 0);
     }
+}
+
+- (void)setPictureRect:(CGRect)rect forLayer:(CAMetalLayer *)layer {
+    /* Two canvases exist for a moment when the layout changes; only the bound one places the picture. */
+    if (layer != _pendingLayer) return;
+    _pictureRect = rect;
+    if (_vmRunning) [self applyPictureRect];
+}
+
+- (void)applyPictureRect {
+    CGRect r = CGRectIsNull(_pictureRect) ? CGRectZero : _pictureRect;
+    hv_winvm_set_display_content(r.origin.x, r.origin.y, r.size.width, r.size.height);
 }
 
 - (void)prepareAndStartWithLayer:(nullable CAMetalLayer *)layer {
@@ -403,15 +531,28 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     NSString *codePath = [dir stringByAppendingPathComponent:@"code.fd"];
     NSString *varsPath = [dir stringByAppendingPathComponent:@"vars.fd"];
     NSString *diskPath = [dir stringByAppendingPathComponent:@"windows11.img"];
+    /* Windows gets a 64 GB disk: the file grows sparse (no space is used up front) and the guest extends C:
+       into the new space (scripts/winios_extend_c.ps1). Before the disk is opened; a failure leaves the
+       image as it was, which still boots. */
+    hv_disk_grow(diskPath.fileSystemRepresentation, HV_DISK_GROW_TARGET);
+    /* The "WindowsiOS Tools" disk (the display driver, posture agent and their installer for Windows) rides as the
+       second NVMe disk whenever it has been copied in. */
+    NSString *toolsImage = [dir stringByAppendingPathComponent:@"tools.img"];
+    const char *toolsPath = [[NSFileManager defaultManager] fileExistsAtPath:toolsImage] ? toolsImage.fileSystemRepresentation : NULL;
 
     _configuredRamMB = ramMB;
-    _configuredCPUs = 4;
+    /* 4 vCPUs; WINIOS_CPUS (1 to 4) at launch for measuring against the phone's 2 performance cores. Only on a
+       fresh boot: a hibernated Windows must resume with the CPU count it hibernated with. */
+    const char *cpusEnv = getenv("WINIOS_CPUS");
+    int cpus = cpusEnv ? atoi(cpusEnv) : 4;
+    _configuredCPUs = cpus >= 1 && cpus <= 4 ? cpus : 4;
+    _engineStats = getenv("HV_ENGINE_STATS") != NULL || [[NSUserDefaults standardUserDefaults] boolForKey:@"winios.engineStats"];
 
     HvWinVmConfig cfg = {
         .code_fd = codePath.fileSystemRepresentation,
         .vars_fd = varsPath.fileSystemRepresentation,
         .disk0 = diskPath.fileSystemRepresentation,
-        .disk1 = NULL,
+        .disk1 = toolsPath,
         .share_dir = sharedDir.fileSystemRepresentation,
         .share_sock = shareSock.fileSystemRepresentation,
         .ncpus = _configuredCPUs,
@@ -423,7 +564,10 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         .no_net = 0,
         .enable_sound = 1,
         .log = 0,
-        .stats_interval = 0,
+        /* Engine stats (translation time, lock waits) cost a little on every translation: on request only
+           (launch with HV_ENGINE_STATS=1, or the winios.engineStats default). The huge interval keeps the
+           counters on without ever printing the stats summary, which would stall CPU 0. */
+        .stats_interval = _engineStats ? 1000000 : 0,
     };
 
     char err[256] = {0};
@@ -437,10 +581,12 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     CAMetalLayer *layer = _pendingLayer;
     if (layer) {
         hv_winvm_set_display_layer((__bridge void *)layer);
+        [self applyPictureRect];
     }
 
     _vmRunning = YES;
     _bootStartTime = CFAbsoluteTimeGetCurrent();
+    _vmStartNS = command_mono_ns();
     _diagTickCount = 0;
     _lastMachTicks = mach_absolute_time();
     _lastWfiTicks = 0;
@@ -451,8 +597,82 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     hv_winvm_start(1, vm_exit_trampoline);
 
     [self startDiagTimer];
+    [self startPerfLog];
+    [self startCommandFile];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
     [self notifyChanged];
+}
+
+- (void)startCommandFile {
+    const char *enabled = getenv("WINIOS_CMD");
+    if (!enabled || strcmp(enabled, "1")) return;
+    [_cmdThread cancel];
+    NSString *docs = [self documentsPath];
+    uint64_t startNS = _vmStartNS;
+    _cmdThread = [[NSThread alloc] initWithBlock:^{
+        @autoreleasepool {
+            NSString *input = [docs stringByAppendingPathComponent:@"winvm_cmds.txt"];
+            NSString *done = [docs stringByAppendingPathComponent:@"winvm_cmds.done"];
+            NSString *logPath = [docs stringByAppendingPathComponent:@"winvm_cmds.log"];
+            FILE *log = fopen(logPath.fileSystemRepresentation, "a");
+            if (!log) return;
+            IOSCmdCtx ctx = {.bridge = self, .docs = docs.fileSystemRepresentation, .log = log};
+            HvCmdFile cmd = {.opaque = &ctx, .out = log, .err = log, .path = ios_cmd_path,
+                             .mark = ios_cmd_mark, .perf_row = ios_cmd_perf_row,
+                             .quit = ios_cmd_quit, .stopped = ios_cmd_stopped};
+            NSString *savedSeq = [NSString stringWithContentsOfFile:done encoding:NSUTF8StringEncoding error:nil];
+            uint64_t lastSeq = ios_cmd_seq(savedSeq.UTF8String);
+            NSString *previous = nil;
+            while (!ios_cmd_stopped(&ctx)) {
+                @autoreleasepool {
+                    /* Reopen each time: devicectl can replace the inode. Require a stable, complete copy. */
+                    NSString *text = [NSString stringWithContentsOfFile:input encoding:NSUTF8StringEncoding error:nil];
+                    if ([text hasSuffix:@"\n"] && [text isEqualToString:previous]) {
+                        NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+                        const char *header = lines[0].UTF8String;
+                        uint64_t seq = !strncmp(header, "#seq ", 5) ? ios_cmd_seq(header + 5) : 0;
+                        if (seq > lastSeq) {
+                            for (NSUInteger i = 1; i < lines.count && !ios_cmd_stopped(&ctx); i++) {
+                                NSString *line = lines[i];
+                                if ([line hasSuffix:@"\r"]) line = [line substringToIndex:line.length - 1];
+                                if (!line.length) continue;
+                                uint64_t ms = (command_mono_ns() - startNS) / 1000000;
+                                fprintf(log, "[%llu] %s\n", (unsigned long long)ms, line.UTF8String);
+                                hv_cmdfile_exec(&cmd, line.UTF8String);
+                                fflush(log);
+                            }
+                            lastSeq = seq;
+                            if (!NSThread.currentThread.cancelled) {
+                                NSString *ack = [NSString stringWithFormat:@"%llu\n", (unsigned long long)seq];
+                                [ack writeToFile:done atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                            }
+                        }
+                    }
+                    previous = text;
+                }
+                if (!ios_cmd_stopped(&ctx)) usleep(200000);
+            }
+            fclose(log);
+        }
+    }];
+    _cmdThread.name = @"winvm.cmdfile";
+    [_cmdThread start];
+}
+
+- (void)commandMark:(const char *)label {
+    uint64_t t = (uint64_t)(NSDate.date.timeIntervalSince1970 * 1000.0);
+    dispatch_sync(_diagQueue, ^{ hv_perf_csv_mark(&self->_perfCsv, t, label); });
+}
+
+- (void)commandPerfRow {
+    dispatch_sync(_diagQueue, ^{
+        HvPerfSnap s;
+        hv_winvm_perf_snapshot(&s);
+        s.avail_mem_mb_now = [self availableMemoryMB];
+        s.thermal_now = (uint64_t)NSProcessInfo.processInfo.thermalState;
+        s.low_power_now = NSProcessInfo.processInfo.lowPowerModeEnabled ? 1 : 0;
+        hv_perf_csv_row(&self->_perfCsv, &s);
+    });
 }
 
 - (void)startDiagTimer {
@@ -479,12 +699,84 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     }
 }
 
+static int sysctl_int(const char *name) {
+    int v = 0;
+    size_t n = sizeof v;
+    return sysctlbyname(name, &v, &n, NULL, 0) == 0 ? v : -1;
+}
+
+/* Documents/perf.csv: one row of every counter (host/perf.h) every 2 s, kept to about 8 MB plus perf.csv.1.
+   Pulled with devicectl and read by scripts/perf_report.py. */
+- (void)startPerfLog {
+    [self stopPerfLog];
+    NSString *path = [[self documentsPath] stringByAppendingPathComponent:@"perf.csv"];
+    NSString *build = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?";
+    const char *qos = getenv("HV_QOS");
+    NSString *comment = [NSString stringWithFormat:
+        @"start=%.0f build=%@ os=%@ cpus=%d ram_mb=%llu jit_mb=%.0f pcores=%d ecores=%d engine_stats=%d qos=%s",
+        [NSDate date].timeIntervalSince1970, build, UIDevice.currentDevice.systemVersion, _configuredCPUs,
+        _configuredRamMB, (double)winios_jit_mapping().size / (1024.0 * 1024.0),
+        sysctl_int("hw.perflevel0.logicalcpu"), sysctl_int("hw.perflevel1.logicalcpu"), _engineStats ? 1 : 0,
+        qos ? qos : "default"];
+    dispatch_sync(_diagQueue, ^{
+        hv_perf_csv_open(&self->_perfCsv, path.fileSystemRepresentation, 8l << 20, comment.UTF8String);
+        HvPerfSnap initial;
+        hv_winvm_perf_snapshot(&initial);
+        self->_perfLastExceptions = initial.exceptions;
+        self->_perfLastUptime = initial.uptime_ms;
+        self->_exceptionStormRows = 0;
+    });
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _diagQueue);
+    dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                              2ull * NSEC_PER_SEC, NSEC_PER_SEC / 10);
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf->_vmRunning) return;
+        HvPerfSnap s;
+        hv_winvm_perf_snapshot(&s);
+        s.avail_mem_mb_now = [strongSelf availableMemoryMB];
+        s.thermal_now = (uint64_t)NSProcessInfo.processInfo.thermalState;
+        s.low_power_now = NSProcessInfo.processInfo.lowPowerModeEnabled ? 1 : 0;
+        hv_perf_csv_row(&strongSelf->_perfCsv, &s);
+        uint64_t elapsed = s.uptime_ms - strongSelf->_perfLastUptime;
+        uint64_t before = strongSelf->_perfLastExceptions;
+        BOOL storm = s.uptime_ms > strongSelf->_perfLastUptime && s.exceptions >= before &&
+                     (double)(s.exceptions - before) * 1000.0 / (double)elapsed > 500000.0;
+        strongSelf->_perfLastExceptions = s.exceptions;
+        strongSelf->_perfLastUptime = s.uptime_ms;
+        strongSelf->_exceptionStormRows = storm ? strongSelf->_exceptionStormRows + 1 : 0;
+        if (!strongSelf->_hangStateWritten && strongSelf->_exceptionStormRows >= 3) {
+            strongSelf->_hangStateWritten = YES;
+            NSString *state = [[strongSelf documentsPath] stringByAppendingPathComponent:@"hang_state.txt"];
+            int rc = hv_cmdfile_state(state.fileSystemRepresentation);
+            const char *label = rc == 0 ? "exception storm: wrote Documents/hang_state.txt" :
+                                         "exception storm: failed to write Documents/hang_state.txt";
+            hv_perf_csv_mark(&strongSelf->_perfCsv, s.t_ms, label);
+            fprintf(stderr, "winvm: %s (rc=%d)\n", label, rc);
+        }
+    });
+    _perfTimer = timer;
+    dispatch_resume(timer);
+}
+
+- (void)stopPerfLog {
+    if (_perfTimer) {
+        dispatch_source_cancel(_perfTimer);
+        _perfTimer = nil;
+    }
+    dispatch_sync(_diagQueue, ^{ hv_perf_csv_close(&self->_perfCsv); });
+}
+
 - (void)onDiagTickBackground {
     _diagTickCount++;
     [self writeDiagnosticsSnapshot];
     if (_vmRunning) {
+        // A full fsync of the multi-GB image stalls guest disk I/O while it drains; the kernel
+        // keeps dirty pages across an app kill, so a barrier is enough here. Backgrounding and
+        // stopping still do the full sync.
         if ((_diagTickCount % 4u) == 0u) {
-            hv_winvm_flush_disks();
+            hv_winvm_checkpoint_disks();
         }
         double uptime = CFAbsoluteTimeGetCurrent() - _bootStartTime;
         if (uptime <= 240.0 || getenv("WINIOS_ALWAYS_SCREENSHOT") != NULL) {
@@ -532,6 +824,8 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     CGFloat scale = _screenScale;
     NSInteger hingeStatus = _hingeStatus;
     double hingeDeg = _hingeAngleDegrees;
+    NSString *geometry = _geometryReport ?: @"";
+    uint32_t requestW = _requestedGuestW, requestH = _requestedGuestH;
     os_unfair_lock_unlock(&_metricsLock);
 
     NSString *txt = [NSString stringWithFormat:
@@ -545,18 +839,25 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         @"avail_mem_mb: %llu\n"
         @"jit_used_mb: %.1f\n"
         @"jit_cap_mb: %.0f\n"
-        @"jit_full_flushes: %llu\n"
+        @"jit_flushes: %llu\n"
         @"wfi_idle_pct: %.1f\n"
+        @"thermal_state: %ld\n"
+        @"low_power: %d\n"
+        @"cores_perf_eff: %d/%d\n"
         @"fb_size: %ux%u\n"
         @"frames_presented: %llu\n"
         @"usb_kbd_ready: %d\n"
         @"usb_tab_ready: %d\n"
         @"usb_delivered: %llu\n"
         @"share_up: %d\n"
+        @"focus_agent_seen_s: %ld\n"
         @"oauth_safari: %d\n"
         @"hinge_status: %ld\n"
         @"hinge_angle_deg: %.1f\n"
-        @"screen_pts: %.0fx%.0f @%.0fx\n",
+        @"screen_pts: %.0fx%.0f @%.0fx\n"
+        @"guest_request: %ux%u\n"
+        @"guest_ram_mb: %llu\n"
+        @"phys_mb: %llu\n",
         running ? @"true" : @"false",
         _vmStatus ?: @"",
         self.isJITLive ? @"true" : @"false",
@@ -569,26 +870,63 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
         (double)jitCapBytes / (1024.0 * 1024.0),
         jitFullFlushes,
         wfiIdlePct,
+        (long)NSProcessInfo.processInfo.thermalState,
+        NSProcessInfo.processInfo.lowPowerModeEnabled ? 1 : 0,
+        sysctl_int("hw.perflevel0.logicalcpu"), sysctl_int("hw.perflevel1.logicalcpu"),
         w, h,
         frames,
         kbdReady,
         tabReady,
         usbDelivered,
         running ? hv_winvm_share_up() : 0,
+        hv_share_focus_agent_seen(),
         hv_share_url_handler_enabled(),
         (long)hingeStatus,
         hingeDeg,
-        pt.width, pt.height, scale];
+        pt.width, pt.height, scale,
+        requestW, requestH,
+        self.guestRAMMB,
+        (unsigned long long)(NSProcessInfo.processInfo.physicalMemory >> 20)];
+    txt = [txt stringByAppendingString:geometry];
     [txt writeToFile:statusFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 - (void)handleVMExitWithReason:(NSString *)reason {
     _vmRunning = NO;
+    [_cmdThread cancel];
     [self stopDiagTimer];
+    [self stopPerfLog];
     [[UIApplication sharedApplication] setIdleTimerDisabled:NO];
     _vmStatus = [NSString stringWithFormat:@"Stopped (%@)", reason];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
     [self notifyChanged];
+}
+
+- (void)sendTouchContacts:(const WinIOSTouchContact *)contacts count:(NSInteger)count {
+    if (!_vmRunning || !contacts || count <= 0) return;
+    HvTouchContact frame[5];
+    int n = (int)MIN(count, 5);
+    for (int i = 0; i < n; i++) {
+        frame[i] = (HvTouchContact){.id = contacts[i].id, .tip = contacts[i].tip, .x = contacts[i].x, .y = contacts[i].y};
+    }
+    hv_winvm_touch(frame, n);
+}
+
+- (BOOL)touchscreenReady {
+    return _vmRunning && hv_winvm_touch_ready();
+}
+
+- (void)requestDisplayWidth:(uint32_t)width height:(uint32_t)height {
+    os_unfair_lock_lock(&_metricsLock);
+    _requestedGuestW = width;
+    _requestedGuestH = height;
+    os_unfair_lock_unlock(&_metricsLock);
+    hv_winvm_request_display_size(width, height);
+    dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
+}
+
+- (void)setLaptopPosture:(BOOL)laptop {
+    hv_winvm_set_posture(laptop ? 1 : 0);
 }
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel {
@@ -649,6 +987,11 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     hv_winvm_power_button();
 }
 
+- (void)requestHibernate {
+    if (!_vmRunning) return;
+    hv_winvm_request_hibernate();
+}
+
 - (void)flushDisks {
     if (!_vmRunning) return;
     hv_winvm_flush_disks();
@@ -666,6 +1009,40 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 - (void)setUseSafariForGuestLinks:(BOOL)useSafariForGuestLinks {
     hv_share_set_url_handler_enabled(useSafariForGuestLinks ? 1 : 0);
     [[NSUserDefaults standardUserDefaults] setBool:useSafariForGuestLinks forKey:@"winios.safariOAuthV2"];
+}
+
+/* The event the app noted last, on the main queue. A report that answers an earlier one is dropped there: the
+   share server has checked it against its own latest, but a newer tap can be noted before the report is delivered.
+   Only earlier ones: the command file's notetap and notelook note events the app never sees, and their reports
+   must still arrive. */
+static unsigned long latest_focus_event;
+
+static void text_focus_reported(unsigned long seq, int editable, int inside, void *ctx) {
+    (void)ctx;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (seq < latest_focus_event) return;
+        void (^handler)(BOOL, BOOL) = WinIOSBridge.shared.onGuestTextFocus;
+        if (handler) handler(editable != 0, inside != 0);
+    });
+}
+
+- (void)setOnGuestTextFocus:(void (^)(BOOL, BOOL))onGuestTextFocus {
+    _onGuestTextFocus = [onGuestTextFocus copy];
+    hv_share_set_text_focus_handler(_onGuestTextFocus ? text_focus_reported : NULL, NULL);
+}
+
+- (NSInteger)textFocusAgentSeenSeconds {
+    return (NSInteger)hv_share_focus_agent_seen();
+}
+
+- (void)noteTapAtGuestX:(int32_t)x y:(int32_t)y {
+    dispatch_assert_queue(dispatch_get_main_queue());
+    latest_focus_event = hv_share_note_tap(x, y);
+}
+
+- (void)noteFocusLook {
+    dispatch_assert_queue(dispatch_get_main_queue());
+    latest_focus_event = hv_share_note_look();
 }
 
 - (nullable NSString *)takeGuestOpenURL {

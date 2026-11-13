@@ -69,12 +69,12 @@ extern uint64_t winios_brk_probe(void);
     } while (0)
 
 /* Executable JIT pages above 0x7000000000 hang on iOS 26/27 TXM devices.
- * Reserve a 512 MiB zero-fill block in __DATA at launch so it sits inside the
+ * Reserve a zero-fill block (WINIOS_JIT_MAX_BYTES) in __DATA at launch so it sits inside the
  * low < 0x180000000 window, then deallocate it immediately before debugserver's
  * `_M<size>,rx` allocation takes the first-fit hole. */
 #define WINIOS_JIT_LOW_LIMIT 0x7000000000ull
 __attribute__((used, aligned(16384)))
-static uint8_t g_jit_reserve[WINIOS_JIT_DEFAULT_BYTES + (16u << 10)];
+static uint8_t g_jit_reserve[WINIOS_JIT_MAX_BYTES + (16u << 10)];
 static bool g_jit_reserve_released;
 
 static _Thread_local bool g_expecting_jit_trap;
@@ -93,11 +93,14 @@ static void prealloc_ledger_exempt_ram(void) {
     size_t len = sizeof phys_mem;
     sysctlbyname("hw.memsize", &phys_mem, &len, NULL, 0);
     uint64_t phys_mb = phys_mem >> 20;
-    /* Size Guest RAM to fit comfortably within iOS 36-bit user VA ceiling alongside TXM JIT RX/RW + JIT tables */
-    static const uint64_t candidates_mb[] = {4608, 4096, 3584, 3072, 2560, 2048};
+    /* The largest size that leaves iOS at least 4 GiB of physical RAM, since Windows eventually
+     * touches all of its memory. Sizes above 4608 MiB are meant for the extended-virtual-addressing
+     * and increased-memory-limit entitlements; if an allocation fails the next size is tried. */
+    static const uint64_t ios_reserve_mb = 4096;
+    static const uint64_t candidates_mb[] = {8192, 7168, 6144, 5120, 4608, 4096, 3584, 3072, 2560, 2048};
     for (size_t i = 0; i < sizeof(candidates_mb) / sizeof(candidates_mb[0]); i++) {
         uint64_t mb = candidates_mb[i];
-        if (phys_mb > 0 && mb + 2560 > phys_mb) continue;
+        if (phys_mb > 0 && mb + ios_reserve_mb > phys_mb) continue;
         uint8_t *p = hv_alloc_no_footprint(mb << 20);
         if (p) {
             g_guest_ram = p;
@@ -161,11 +164,11 @@ size_t winios_available_memory_bytes(void) {
 }
 
 static void release_low_hold(size_t bytes) {
-    if (g_jit_reserve_released || bytes > WINIOS_JIT_DEFAULT_BYTES) return;
+    if (g_jit_reserve_released || bytes > WINIOS_JIT_MAX_BYTES) return;
     vm_address_t start = ((vm_address_t)g_jit_reserve + 16383) & ~(vm_address_t)16383;
-    kern_return_t kr = vm_deallocate(mach_task_self(), start, WINIOS_JIT_DEFAULT_BYTES);
+    kern_return_t kr = vm_deallocate(mach_task_self(), start, WINIOS_JIT_MAX_BYTES);
     WINIOS_LOG("released low __DATA hold at %#lx (%zu MiB): %s",
-               (unsigned long)start, WINIOS_JIT_DEFAULT_BYTES >> 20, mach_error_string(kr));
+               (unsigned long)start, WINIOS_JIT_MAX_BYTES >> 20, mach_error_string(kr));
     g_jit_reserve_released = true;
 }
 
@@ -201,6 +204,7 @@ static bool jit_selftest(const WinIosDualMapping *m) {
 bool winios_jit_acquire(size_t bytes, bool detach_after) {
     if (atomic_load(&g_jit_live)) return true;
     if (bytes == 0) bytes = WINIOS_JIT_DEFAULT_BYTES;
+    if (bytes > WINIOS_JIT_MAX_BYTES) bytes = WINIOS_JIT_MAX_BYTES;
     bytes = (bytes + 0x3fffu) & ~(size_t)0x3fffu;
 
     if (!winios_jit_is_debugger_attached()) {

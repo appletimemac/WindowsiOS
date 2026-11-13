@@ -46,6 +46,7 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
 
 int hv_machine_init_jit(HvMachine *m, void *rx, void *rw, size_t jit_bytes) {
     knobs_init();
+    hv_mmu_env_init();
     memset(m, 0, sizeof *m);
     if (hv_jit_region_attach(&m->jit, rx, rw, jit_bytes) != 0) return -1;
     return init_rest(m);
@@ -75,8 +76,8 @@ static int init_rest(HvMachine *m) {
     m->slot_cond = calloc(m->max_slots, sizeof *m->slot_cond);
     m->slot_xa = calloc(m->max_slots, sizeof *m->slot_xa);
     m->slot_xpa = calloc(m->max_slots, sizeof *m->slot_xpa);
-    m->xchained = calloc(m->max_slots, sizeof *m->xchained);
-    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->xchained) return -1;
+    m->slot_xnext = calloc(m->max_slots, sizeof *m->slot_xnext);
+    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->slot_xnext) return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -105,11 +106,17 @@ static int init_rest(HvMachine *m) {
 }
 
 __thread HvCpu *hv_self;
+/* Device lock depth of this thread: a code invalidation under it came from a device (DMA), not a store. */
+static __thread int dev_depth;
 
 void hv_dev_lock(HvMachine *m) {
-    if (pthread_mutex_trylock(&m->dev_mu) == 0) return;
+    if (pthread_mutex_trylock(&m->dev_mu) == 0) {
+        dev_depth++;
+        return;
+    }
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
     pthread_mutex_lock(&m->dev_mu);
+    dev_depth++;
     if (m->stats_interval) {
         m->stats.dev_waits++;
         m->stats.dev_wait_ticks += mach_absolute_time() - t0;
@@ -117,6 +124,7 @@ void hv_dev_lock(HvMachine *m) {
 }
 
 void hv_dev_unlock(HvMachine *m) {
+    dev_depth--;
     pthread_mutex_unlock(&m->dev_mu);
 }
 
@@ -260,7 +268,14 @@ void hv_machine_free(HvMachine *m) {
     hv_jit_region_close(&m->jit);
     for (int i = 0; i < m->nram; i++) {
         free(m->ram[i].code_pages);
+        free(m->ram[i].chain_in);
         free(m->ram[i].page_gen);
+        free(m->ram[i].code_grains);
+        free(m->ram[i].code_miss);
+        free(m->ram[i].code_hot);
+        free(m->ram[i].block_head);
+        free(m->ram[i].page_seq);
+        free(m->ram[i].diag_words);
     }
     free(m->blocks);
     for (int i = 0; i < HV_MAX_CPUS; i++) {
@@ -278,7 +293,7 @@ void hv_machine_free(HvMachine *m) {
     free(m->slot_cond);
     free(m->slot_xa);
     free(m->slot_xpa);
-    free(m->xchained);
+    free(m->slot_xnext);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
@@ -293,10 +308,18 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     while ((1ull << r->pages_log2) < pages) r->pages_log2++;
     /* A power of two, so translated code bounds-checks a page index with one shift (IC IVAU). */
     r->code_pages = calloc((size_t)1 << r->pages_log2, 1);
+    r->chain_in = calloc(pages, sizeof *r->chain_in);
     if (!m->main_ram || size > m->main_ram->size) m->main_ram = r;
     r->page_gen = calloc(pages, sizeof *r->page_gen);
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
-    return r->code_pages && r->page_gen && r->whint ? 0 : -1;
+    r->code_grains = calloc(pages * HV_CODE_GRAIN_WORDS, sizeof *r->code_grains); /* 28 MB at 7 GB, touched where code is */
+    r->code_miss = calloc(pages, sizeof *r->code_miss);
+    r->code_hot = calloc(pages, 1);
+    r->block_head = calloc(pages, sizeof *r->block_head);
+    r->page_seq = calloc(pages, sizeof *r->page_seq);
+    if (hv_code_diag_on()) r->diag_words = calloc(pages, (1u << HV_TLB_PAGE_BITS) / 32);
+    return r->code_pages && r->chain_in && r->page_gen && r->whint && r->code_grains && r->code_miss && r->code_hot &&
+           r->block_head && r->page_seq ? 0 : -1;
 }
 
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
@@ -319,45 +342,283 @@ uint32_t *hv_smc_counts;
 uint64_t *hv_smc_last;
 uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
 
-void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+static uint64_t grain_mask(uint32_t w, uint32_t a, uint32_t b) { /* pieces a..b within word w of the map */
+    uint64_t mask = ~0ull;
+    if (w == a >> 6) mask &= ~0ull << (a & 63);
+    if (w == b >> 6) mask &= ~0ull >> (63 - (b & 63));
+    return mask;
+}
+
+void hv_code_grains_mark(HvRam *r, uint64_t pg, uint32_t lo, uint32_t hi) {
+    if (lo >= hi) return;
+    uint64_t *g = r->code_grains + pg * HV_CODE_GRAIN_WORDS;
+    uint32_t a = lo >> HV_CODE_GRAIN_BITS, b = (hi - 1) >> HV_CODE_GRAIN_BITS;
+    for (uint32_t w = a >> 6; w <= b >> 6; w++) __atomic_fetch_or(&g[w], grain_mask(w, a, b), __ATOMIC_SEQ_CST);
+}
+
+int hv_code_grains_hit(const HvRam *r, uint64_t pg, uint32_t lo, uint32_t hi) {
+    if (lo >= hi) return 0;
+    const uint64_t *g = r->code_grains + pg * HV_CODE_GRAIN_WORDS;
+    uint32_t a = lo >> HV_CODE_GRAIN_BITS, b = (hi - 1) >> HV_CODE_GRAIN_BITS;
+    for (uint32_t w = a >> 6; w <= b >> 6; w++)
+        if (__atomic_load_n(&g[w], __ATOMIC_RELAXED) & grain_mask(w, a, b)) return 1;
+    return 0;
+}
+
+/* Does the write [off, off + len) (offsets into r) cover a translated piece of page pg? */
+static int write_hits(const HvRam *r, uint64_t pg, uint64_t off, uint64_t len) {
+    uint64_t start = pg << HV_TLB_PAGE_BITS, end = start + (1u << HV_TLB_PAGE_BITS);
+    uint64_t lo = off > start ? off : start, hi = off + len < end ? off + len : end;
+    return hv_code_grains_hit(r, pg, (uint32_t)(lo - start), (uint32_t)(hi - start));
+}
+
+/* The page's blocks go: the write hit them, or the page took too many writes that missed them (counted here,
+   without the lock; a lost count only delays giving up). */
+static int write_drops(HvRam *r, uint64_t pg, uint64_t off, uint64_t len, int *forced) {
+    if (write_hits(r, pg, off, len)) return 1;
+    uint16_t n = __atomic_load_n(&r->code_miss[pg], __ATOMIC_RELAXED);
+    if (n < HV_CODE_MISS_MAX) {
+        __atomic_store_n(&r->code_miss[pg], (uint16_t)(n + 1), __ATOMIC_RELAXED);
+        return 0;
+    }
+    *forced = 1;
+    return 1;
+}
+
+/* HV_CODE_DIAG: measuring why writes drop pages. */
+__thread uint64_t hv_access_pc;
+__thread int hv_diag_same = -1;
+int hv_code_diag_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("HV_CODE_DIAG") != NULL;
+    return on;
+}
+
+void hv_code_diag_mark(HvRam *r, uint64_t pg, uint32_t lo, uint32_t hi) {
+    if (!r->diag_words || lo >= hi) return;
+    uint8_t *bits = r->diag_words + pg * ((1u << HV_TLB_PAGE_BITS) / 32);
+    for (uint32_t w = lo >> 2; w < (hi + 3) >> 2; w++) __atomic_fetch_or(&bits[w >> 3], (uint8_t)(1u << (w & 7)), __ATOMIC_RELAXED);
+}
+
+typedef struct {
+    uint64_t key, count, word, same, zero, bytes, lens[6], g8, g16;
+    uint32_t insns[8], offs;
+    int have_insns;
+} DiagPc;
+#define DIAG_PCS 4096
+static DiagPc diag_pcs[DIAG_PCS];
+static pthread_mutex_t diag_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* One write that dropped page pg of r: classify it, and count it under the guest PC that made it. */
+static void diag_record(HvMachine *m, HvRam *r, uint64_t pg, uint64_t off, uint64_t len) {
+    uint64_t start = pg << HV_TLB_PAGE_BITS, end = start + (1u << HV_TLB_PAGE_BITS);
+    uint64_t lo = off > start ? off : start, hi = off + len < end ? off + len : end;
+    int word = 0, g8 = 0, g16 = 0, zero = 1;
+    if (r->diag_words) { /* on a translated word, or within the same 8 or 16 bytes as one */
+        const uint8_t *bits = r->diag_words + pg * ((1u << HV_TLB_PAGE_BITS) / 32);
+        uint64_t w0 = (lo - start) >> 2, w1 = ((hi - start) + 3) >> 2;
+        for (uint64_t w = w0 & ~3ull; w < ((w1 + 3) & ~3ull) && w < (1u << HV_TLB_PAGE_BITS) / 4; w++) {
+            int t = (__atomic_load_n(&bits[w >> 3], __ATOMIC_RELAXED) >> (w & 7)) & 1;
+            if (!t) continue;
+            g16 = 1;
+            if (w >= (w0 & ~1ull) && w < ((w1 + 1) & ~1ull)) g8 = 1;
+            if (w >= w0 && w < w1) word = 1;
+        }
+    }
+    for (uint64_t b = lo; b < hi && b < lo + 64; b++) zero &= r->host[b] == 0;
+    int same = hv_diag_same == 1;
+    HvCpu *c = hv_self;
+    m->stats.diag_word += word, m->stats.diag_same += same, m->stats.diag_zero += zero;
+    m->stats.diag_el1 += c && c->el, m->stats.diag_dev += !c, m->stats.diag_big += len >= 256;
+    m->stats.diag_g8 += g8, m->stats.diag_g16 += g16;
+    uint64_t pc = c ? hv_access_pc : 0;
+    uint64_t key = c ? (uint64_t)c->el << 62 | (pc & ((1ull << 62) - 1)) : ~0ull;
+    int lb = len <= 4 ? 0 : len <= 8 ? 1 : len <= 16 ? 2 : len <= 32 ? 3 : len <= 64 ? 4 : 5;
+    pthread_mutex_lock(&diag_mu);
+    uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 52);
+    DiagPc *d = NULL;
+    for (uint32_t k = 0; k < DIAG_PCS; k++) {
+        DiagPc *e = &diag_pcs[(h + k) & (DIAG_PCS - 1)];
+        if (!e->count || e->key == key) { d = e; break; }
+    }
+    if (d) {
+        if (!d->count) {
+            d->key = key;
+            d->offs = (uint32_t)(lo - start);
+            if (c) { /* the instructions around the store, through this CPU's own mapping */
+                for (int i = 0; i < 8; i++) {
+                    HvWalk w;
+                    hv_mmu_walk(c, pc - 16 + 4 * i, HV_ACC_READ, 1, &w);
+                    const uint32_t *p = w.fsc ? NULL : hv_phys_ptr(m, w.pa, 4);
+                    d->insns[i] = p ? *p : 0;
+                }
+                d->have_insns = 1;
+            }
+        }
+        d->count++, d->word += word, d->same += same, d->zero += zero, d->bytes += len, d->lens[lb]++;
+        d->g8 += g8, d->g16 += g16;
+    }
+    pthread_mutex_unlock(&diag_mu);
+}
+
+static int diag_cmp(const void *a, const void *b) {
+    const DiagPc *x = a, *y = b;
+    return x->count < y->count ? 1 : x->count > y->count ? -1 : 0;
+}
+
+int hv_code_diag_dump(HvMachine *m, const char *path) {
+    if (!hv_code_diag_on()) return -1;
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    static DiagPc copy[DIAG_PCS];
+    pthread_mutex_lock(&diag_mu);
+    memcpy(copy, diag_pcs, sizeof copy);
+    pthread_mutex_unlock(&diag_mu);
+    qsort(copy, DIAG_PCS, sizeof copy[0], diag_cmp);
+    const HvStats *s = &m->stats;
+    fprintf(f, "writes to code pages %llu, dropped %llu (forced %llu)\n", (unsigned long long)s->code_writes,
+            (unsigned long long)s->code_write_hits, (unsigned long long)s->code_write_forced);
+    fprintf(f, "of the dropping writes: on translated words %llu, within 8B %llu, within 16B %llu, same bytes %llu, zeros %llu, EL1 %llu, device %llu, 256B+ %llu\n",
+            (unsigned long long)s->diag_word, (unsigned long long)s->diag_g8, (unsigned long long)s->diag_g16,
+            (unsigned long long)s->diag_same, (unsigned long long)s->diag_zero,
+            (unsigned long long)s->diag_el1, (unsigned long long)s->diag_dev, (unsigned long long)s->diag_big);
+    fprintf(f, "el pc count word g8 g16 same zero avgbytes lens<=4/8/16/32/64/more first-offset insns(pc-16..pc+12)\n");
+    for (int i = 0; i < 60 && copy[i].count; i++) {
+        const DiagPc *d = &copy[i];
+        if (d->key == ~0ull) fprintf(f, "dev -");
+        else fprintf(f, "%llu %llx", (unsigned long long)(d->key >> 62), (unsigned long long)(d->key & ((1ull << 62) - 1)));
+        fprintf(f, " %llu %llu %llu %llu %llu %llu %llu %llu/%llu/%llu/%llu/%llu/%llu %x", (unsigned long long)d->count,
+                (unsigned long long)d->word, (unsigned long long)d->g8, (unsigned long long)d->g16,
+                (unsigned long long)d->same, (unsigned long long)d->zero,
+                (unsigned long long)(d->bytes / d->count), (unsigned long long)d->lens[0], (unsigned long long)d->lens[1],
+                (unsigned long long)d->lens[2], (unsigned long long)d->lens[3], (unsigned long long)d->lens[4],
+                (unsigned long long)d->lens[5], d->offs);
+        if (d->have_insns)
+            for (int k = 0; k < 8; k++) fprintf(f, " %08x", d->insns[k]);
+        fprintf(f, "\n");
+    }
+    fclose(f);
+    return 0;
+}
+
+/* Retire the blocks of hot page pg made from bytes [off, off + len) of r, and no others. Whatever still enters
+   one (a chain from any page, the indirect-branch cache, the dispatcher's block in hand) meets its first word, now
+   a branch to its forwarding stub: an exit whose slot chains to the block's replacement. So nothing is unchained,
+   no cache starts over and nobody is asked to leave; a CPU inside one finishes it, as with a dropped page.
+   0: the page is dropped instead (a block without a stub, or the page's share of retirements used up, which also
+   bounds how many forwards an old chain can cross). Under tr_mu. */
+static int retire_blocks(HvMachine *m, HvRam *r, uint64_t pg, uint64_t off, uint64_t len) {
+    uint16_t n = __atomic_load_n(&r->code_miss[pg], __ATOMIC_RELAXED);
+    if (n >= HV_CODE_MISS_MAX || hv_knob[HV_K_GROUPS]) return 0; /* grouping reads past a block's own words */
+    uint64_t lo = r->pa + off, hi = lo + len;
+    uint32_t gen = __atomic_load_n(&r->page_gen[pg], __ATOMIC_RELAXED);
+    for (uint32_t i = r->block_head[pg]; i; i = m->blocks[i - 1].page_next) {
+        const HvBlock *b = &m->blocks[i - 1];
+        if (b->gen == gen && b->pa < hi && lo < b->pa + 4ull * b->ninsns && !b->fwd) return 0;
+    }
+    /* Before the list: a translation of these bytes not yet in it sees this at its publication and starts over. */
+    __atomic_add_fetch(&r->page_seq[pg], 1, __ATOMIC_SEQ_CST);
+    for (uint32_t *link = &r->block_head[pg]; *link;) {
+        HvBlock *b = &m->blocks[*link - 1];
+        int live = b->gen == gen;
+        if (live && b->pa < hi && lo < b->pa + 4ull * b->ninsns) {
+            uint32_t *site = m->slot_site[b->fwd - 1];
+            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[b->fwd - 1] - site) & 0x3ffffff);
+            __atomic_store_n(&b->gen, HV_GEN_DEAD, __ATOMIC_RELEASE); /* no lookup returns it from here on */
+            hv_jit_write(&m->jit, site, &insn, 4);                    /* nop to b: safe under a CPU running it */
+            hv_jit_finish(&m->jit, site, 1);
+            m->stats.code_block_kills++;
+            live = 0;
+        }
+        if (live) link = &b->page_next;
+        else *link = b->page_next; /* and stale ones leave the list on the way */
+    }
+    __atomic_store_n(&r->code_miss[pg], (uint16_t)(n + 1), __ATOMIC_RELAXED);
+    return 1;
+}
+
+/* Drop the blocks translated from the pages of [pa, pa + len): every page holding code (all), or only those
+   where the bytes overlap a translated piece. */
+static void invalidate_code(HvMachine *m, uint64_t pa, uint64_t len, int all) {
     HvRam *r = hv_ram_lookup(m, pa);
-    if (!r) return;
-    uint64_t pg = (pa - r->pa) >> HV_TLB_PAGE_BITS;
-    if (!r->code_pages[pg]) return;
+    if (!r || !len || len > r->size - (pa - r->pa)) return;
+    uint64_t off = pa - r->pa;
+    uint64_t first = off >> HV_TLB_PAGE_BITS;
+    uint64_t last = (off + len - 1) >> HV_TLB_PAGE_BITS;
+    while (first <= last && !__atomic_load_n(&r->code_pages[first], __ATOMIC_ACQUIRE)) first++;
+    if (first > last) return;
+    int forced = 0;
+    if (!all) {
+        m->stats.code_writes++;
+        while (first <= last && !(__atomic_load_n(&r->code_pages[first], __ATOMIC_ACQUIRE) && write_drops(r, first, off, len, &forced))) first++;
+        if (first > last) return; /* only bytes no translation came from: the page stays write-protected */
+        if (hv_code_diag_on()) diag_record(m, r, first, off, len);
+        m->stats.code_write_hits++;
+        m->stats.code_write_forced += forced;
+    }
+    uint64_t t0 = mach_absolute_time();
     /* Blocks remember the generation they were made under; a stale one is
        retranslated the next time it is looked up. The block running now may
        finish with the old code, as it would with a real instruction pipeline. */
-    r->code_pages[pg] = 0;
-    __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
-    m->stats.flush_smc++;
-    if (hv_smc_counts && pg < hv_smc_pages) {
-        hv_smc_counts[pg]++;
-        uint64_t caller = hv_self ? hv_self->pc : 0;
-        hv_smc_last[pg] = caller;
-        if (hv_self) hv_smc_cpu++;
-        else hv_smc_dma++;
-    }
-    /* Exits from other pages chained into the stale blocks go back to their stub
-       (whose next chain finds the new translation). Under the translation lock,
-       as chaining them is: one that saw the old generation is done by now. */
     pthread_mutex_lock(&m->tr_mu);
-    uint64_t tpa = (r->pa + (pg << HV_TLB_PAGE_BITS)) | 1;
-    for (uint32_t k = 0; k < m->nxchained;) {
-        uint32_t idx = m->xchained[k];
-        if (m->slot_xpa[idx] != tpa) {
-            k++;
-            continue;
+    int any = 0;
+    for (uint64_t pg = first; pg <= last; pg++) {
+        if (!__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) continue;
+        int hit = all || write_hits(r, pg, off, len);
+        if (!hit && __atomic_load_n(&r->code_miss[pg], __ATOMIC_RELAXED) < HV_CODE_MISS_MAX) continue;
+        if (!all && hit && len <= HV_CODE_PATCH_MAX && r->code_hot[pg] && retire_blocks(m, r, pg, off, len)) continue;
+        __atomic_store_n(&r->code_miss[pg], 0, __ATOMIC_RELAXED);
+        r->block_head[pg] = 0; /* its blocks all go: the list with them */
+        /* A page written over its code once is likely a JIT's: from the next generation on its blocks can be
+           retired one at a time. Before the generation moves, so a translation under the new one sees it. */
+        if (hit && !all) __atomic_store_n(&r->code_hot[pg], 1, __ATOMIC_RELEASE);
+        /* The marks go before the generation moves, so a translation that reads the new one marks after this
+           (and a stale block's late marks only cost a needless invalidation one day). */
+        uint64_t *g = r->code_grains + pg * HV_CODE_GRAIN_WORDS;
+        for (unsigned w = 0; w < HV_CODE_GRAIN_WORDS; w++) __atomic_store_n(&g[w], 0, __ATOMIC_RELAXED);
+        if (r->diag_words) memset(r->diag_words + pg * ((1u << HV_TLB_PAGE_BITS) / 32), 0, (1u << HV_TLB_PAGE_BITS) / 32);
+        if (!__atomic_exchange_n(&r->code_pages[pg], 0, __ATOMIC_SEQ_CST)) continue;
+        any = 1;
+        if (__atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST) == HV_GEN_DEAD)
+            __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST); /* never a retired block's */
+        m->stats.flush_smc++;
+        if (hv_smc_counts && pg < hv_smc_pages) {
+            hv_smc_counts[pg]++;
+            uint64_t caller = hv_self ? hv_self->pc : 0;
+            hv_smc_last[pg] = caller;
+            if (hv_self) hv_smc_cpu++;
+            else hv_smc_dma++;
         }
-        m->slot_xpa[idx] = 0;
-        __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
-        uint32_t *site = m->slot_site[idx];
-        if (site) {
-            uint32_t insn = 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff); /* back to its stub */
-            hv_jit_write(&m->jit, site, &insn, 4);
-            hv_jit_finish(&m->jit, site, 1);
+        /* Exits from other pages chained into the stale blocks go back to their stub
+           (whose next chain finds the new translation). Under the translation lock,
+           as chaining them is: one that saw the old generation is done by now. */
+        for (uint32_t s = r->chain_in[pg]; s;) {
+            uint32_t idx = s - 1;
+            s = m->slot_xnext[idx];
+            m->stats.inval_scanned++;
+            m->nxchained--;
+            m->slot_xpa[idx] = 0;
+            __atomic_store_n(&m->slots[idx], 0, __ATOMIC_RELEASE);
+            uint32_t *site = m->slot_site[idx];
+            uint32_t insn = site ? 0x14000000u | (uint32_t)((m->slot_stub[idx] - site) & 0x3ffffff) : 0; /* back to its stub */
+            if (site && *site != insn) { /* a far chain never left it */
+                hv_jit_write(&m->jit, site, &insn, 4);
+                hv_jit_finish(&m->jit, site, 1);
+            }
         }
-        m->xchained[k] = m->xchained[--m->nxchained];
+        r->chain_in[pg] = 0;
+        if (m->gen_checks) {
+            uint64_t xpa = (r->pa + (pg << HV_TLB_PAGE_BITS)) | 1;
+            for (uint32_t k = 0; k < m->nslots && k < m->max_slots; k++)
+                if (m->slot_xpa[k] == xpa) fprintf(stderr, "hengevm: invalidation left chain slot %u to pa %llx\n", k, (unsigned long long)xpa);
+        }
     }
+    if (!any) {
+        pthread_mutex_unlock(&m->tr_mu);
+        m->stats.inval_ticks += mach_absolute_time() - t0; /* retiring blocks takes time too */
+        return;
+    }
+    if (dev_depth || !hv_self) m->stats.inval_dev++;
     pthread_mutex_unlock(&m->tr_mu);
     /* The indirect-branch cache may lead into the stale blocks: start it over,
        here at once and on the other CPUs before they next leave a block (their
@@ -378,14 +639,19 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     m->stats.reset_why[4]++;
     /* Make a running chain leave (chains stay patched: see chain() in dispatch.c). */
     hv_machine_kick_all(m);
+    m->stats.inval_ticks += mach_absolute_time() - t0;
 }
 
-void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len) {
-    HvRam *r = hv_ram_lookup(m, pa);
-    if (!r || !len || pa + len - r->pa > r->size) return;
-    uint64_t first = (pa - r->pa) >> HV_TLB_PAGE_BITS, last = (pa + len - 1 - r->pa) >> HV_TLB_PAGE_BITS;
-    for (uint64_t pg = first; pg <= last; pg++)
-        if (__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS));
+void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+    invalidate_code(m, pa, 1, 1);
+}
+
+void hv_ram_written(HvMachine *m, uint64_t pa, uint64_t len) {
+    /* The write is done; now the marks. lookup() marks, fences, then checks the words it translated: one side
+       always sees the other, so no block survives that was made from bytes this write changed. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    invalidate_code(m, pa, len, 0);
+    hv_diag_same = -1; /* hv_phys_write's note about this write is used up */
 }
 
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
@@ -423,12 +689,10 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
 
 int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
     HvRam *r = hv_ram_lookup(m, pa);
-    if (r && pa + len - r->pa <= r->size) {
+    if (r && len <= r->size - (pa - r->pa)) {
         if (r->readonly) return 0; /* ROM: writes are ignored */
         uint64_t off = pa - r->pa;
-        uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-        for (uint64_t pg = first; pg <= last; pg++)
-            if (r->code_pages[pg]) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS)); /* a write to code */
+        if (r->diag_words && r->code_pages[off >> HV_TLB_PAGE_BITS]) hv_diag_same = !memcmp(r->host + off, buf, len);
         if (m->watch_pa && m->watch_pa - pa < len) {
             uint64_t v = 0;
             memcpy(&v, (const uint8_t *)buf + (m->watch_pa - pa), len - (m->watch_pa - pa) < 8 ? len - (m->watch_pa - pa) : 8);
@@ -437,6 +701,7 @@ int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
                     (unsigned long long)m->access_pc);
         }
         memcpy(r->host + off, buf, len);
+        hv_ram_written(m, pa, len);
         return 0;
     }
     HvMmio *d = hv_mmio_lookup(m, pa);

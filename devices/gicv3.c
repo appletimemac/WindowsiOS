@@ -143,6 +143,41 @@ static void hv_gicv3_pend_body(HvGic *g, int intid) {
     hv_gicv3_update(g);
 }
 
+/* For the state dump: what each CPU's interface holds and every interrupt that is asserted, pending or active. */
+void hv_gicv3_dump(HvGic *g, FILE *f) {
+    pthread_mutex_lock(&g->mu);
+    fprintf(f, "gic: ctlr=%x\n", g->ctlr);
+    for (int c = 0; c < ncpus(g); c++) {
+        HvGicCpu *k = &g->cpu[c];
+        HvPerCpu *p = &g->m->percpu[c];
+        uint8_t prio = 0;
+        int grp = 1, shown = hppi_ex(g, c, 1, &prio, &grp), any = hppi_ex(g, c, 0, NULL, NULL);
+        fprintf(f, "gic cpu%d: irq_line=%d fiq_line=%d pmr=%llx igrpen0=%llu igrpen1=%llu ctlr=%llx running=%x depth=%d hppi=%d (prio %x) unmasked_hppi=%d lpis=%u\n",
+                c, p->irq_line, p->fiq_line, (unsigned long long)k->pmr, (unsigned long long)k->igrpen0,
+                (unsigned long long)k->igrpen1, (unsigned long long)k->icc_ctlr, running_priority(g, c), k->depth, shown, prio, any,
+                k->gicr_ctlr & 1);
+        for (int d = 0; d < k->depth; d++) fprintf(f, "  acknowledged[%d]: intid %u prio %x group %u\n", d, k->stack[d].intid, k->stack[d].prio, k->stack[d].group);
+        for (int i = 0; i < 32; i++)
+            if (k->latch[i] || k->level[i] || k->active[i])
+                fprintf(f, "  intid %d: enabled=%u latch=%u level=%u active=%u prio=%x group=%u edge=%u\n", i, k->enabled[i], k->latch[i],
+                        k->level[i], k->active[i], k->priority[i], k->group[i], k->edge[i]);
+        for (int w = 0; w < HV_GIC_MAX_LPIS / 64; w++)
+            for (uint64_t bits = k->lpi_pending[w]; bits; bits &= bits - 1) {
+                int lpi = HV_GIC_LPI_BASE + w * 64 + __builtin_ctzll(bits);
+                /* Read from RAM only: the table's address is the guest's, and a read through the device path
+                   would take the device lock under this one, the reverse of a device raising an interrupt. */
+                const uint8_t *prop = hv_phys_ptr(g->m, (k->propbaser & 0x000ffffffffff000ULL) + (uint64_t)(lpi - HV_GIC_LPI_BASE), 1);
+                if (prop) fprintf(f, "  lpi %d: pending enabled=%d prio=%x\n", lpi, *prop & 1, *prop & 0xfcu);
+                else fprintf(f, "  lpi %d: pending, properties not in RAM\n", lpi);
+            }
+    }
+    for (int i = 32; i < HV_GIC_NUM_IRQS; i++)
+        if (g->latch[i] || g->level[i] || g->active[i])
+            fprintf(f, "gic spi %d: enabled=%u latch=%u level=%u active=%u prio=%x group=%u edge=%u cpu=%d\n", i, g->enabled[i], g->latch[i],
+                    g->level[i], g->active[i], g->priority[i], g->group[i], g->edge[i], target_of(g, i));
+    pthread_mutex_unlock(&g->mu);
+}
+
 /* ---- the CPU interface ---- */
 
 static uint64_t acknowledge(HvGic *g, int c, int grp) {
@@ -336,7 +371,7 @@ static int bank0(uint32_t a) {
 
 static uint64_t dist_read_body(void *opaque, uint64_t off, unsigned size) {
     HvGic *g = opaque;
-    if (off >= 0x6100 && off < 0x6100 + 8 * HV_GIC_NUM_IRQS) { /* IROUTER<n>, n >= 32 */
+    if (off >= 0x6100 && off < 0x6000 + 8 * HV_GIC_NUM_IRQS) { /* IROUTER<n>, 32 <= n < HV_GIC_NUM_IRQS */
         uint64_t v = g->route[(off - 0x6000) / 8];
         return size == 8 ? v : (uint32_t)(v >> ((off & 4) * 8));
     }
@@ -355,11 +390,12 @@ static uint64_t dist_read_body(void *opaque, uint64_t off, unsigned size) {
 
 static void dist_write_body(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvGic *g = opaque;
-    if (off >= 0x6100 && off < 0x6100 + 8 * HV_GIC_NUM_IRQS) {
+    if (off >= 0x6100 && off < 0x6000 + 8 * HV_GIC_NUM_IRQS) {
         uint64_t *r = &g->route[(off - 0x6000) / 8];
         if (size == 8) *r = v;
         else if (off & 4) *r = (*r & 0xffffffffull) | v << 32;
         else *r = (*r & ~0xffffffffull) | (uint32_t)v;
+        hv_gicv3_update(g);
         return;
     }
     uint32_t a = (uint32_t)off & ~3u, mask = size_mask(off, size);
@@ -583,8 +619,76 @@ struct HvGicIts {
     uint64_t creadr;
     uint64_t baser[8];
     uint16_t coll_cpu[HV_ITS_MAX_COLLS];
+    uint8_t coll_valid[HV_ITS_MAX_COLLS];
     HvItsIte ite[HV_ITS_MAX_ITES];
 };
+
+/* The device, collection and event tables live in guest memory the OS hands over (GITS_BASER, MAPD's ITT),
+   as on real hardware, in this model's own 8-byte formats (their layout is implementation defined):
+     device entry:     bit 63 valid | ITT address (bits 51:8) | EventID bits - 1 (bits 4:0)
+     collection entry: bit 63 valid | target CPU (bits 15:0)
+     event entry:      bit 63 valid | ICID (bits 47:32) | pINTID (bits 31:0)
+   The arrays above cache them. Windows resuming from hibernation restores those tables with the rest of RAM
+   and never maps its devices again, so a cache miss reads the tables. */
+#define ITS_TYPE_DEVICE 1
+#define ITS_TYPE_COLLECTION 4
+
+static int its_entry_pa(HvGicIts *its, int type, uint32_t id, uint64_t *pa) {
+    for (int i = 0; i < 8; i++) {
+        uint64_t b = its->baser[i];
+        if (!(b >> 63) || (int)((b >> 56) & 7) != type) continue;
+        uint32_t ps = (b >> 8) & 3;
+        uint64_t page = ps == 0 ? 4096 : ps == 1 ? 16384 : 65536;
+        uint64_t base = page == 65536 ? (b & 0x0000ffffffff0000ull) | ((b >> 12 & 0xf) << 48) : b & 0x0000fffffffff000ull;
+        uint64_t bytes = ((b & 0xff) + 1) * page;
+        if (!((b >> 62) & 1)) { /* flat */
+            if ((uint64_t)id * 8 >= bytes) return 0;
+            *pa = base + (uint64_t)id * 8;
+            return 1;
+        }
+        uint64_t per = page / 8, l1 = (uint64_t)id / per, l2;
+        if (l1 * 8 >= bytes || hv_phys_read(its->m, base + l1 * 8, &l2, 8) != 0 || !(l2 >> 63)) return 0;
+        *pa = (l2 & 0x000ffffffffff000ull) + ((uint64_t)id % per) * 8;
+        return 1;
+    }
+    return 0;
+}
+
+static int its_entry_read(HvGicIts *its, int type, uint32_t id, uint64_t *v) {
+    uint64_t pa;
+    return its_entry_pa(its, type, id, &pa) && hv_phys_read(its->m, pa, v, 8) == 0 && (*v >> 63);
+}
+
+static void its_entry_write(HvGicIts *its, int type, uint32_t id, uint64_t v) {
+    uint64_t pa;
+    if (its_entry_pa(its, type, id, &pa)) hv_phys_write(its->m, pa, &v, 8);
+}
+
+/* The event entry's address, from the device entry; 0 if the device is not mapped or the event is out of range. */
+static uint64_t its_ite_pa(HvGicIts *its, uint32_t devid, uint32_t eventid) {
+    uint64_t dte;
+    if (!its_entry_read(its, ITS_TYPE_DEVICE, devid, &dte)) return 0;
+    uint32_t bits = (uint32_t)(dte & 0x1f) + 1;
+    if (bits < 32 && eventid >> bits) return 0;
+    return (dte & 0x000fffffffffff00ull) + (uint64_t)eventid * 8;
+}
+
+static void its_ite_write(HvGicIts *its, uint32_t devid, uint32_t eventid, uint64_t v) {
+    uint64_t pa = its_ite_pa(its, devid, eventid);
+    if (pa) hv_phys_write(its->m, pa, &v, 8);
+}
+
+static int its_coll_cpu(HvGicIts *its, uint16_t icid) {
+    if (icid >= HV_ITS_MAX_COLLS) return 0;
+    if (!its->coll_valid[icid]) {
+        uint64_t cte;
+        if (its_entry_read(its, ITS_TYPE_COLLECTION, icid, &cte)) {
+            its->coll_cpu[icid] = (uint16_t)cte;
+            its->coll_valid[icid] = 1;
+        }
+    }
+    return its->coll_cpu[icid];
+}
 
 static int rdbase_to_cpu(HvGicIts *its, uint64_t rdbase) {
     int n = ncpus(its->g);
@@ -594,23 +698,46 @@ static int rdbase_to_cpu(HvGicIts *its, uint64_t rdbase) {
     return (int)rdbase < n ? (int)rdbase : 0;
 }
 
+static void its_dropped(uint32_t devid, uint32_t eventid, const char *why) {
+    static int logged;
+    if (logged < 20) {
+        logged++;
+        fprintf(stderr, "its: MSI from device %#x event %u dropped: %s\n", devid, eventid, why);
+    }
+}
+
+static void its_map_ite(HvGicIts *its, uint32_t devid, uint32_t eventid, uint32_t pintid, uint16_t icid);
+
+static void its_set_pending(HvGicIts *its, uint32_t pintid, uint16_t icid) {
+    int c = its_coll_cpu(its, icid);
+    if (c >= ncpus(its->g)) c = 0;
+    if (pintid >= HV_GIC_LPI_BASE && pintid < HV_GIC_LPI_BASE + HV_GIC_MAX_LPIS) {
+        uint32_t idx = pintid - HV_GIC_LPI_BASE;
+        its->g->cpu[c].lpi_pending[idx / 64] |= 1ull << (idx % 64);
+        hv_gicv3_update_body(its->g);
+    }
+}
+
 static void its_deliver_locked(HvGicIts *its, uint32_t devid, uint32_t eventid) {
-    if (!(its->ctlr & 1u)) return;
+    if (!(its->ctlr & 1u)) {
+        its_dropped(devid, eventid, "ITS disabled");
+        return;
+    }
     for (int i = 0; i < HV_ITS_MAX_ITES; i++) {
-        if (!its->ite[i].valid) continue;
-        if (its->ite[i].devid == devid && its->ite[i].eventid == eventid) {
-            uint32_t pintid = its->ite[i].pintid;
-            uint16_t icid = its->ite[i].icid;
-            int c = icid < HV_ITS_MAX_COLLS ? its->coll_cpu[icid] : 0;
-            if (c >= ncpus(its->g)) c = 0;
-            if (pintid >= HV_GIC_LPI_BASE && pintid < HV_GIC_LPI_BASE + HV_GIC_MAX_LPIS) {
-                uint32_t idx = pintid - HV_GIC_LPI_BASE;
-                its->g->cpu[c].lpi_pending[idx / 64] |= 1ull << (idx % 64);
-                hv_gicv3_update_body(its->g);
-            }
+        if (its->ite[i].valid && its->ite[i].devid == devid && its->ite[i].eventid == eventid) {
+            its_set_pending(its, its->ite[i].pintid, its->ite[i].icid);
             return;
         }
     }
+    /* Not cached: the tables in memory (after a resume from hibernation, the only copy). Delivered from what
+       was read even if the cache has no room left for it. */
+    uint64_t pa = its_ite_pa(its, devid, eventid), ite;
+    if (!pa || hv_phys_read(its->m, pa, &ite, 8) != 0 || !(ite >> 63)) {
+        its_dropped(devid, eventid, "no mapping");
+        return;
+    }
+    its_map_ite(its, devid, eventid, (uint32_t)ite, (uint16_t)(ite >> 32));
+    its_set_pending(its, (uint32_t)ite, (uint16_t)(ite >> 32));
 }
 
 void hv_gicv3_its_msi(HvGicIts *its, uint32_t devid, uint32_t eventid) {
@@ -640,7 +767,7 @@ static void its_clear_ite(HvGicIts *its, uint32_t devid, uint32_t eventid, int d
         if (!its->ite[i].valid || its->ite[i].devid != devid || its->ite[i].eventid != eventid) continue;
         uint32_t pintid = its->ite[i].pintid;
         uint16_t icid = its->ite[i].icid;
-        int c = icid < HV_ITS_MAX_COLLS ? its->coll_cpu[icid] : 0;
+        int c = its_coll_cpu(its, icid);
         if (c < ncpus(its->g) && pintid >= HV_GIC_LPI_BASE && pintid < HV_GIC_LPI_BASE + HV_GIC_MAX_LPIS) {
             uint32_t idx = pintid - HV_GIC_LPI_BASE;
             its->g->cpu[c].lpi_pending[idx / 64] &= ~(1ull << (idx % 64));
@@ -672,11 +799,16 @@ static void its_process_commands(HvGicIts *its) {
                     cmd, (unsigned long long)dw[0], (unsigned long long)dw[1],
                     (unsigned long long)dw[2], (unsigned long long)dw[3]);
         switch (cmd) {
-        case 0x01: { /* MOVALL */
-            int c1 = rdbase_to_cpu(its, (dw[2] >> 16) & 0x7ffffffffULL);
-            int c2 = rdbase_to_cpu(its, (dw[3] >> 16) & 0x7ffffffffULL);
-            for (int i = 0; i < HV_ITS_MAX_COLLS; i++)
-                if (its->coll_cpu[i] == c1) its->coll_cpu[i] = (uint16_t)c2;
+        case 0x01: { /* MOVI: the event now belongs to another collection */
+            uint16_t icid = (uint16_t)(dw[2] & 0xffffu);
+            for (int i = 0; i < HV_ITS_MAX_ITES; i++)
+                if (its->ite[i].valid && its->ite[i].devid == devid && its->ite[i].eventid == eventid)
+                    its->ite[i].icid = icid;
+            uint64_t pa = its_ite_pa(its, devid, eventid), ite;
+            if (pa && hv_phys_read(its->m, pa, &ite, 8) == 0 && (ite >> 63)) {
+                ite = (ite & ~(0xffffull << 32)) | (uint64_t)icid << 32;
+                hv_phys_write(its->m, pa, &ite, 8);
+            }
             hv_gicv3_update_body(its->g);
             break;
         }
@@ -695,30 +827,47 @@ static void its_process_commands(HvGicIts *its) {
             if (!((dw[2] >> 63) & 1u)) {
                 for (int i = 0; i < HV_ITS_MAX_ITES; i++)
                     if (its->ite[i].valid && its->ite[i].devid == devid) its->ite[i].valid = 0;
+                its_entry_write(its, ITS_TYPE_DEVICE, devid, 0);
+            } else {
+                its_entry_write(its, ITS_TYPE_DEVICE, devid, 1ull << 63 | (dw[2] & 0x000fffffffffff00ull) | (dw[1] & 0x1f));
             }
             break;
         case 0x09: { /* MAPC */
             uint16_t icid = (uint16_t)(dw[2] & 0xffffu);
-            if (icid < HV_ITS_MAX_COLLS && ((dw[2] >> 63) & 1u))
+            if (icid < HV_ITS_MAX_COLLS && ((dw[2] >> 63) & 1u)) {
                 its->coll_cpu[icid] = (uint16_t)rdbase_to_cpu(its, (dw[2] >> 16) & 0x7ffffffffULL);
+                its->coll_valid[icid] = 1;
+                its_entry_write(its, ITS_TYPE_COLLECTION, icid, 1ull << 63 | its->coll_cpu[icid]);
+            } else if (icid < HV_ITS_MAX_COLLS) {
+                its->coll_valid[icid] = 0;
+                its->coll_cpu[icid] = 0;
+                its_entry_write(its, ITS_TYPE_COLLECTION, icid, 0);
+            }
             break;
         }
         case 0x0a: /* MAPTI */
-            its_map_ite(its, devid, eventid, (uint32_t)(dw[1] >> 32), (uint16_t)(dw[2] & 0xffffu));
-            break;
-        case 0x0b: /* MAPI */
-            its_map_ite(its, devid, eventid, eventid, (uint16_t)(dw[2] & 0xffffu));
-            break;
-        case 0x0e: { /* MOVI */
+        case 0x0b: { /* MAPI */
+            uint32_t pintid = cmd == 0x0a ? (uint32_t)(dw[1] >> 32) : eventid;
             uint16_t icid = (uint16_t)(dw[2] & 0xffffu);
-            for (int i = 0; i < HV_ITS_MAX_ITES; i++)
-                if (its->ite[i].valid && its->ite[i].devid == devid && its->ite[i].eventid == eventid)
-                    its->ite[i].icid = icid;
+            its_map_ite(its, devid, eventid, pintid, icid);
+            its_ite_write(its, devid, eventid, 1ull << 63 | (uint64_t)icid << 32 | pintid);
+            break;
+        }
+        case 0x0e: { /* MOVALL: pending interrupts move from one redistributor to another */
+            int c1 = rdbase_to_cpu(its, (dw[2] >> 16) & 0x7ffffffffULL);
+            int c2 = rdbase_to_cpu(its, (dw[3] >> 16) & 0x7ffffffffULL);
+            if (c1 != c2 && c1 < ncpus(its->g) && c2 < ncpus(its->g)) {
+                for (int k = 0; k < HV_GIC_MAX_LPIS / 64; k++) {
+                    its->g->cpu[c2].lpi_pending[k] |= its->g->cpu[c1].lpi_pending[k];
+                    its->g->cpu[c1].lpi_pending[k] = 0;
+                }
+            }
             hv_gicv3_update_body(its->g);
             break;
         }
         case 0x0f: /* DISCARD */
             its_clear_ite(its, devid, eventid, 1);
+            its_ite_write(its, devid, eventid, 0);
             break;
         default:
             break;
@@ -777,6 +926,9 @@ static void its_write(void *opaque, uint64_t off, uint64_t val, unsigned size) {
         uint64_t cur = its->baser[idx];
         write_slice64(&cur, off, val, size);
         its->baser[idx] = (its->baser[idx] & ro) | (cur & ~ro);
+        /* New tables: the caches may describe the old ones (the tables are the truth; a miss reads them). */
+        memset(its->ite, 0, sizeof its->ite);
+        memset(its->coll_valid, 0, sizeof its->coll_valid);
     }
     pthread_mutex_unlock(&its->g->mu);
 }
@@ -805,6 +957,7 @@ void hv_gicv3_its_reset(HvGicIts *its) {
     its->baser[0] = (1ull << 56) | (7ull << 48);
     its->baser[1] = (4ull << 56) | (7ull << 48);
     memset(its->coll_cpu, 0, sizeof its->coll_cpu);
+    memset(its->coll_valid, 0, sizeof its->coll_valid);
     memset(its->ite, 0, sizeof its->ite);
     pthread_mutex_unlock(&its->g->mu);
 }

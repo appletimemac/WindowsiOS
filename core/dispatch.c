@@ -35,6 +35,21 @@ void hv_flush_blocks(HvMachine *m) {
     m->nblocks = 0;
     m->nslots = 0;
     m->nxchained = 0;
+    /* No translations remain. A new one protects its page before reading code. */
+    for (int i = 0; i < m->nram; i++) {
+        HvRam *r = &m->ram[i];
+        uint64_t pages = (r->size + (1u << HV_TLB_PAGE_BITS) - 1) >> HV_TLB_PAGE_BITS;
+        for (uint64_t pg = 0; pg < pages; pg++) /* only where code was, so the rest of the maps stays untouched */
+            if (r->code_pages[pg] || r->code_hot[pg]) { /* a chain or block list, or marks, only exist there */
+                memset(r->code_grains + pg * HV_CODE_GRAIN_WORDS, 0, HV_CODE_GRAIN_WORDS * sizeof *r->code_grains);
+                if (r->diag_words) memset(r->diag_words + pg * ((1u << HV_TLB_PAGE_BITS) / 32), 0, (1u << HV_TLB_PAGE_BITS) / 32);
+                r->code_miss[pg] = 0;
+                r->chain_in[pg] = 0;
+                r->block_head[pg] = 0;
+                r->code_hot[pg] = 0; /* learned again at the page's next write: the list is of blocks by index */
+            }
+        memset(r->code_pages, 0, (size_t)1 << r->pages_log2);
+    }
     hv_jit_reset(&m->jit);
     m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */
@@ -123,7 +138,9 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     uint32_t j = (uint32_t)((va >> 2) ^ (va >> 18) ^ ((uint64_t)flags << 13)) & ((1u << HV_JC_BITS) - 1);
     __typeof__(cpu->pc_state->jc[0]) *jc = cpu->pc_state->jc;
     HvBlock *c = jc[j].va == va ? jc[j].b : NULL;
-    if (c && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == c->gen) return c;
+    if (c && c->pa == pa && c->flags == flags && c->ram->page_gen[c->pg] == __atomic_load_n(&c->gen, __ATOMIC_RELAXED)) return c;
+    uint32_t tries = 0;
+again:;
     uint32_t h = hash_of(va, pa, flags);
     HvRam *ram = hv_ram_lookup(m, pa);
     uint64_t pg = (pa - ram->pa) >> HV_TLB_PAGE_BITS;
@@ -135,25 +152,67 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     }
 
     if (m->flush_pending) goto flush_unlocked;
-    /* Writes to this page must take the slow path from now on so we notice them:
-       before its code is read (so a write after that, or the IC IVAU after it,
-       invalidates what we make), and without the lock (it may scan every CPU's
-       TLB; two CPUs doing it at once is harmless). */
-    if (!__atomic_load_n(&ram->code_pages[pg], __ATOMIC_RELAXED)) {
-        __atomic_store_n(&ram->code_pages[pg], 1, __ATOMIC_SEQ_CST); /* before the TLBs: see the end of tlb_fill */
+    /* Writes to this page must take the slow path from now on so we notice them,
+       before its code is read, and without the lock (it may scan every CPU's TLB).
+       One CPU protects it (0 to its own number, every TLB, then protected); the
+       others wait, as until then a write through another CPU's old TLB entry could
+       change the code unseen. The number is the CPU's own so that it cannot finish
+       another CPU's protection when an invalidation reset the page in between. The
+       generation is read before protected is seen: if an invalidation reset the
+       page after that, our block is born stale. */
+    const uint8_t mine = (uint8_t)(cpu->index + 1);
+    for (;;) {
+        gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
+        uint8_t state = __atomic_load_n(&ram->code_pages[pg], __ATOMIC_ACQUIRE);
+        if (state == HV_CODE_PROTECTED) break;
+        if (state) {
+            sched_yield(); /* another CPU is dropping the write tags */
+            continue;
+        }
+        if (!__atomic_compare_exchange_n(&ram->code_pages[pg], &state, mine, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+            continue; /* before the TLBs: see the end of tlb_fill */
+        __atomic_store_n(&ram->code_miss[pg], 0, __ATOMIC_RELAXED);
         m->stats.code_protects++;
         for (int i = 0; i < m->ncpus; i++) /* in every CPU's TLB, or a write from another CPU goes unnoticed */
             if (m->cpus[i]) hv_tlb_protect_code_page(m->cpus[i], ram, pg);
-        gen = __atomic_load_n(&ram->page_gen[pg], __ATOMIC_ACQUIRE);
+        state = mine;
+        __atomic_compare_exchange_n(&ram->code_pages[pg], &state, HV_CODE_PROTECTED, 0, __ATOMIC_SEQ_CST,
+                                    __ATOMIC_RELAXED); /* else reset meanwhile: again */
     }
-    /* Translate without the lock, into this thread's buffer... */
-    HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1, .jit_gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)};
+    /* A hot page's blocks are retired one at a time by small writes (retire_blocks): they are made to be (fwd),
+       and the page's sequence is read before its code, so that a write retiring blocks meanwhile, which this one
+       is not yet among, is noticed when it is published. Hot is set before the generation read above moved. */
+    int hot = __atomic_load_n(&ram->code_hot[pg], __ATOMIC_ACQUIRE);
+    uint32_t seq = hot ? __atomic_load_n(&ram->page_seq[pg], __ATOMIC_ACQUIRE) : 0;
+    /* Translate without the lock, from a copy of the guest's words (one version of them, checked below),
+       into this thread's buffer... */
+    uint32_t nread = avail < HV_MAX_BLOCK_INSNS ? avail : HV_MAX_BLOCK_INSNS;
+    uint32_t words[HV_MAX_BLOCK_INSNS];
+    memcpy(words, code, 4u * nread);
+    if (m->lookup_hook) m->lookup_hook(m, 0);
+    HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1, .fwd = (uint32_t)hot, .jit_gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)};
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
-    if (hv_translate_emit(m, &nb, code, avail) != 0) goto flush_unlocked;
+    if (hv_translate_emit(m, &nb, words, nread) != 0) goto flush_unlocked;
     if (m->stats_interval) {
         m->stats.translate_ticks += mach_absolute_time() - t0;
         m->stats.translated_insns += nb.ninsns;
     }
+    /* ...mark the pieces of the page it came from, then check those words are still what it was made from.
+       A write marks nothing: it stores, fences, then looks at the marks (hv_ram_written). So either the write
+       sees our mark and drops the page's blocks, or this check sees the write and we translate again. */
+    uint32_t used = hv_knob[HV_K_GROUPS] ? nread : nb.ninsns; /* grouping looks ahead of the block's end */
+    uint32_t at = (uint32_t)((pa - ram->pa) & ((1u << HV_TLB_PAGE_BITS) - 1));
+    hv_code_grains_mark(ram, pg, at, at + 4u * used);
+    hv_code_diag_mark(ram, pg, at, at + 4u * used);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (memcmp(words, code, 4u * used) != 0) {
+        m->stats.code_retranslates++;
+        /* A flush waits for this CPU: join it (run_loop tries again after). */
+        if (m->flush_pending || __atomic_load_n(&m->stw_active, __ATOMIC_SEQ_CST)) return NULL;
+        if (++tries > 8) sched_yield(); /* something rewriting this code nonstop: let it finish */
+        goto again;
+    }
+    if (m->lookup_hook) m->lookup_hook(m, 1);
     /* ...and place it in the region (space is reserved atomically, so no lock either)... */
     size_t used0 = m->jit.used;
     if (hv_translate_place(m, &nb) != 0) { /* JIT region full: start over */
@@ -183,8 +242,19 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
         m->stats.flush_full++;
         goto flush;
     }
+    if (hot && __atomic_load_n(&ram->page_seq[pg], __ATOMIC_RELAXED) != seq) {
+        /* A write retired blocks of this page after we read its code: ours may be made from what it replaced,
+           and was not there to be retired. (Its space stays used until a flush, like a lost race's.) */
+        pthread_mutex_unlock(&m->tr_mu);
+        m->stats.code_retranslates++;
+        goto again;
+    }
     b = &m->blocks[m->nblocks];
     *b = nb;
+    if (hot) { /* where retire_blocks finds it */
+        b->page_next = ram->block_head[pg];
+        ram->block_head[pg] = (uint32_t)m->nblocks + 1;
+    }
     m->stats.translations++;
     if (m->stats_interval) {
         m->stats.translated_words += m->jit.used - used0;
@@ -199,7 +269,7 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     m->nblocks++;
     for (HvBlock **pp = &m->hash[h]; *pp;) {
         HvBlock *cur = *pp;
-        if (__atomic_load_n(&cur->ram->page_gen[cur->pg], __ATOMIC_RELAXED) != cur->gen)
+        if (__atomic_load_n(&cur->ram->page_gen[cur->pg], __ATOMIC_RELAXED) != __atomic_load_n(&cur->gen, __ATOMIC_RELAXED))
             __atomic_store_n(pp, cur->next, __ATOMIC_RELEASE);
         else
             pp = &cur->next;
@@ -493,8 +563,10 @@ static int wait_for_interrupt(HvCpu *cpu) {
     pthread_mutex_unlock(&p->wake_mu);
     unpark(cpu);
     hv_big_lock(m);
+    uint64_t slept = mach_absolute_time() - t0;
     m->stats.wfi++;
-    m->stats.wfi_ticks += mach_absolute_time() - t0;
+    m->stats.wfi_ticks += slept;
+    p->wfi_ticks += slept;
     m->tick(m, cpu);
     return 0;
 }
@@ -639,7 +711,7 @@ static void print_stats(HvCpu *cpu, int force) {
                 uint64_t len = 0;
                 for (HvBlock *b = m->hash[h]; b; b = b->next) {
                     len++;
-                    if (b->ram->page_gen[b->pg] != b->gen) stale++;
+                    if (b->ram->page_gen[b->pg] != __atomic_load_n(&b->gen, __ATOMIC_RELAXED)) stale++;
                 }
                 if (len) used++;
                 sumsq += len * len;
@@ -737,10 +809,11 @@ static void print_stats(HvCpu *cpu, int force) {
 }
 
 /* Fill the slot of the chainable exit a block just left through, so it jumps
-   straight to b next time. Chains never need undoing: both blocks are in the
-   same 16 KB page, so when that page's code is invalidated the stale blocks are
-   only reachable from each other, and the exit_req check before every chained
-   jump gets a block that just wrote its own page back to the dispatcher. */
+   straight to b next time. Chains within a page never need undoing: both blocks
+   are in the same 4 KB physical page (checked below, not assumed from the
+   address), so when that page's code is invalidated the stale blocks are only
+   reachable from each other, and the exit_req check before every chained jump
+   gets a block that just wrote its own page back to the dispatcher. */
 static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
     uint32_t idx = (uint32_t)(slot - m->slots);
     if (m->gen_checks && (b->jit_gen != m->jit_gen || (m->slot_site[idx] && (uint64_t)(m->slot_site[idx] - m->jit.base) >= m->jit.used)))
@@ -758,7 +831,9 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             return;
         }
         m->slot_xpa[idx] = page_pa | 1;
-        m->xchained[m->nxchained++] = idx;
+        m->slot_xnext[idx] = b->ram->chain_in[b->pg];
+        b->ram->chain_in[b->pg] = idx + 1;
+        m->nxchained++;
         __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
         uint32_t *site = m->slot_site[idx];
         int64_t off = site ? b->code - site : 0;
@@ -766,12 +841,19 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
             uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
             hv_jit_write(&m->jit, site, &insn, 4);
             hv_jit_finish(&m->jit, site, 1);
+        } else if (site) {
+            m->stats.chain_far++;
         }
         m->stats.chained++;
         if (m->stats_interval) m->stats.xchained++;
         pthread_mutex_unlock(&m->tr_mu);
         return;
     }
+    /* Within the page (and a retired block's forward to its replacement): only to a block of the physical page
+       the exit left. Between that exit and the dispatcher's lookup another CPU may have mapped the address
+       elsewhere, and the exit's block is shared by every address space that maps the old page. */
+    uint64_t from = m->slot_xpa[idx];
+    if (!(from & 2) || ((from ^ b->pa) >> HV_TLB_PAGE_BITS)) return;
     __atomic_store_n(slot, (uint64_t)(uintptr_t)b->code, __ATOMIC_RELEASE);
     /* And the stub's B, when the target is in its range: a direct branch, no load. */
     uint32_t *site = m->slot_site[slot - m->slots];
@@ -780,6 +862,8 @@ static void chain(HvMachine *m, uint64_t *slot, HvBlock *b) {
         uint32_t insn = 0x14000000u | (uint32_t)(off & 0x3ffffff);
         hv_jit_write(&m->jit, site, &insn, 4);
         hv_jit_finish(&m->jit, site, 1);
+    } else if (site) {
+        m->stats.chain_far++;
     }
     uint32_t *cond = m->slot_cond[idx];
     if (cond) { /* the conditional branch to that stub, too */
@@ -826,6 +910,7 @@ static void stop_the_world(HvCpu *cpu) {
     HvMachine *m = cpu->m;
     pthread_mutex_lock(&m->stw_mu);
     if (__atomic_load_n(&m->flush_pending, __ATOMIC_SEQ_CST) && !m->stw_active) {
+        uint64_t t0 = mach_absolute_time();
         __atomic_store_n(&m->stw_active, 1, __ATOMIC_SEQ_CST);
         __atomic_store_n(&m->flush_pending, 0, __ATOMIC_SEQ_CST);
         pthread_mutex_unlock(&m->stw_mu);
@@ -842,6 +927,10 @@ static void stop_the_world(HvCpu *cpu) {
         pthread_mutex_lock(&m->tr_mu);
         hv_flush_blocks(m);
         pthread_mutex_unlock(&m->tr_mu);
+        uint64_t dt = mach_absolute_time() - t0;
+        m->stats.stw_count++;
+        m->stats.stw_ticks += dt;
+        if (dt > m->stats.stw_max_ticks) m->stats.stw_max_ticks = dt;
         pthread_mutex_lock(&m->stw_mu);
         __atomic_store_n(&m->stw_active, 0, __ATOMIC_SEQ_CST);
         pthread_cond_broadcast(&m->stw_cv);
@@ -936,7 +1025,8 @@ static int run_loop(HvCpu *cpu, int one) {
         if (m->tick && (kicked || (++since_tick >= 64 && (since_tick = 0, next_due && mach_absolute_time() >= next_due)))) {
             since_tick = 0;
             next_due = m->tick(m, cpu);
-            cpu->timer_due = next_due;
+            __atomic_store_n(&cpu->timer_due, next_due, __ATOMIC_RELEASE); /* the kicker reads it */
+            if (next_due && m->timer_hint) m->timer_hint(m, next_due);
         }
         int why = pending_chain ? 0 : kicked ? 1 : last_reason != HV_EXIT_BRANCH ? 2 : 5;
         if (hv_check_interrupts(cpu)) {
