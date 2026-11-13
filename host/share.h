@@ -18,6 +18,18 @@ long hv_share_agent_seen(void);
 
 /* The device's posture for the guest's tablet mode: 1 laptop, 0 tablet (the default). Served at GET /.henge/posture. */
 void hv_share_set_posture(int laptop);
+/* The Windows display scale the app wants, in percent; 0 (the default) means the app has not said. Anything else is
+   clamped to 100..500. Served after the posture at GET /.henge/posture as " scale=NNN"; the agent writes it down as
+   Windows' scale, which Windows takes at its next sign-in. Safe from any thread, and before hv_share_start. */
+void hv_share_set_display_scale(int percent);
+/* The scale Windows is running at, in percent, as the agent last reported it (its posture poll carries "?scale=NNN");
+   0 when none has, which is also what an agent older than the report gives. */
+int hv_share_agent_display_scale(void);
+/* Forget the report (a new VM is starting, and Windows may come up at another scale). */
+void hv_share_clear_agent_display_scale(void);
+/* fn is called each time that scale changes or is forgotten, on a share thread or on the thread that forgot it, and
+   reads the scale with hv_share_agent_display_scale. NULL removes it; a call already on its way may still arrive. */
+void hv_share_set_agent_display_scale_handler(void (*fn)(void *ctx), void *ctx);
 /* Ask Windows to hibernate: the WindowsiOS Tools agent picks it up within a second and runs shutdown /h. */
 void hv_share_request_hibernate(void);
 /* Forget an untaken request (a new VM is starting). */

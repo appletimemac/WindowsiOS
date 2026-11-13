@@ -56,6 +56,49 @@ static int posture_laptop; /* atomic; 0 = tablet */
 
 void hv_share_set_posture(int laptop) { __atomic_store_n(&posture_laptop, laptop ? 1 : 0, __ATOMIC_RELAXED); }
 
+/* The Windows display scale the app wants, in percent (0 = it has not said), atomic. GET /.henge/posture appends it
+   as " scale=NNN"; the agent in Windows writes it down for Windows' next sign-in, which is when Windows takes a scale. */
+static int display_scale;
+
+void hv_share_set_display_scale(int percent) {
+    if (percent != 0) percent = percent < 100 ? 100 : percent > 500 ? 500 : percent;
+    __atomic_store_n(&display_scale, percent, __ATOMIC_RELAXED);
+}
+
+/* The scale Windows is running at, in percent, as the agent last said with its posture poll ("?scale=NNN"); 0 until
+   one has (no agent yet, or one from before it said this). The handler is told of each change outside the lock, and
+   only that there was one: it reads the scale itself, so calls that arrive out of order still leave it the latest. */
+static pthread_mutex_t agent_scale_mu = PTHREAD_MUTEX_INITIALIZER;
+static int agent_display_scale;
+static void (*agent_scale_handler)(void *);
+static void *agent_scale_handler_ctx;
+
+static void agent_scale_set(int percent) {
+    pthread_mutex_lock(&agent_scale_mu);
+    int changed = agent_display_scale != percent;
+    agent_display_scale = percent;
+    void (*fn)(void *) = agent_scale_handler;
+    void *ctx = agent_scale_handler_ctx;
+    pthread_mutex_unlock(&agent_scale_mu);
+    if (changed && fn) fn(ctx);
+}
+
+int hv_share_agent_display_scale(void) {
+    pthread_mutex_lock(&agent_scale_mu);
+    int percent = agent_display_scale;
+    pthread_mutex_unlock(&agent_scale_mu);
+    return percent;
+}
+
+void hv_share_clear_agent_display_scale(void) { agent_scale_set(0); }
+
+void hv_share_set_agent_display_scale_handler(void (*fn)(void *ctx), void *ctx) {
+    pthread_mutex_lock(&agent_scale_mu);
+    agent_scale_handler = fn;
+    agent_scale_handler_ctx = ctx;
+    pthread_mutex_unlock(&agent_scale_mu);
+}
+
 /* When the app asked Windows to hibernate (CLOCK_UPTIME_RAW ns, 0 for none), atomic. GET /.henge/power, which
    WinIOSAgent polls twice a second, answers it once. One the agent did not take within HIBERNATE_TTL_NS (no agent
    installed, Windows still booting, a second tap while it saves) is dropped rather than left for a later agent,
@@ -71,7 +114,7 @@ void hv_share_clear_hibernate(void) { __atomic_store_n(&hibernate_requested_at, 
    touch lands on the picture (or hv_share_note_look after Enter) and the poll answers with that event. The agent
    then asks UI Automation what has focus and reports it at GET /.henge/focus, which reaches the app's handler. Only
    the newest event is kept: a report for an older one is dropped because a newer tap is already being looked at.
-   The limits are variables so tests/test_share_focus.c can shorten them. */
+   The limits are variables so tests/test_share.c can shorten them. */
 unsigned hv_share_focus_wait_ms = 8000;   /* how long a poll waits for an event before answering "none" */
 unsigned hv_share_focus_stale_ms = 2000;  /* an event older than this is not worth popping a keyboard for */
 unsigned hv_share_focus_report_ms = 4000; /* nor is a report this long after its event (a hung app held the agent) */
@@ -894,8 +937,13 @@ static int serve_henge(Conn *c, Request *r) {
     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r);
     if (!strcmp(what, "posture") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
-        const char *text = __atomic_load_n(&posture_laptop, __ATOMIC_RELAXED) ? "laptop" : "tablet";
-        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n", text, strlen(text));
+        unsigned long running;
+        if (query_number(r->query, "scale", &running) && running >= 100 && running <= 500) agent_scale_set((int)running);
+        const char *word = __atomic_load_n(&posture_laptop, __ATOMIC_RELAXED) ? "laptop" : "tablet";
+        int scale = __atomic_load_n(&display_scale, __ATOMIC_RELAXED);
+        char text[32];
+        int n = scale ? snprintf(text, sizeof text, "%s scale=%d", word, scale) : snprintf(text, sizeof text, "%s", word);
+        return respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n", text, (size_t)n);
     }
     if (!strcmp(what, "power") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;

@@ -298,6 +298,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     hv_winvirt_reset_cpu(&board);
 
     share_on = 0;
+    hv_share_clear_agent_display_scale(); /* whatever the last VM's Windows ran at, also when this one has no share */
     if (c->share_dir && *c->share_dir && c->share_sock && *c->share_sock) {
         hv_share_clear_hibernate();
 #if !TARGET_OS_IPHONE
