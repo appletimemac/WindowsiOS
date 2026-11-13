@@ -150,7 +150,7 @@ static void apply_launch_env_file(NSString *docs) {
     if (!data) return;
     id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     if (![json isKindOfClass:[NSDictionary class]]) return;
-    [(NSDictionary *)json enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+    [(NSDictionary *)json enumerateKeysAndObjectsUsingBlock:^(id key, id value, __unused BOOL *stop) {
         if (![key isKindOfClass:[NSString class]] || ![value isKindOfClass:[NSString class]]) return;
         if (![key hasPrefix:@"HV_"] && ![key hasPrefix:@"WINIOS_"]) return;
         setenv([key UTF8String], [value UTF8String], 0);
