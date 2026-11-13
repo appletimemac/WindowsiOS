@@ -48,6 +48,9 @@ typedef struct WinIOSTouchContact {
 - (BOOL)needsSparseUnpack;
 - (void)prepareAndStartWithLayer:(nullable CAMetalLayer *)layer;
 - (void)bindMetalLayer:(nullable CAMetalLayer *)layer;
+/// Where the Windows picture goes in that layer, as fractions of its width and height. The rest of
+/// the layer continues the picture's edge pixels. Ignored for a layer that is not the bound one.
+- (void)setPictureRect:(CGRect)rect forLayer:(CAMetalLayer *)layer;
 
 - (void)updateScreenSize:(CGSize)size scale:(CGFloat)scale;
 - (void)updateHingeStatus:(NSInteger)status angleDegrees:(double)angleDegrees;

@@ -23,14 +23,14 @@ static NSString *const kFbShaderSource =
     @"#include <metal_stdlib>\n"
      "using namespace metal;\n"
      "struct VOut { float4 pos [[position]]; float2 uv; };\n"
-     "struct Quad { float2 origin; float2 size; };\n"
+     "struct Quad { float2 origin; float2 size; float2 uv0; float2 uvSize; };\n"
      "vertex VOut fb_vs(uint vid [[vertex_id]], constant Quad &q [[buffer(0)]]) {\n"
      "    const float2 corner[4] = { float2(0,0), float2(1,0), float2(0,1), float2(1,1) };\n"
      "    float2 c = corner[vid];\n"
      "    VOut o;\n"
      "    float2 p = q.origin + c * q.size;\n"
      "    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
-     "    o.uv = c;\n"
+     "    o.uv = q.uv0 + c * q.uvSize;\n"
      "    return o;\n"
      "}\n"
      "fragment float4 fb_fs_linear(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
@@ -49,6 +49,8 @@ static NSString *const kFbShaderSource =
 typedef struct {
     float origin[2];
     float size[2];
+    float uv0[2];    /* texture coordinates at origin and across size: outside 0..1 the samplers */
+    float uvSize[2]; /* clamp, so a quad larger than the picture repeats the picture's edge */
 } FbQuad;
 
 @interface HvFbMetalPresenter : NSObject <CAMetalDisplayLinkDelegate> {
@@ -71,10 +73,15 @@ typedef struct {
     int lastCursorVisible;
     int32_t lastCursorX, lastCursorY;
     CGSize lastDrawableSize;
+    /* Where in the drawable the picture goes (0..1 of each axis), under lock. Unset: the whole drawable,
+       letterboxed in black. Set: the rest of the drawable continues the picture's edge pixels. */
+    double content[4];
+    BOOL hasContent, contentMoved;
     _Atomic(uint64_t) framesPresented;
 }
 - (instancetype)initWithDisplay:(HvFbDisplay *)display;
 - (void)setTargetLayer:(CAMetalLayer *)newLayer;
+- (void)setContentX:(double)x y:(double)y width:(double)w height:(double)h;
 @end
 
 @implementation HvFbMetalPresenter
@@ -149,6 +156,18 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
     [self performSelector:@selector(attachLinkTo:) onThread:renderThread withObject:newLayer waitUntilDone:NO];
 }
 
+/* Any thread. A rectangle with no area goes back to the whole drawable. The next tick redraws. */
+- (void)setContentX:(double)x y:(double)y width:(double)w height:(double)h {
+    os_unfair_lock_lock(&lock);
+    hasContent = w > 0 && h > 0;
+    content[0] = x;
+    content[1] = y;
+    content[2] = w;
+    content[3] = h;
+    contentMoved = YES;
+    os_unfair_lock_unlock(&lock);
+}
+
 /* Runs on the render thread. */
 - (void)attachLinkTo:(CAMetalLayer *)target {
     [link invalidate];
@@ -215,12 +234,16 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
     @autoreleasepool {
         os_unfair_lock_lock(&lock);
         CAMetalLayer *curLayer = layer;
+        BOOL extend = hasContent, moved = contentMoved;
+        double rx = extend ? content[0] : 0.0, ry = extend ? content[1] : 0.0;
+        double rw = extend ? content[2] : 1.0, rh = extend ? content[3] : 1.0;
+        contentMoved = NO;
         os_unfair_lock_unlock(&lock);
         if (!curLayer || !pipeLinear || !queue) return;
 
         CGSize dsize = curLayer.drawableSize;
         if (dsize.width < 4 || dsize.height < 4) return;
-        BOOL sizeChanged = !CGSizeEqualToSize(dsize, lastDrawableSize);
+        BOOL sizeChanged = moved || !CGSizeEqualToSize(dsize, lastDrawableSize);
 
         HvFbFrame f;
         hv_fb_display_lock(fb);
@@ -295,12 +318,12 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
 
         if (!contentChanged && !cursorChanged && !sizeChanged) return; /* nothing new: skip this vsync */
 
-        /* Aspect fit, in normalized drawable coordinates. */
-        double dstAspect = dsize.width / dsize.height, srcAspect = (double)texW / (double)texH;
-        double qw = 1.0, qh = 1.0;
-        if (dstAspect > srcAspect) qw = srcAspect / dstAspect;
-        else qh = dstAspect / srcAspect;
-        FbQuad quad = {{(float)((1.0 - qw) / 2.0), (float)((1.0 - qh) / 2.0)}, {(float)qw, (float)qh}};
+        /* Aspect fit inside the content rectangle, in normalized drawable coordinates. */
+        HvFbRect fit = hv_fb_fit(dsize.width, dsize.height, texW, texH, (HvFbRect){rx, ry, rw, rh});
+        double qx = fit.x, qy = fit.y, qw = fit.w, qh = fit.h;
+        /* The picture alone, or the whole drawable with the picture at its place in it. */
+        FbQuad quad = {{(float)qx, (float)qy}, {(float)qw, (float)qh}, {0, 0}, {1, 1}};
+        if (extend) quad = (FbQuad){{0, 0}, {1, 1}, {(float)(-qx / qw), (float)(-qy / qh)}, {(float)(1.0 / qw), (float)(1.0 / qh)}};
         double pxScale = (qw * dsize.width) / (double)texW;
         BOOL integerScale = fabs(pxScale - round(pxScale)) < 0.001 && round(pxScale) >= 1.0;
 
@@ -319,9 +342,8 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
         [enc setFragmentTexture:texture atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         if (cursorVisible && cursorTexture && pipeCursor) {
-            FbQuad cq = {{(float)(quad.origin[0] + quad.size[0] * (double)cx / texW),
-                          (float)(quad.origin[1] + quad.size[1] * (double)cy / texH)},
-                         {(float)(quad.size[0] * 64.0 / texW), (float)(quad.size[1] * 64.0 / texH)}};
+            FbQuad cq = {{(float)(qx + qw * (double)cx / texW), (float)(qy + qh * (double)cy / texH)},
+                         {(float)(qw * 64.0 / texW), (float)(qh * 64.0 / texH)}, {0, 0}, {1, 1}};
             [enc setRenderPipelineState:pipeCursor];
             [enc setVertexBytes:&cq length:sizeof cq atIndex:0];
             [enc setFragmentTexture:cursorTexture atIndex:0];
@@ -354,6 +376,12 @@ void hv_fb_metal_set_layer(HvFbDisplay *fb, void *ca_metal_layer) {
     HvFbMetalPresenter *p = ensure_presenter(fb);
     if (!p) return;
     [p setTargetLayer:(__bridge CAMetalLayer *)ca_metal_layer];
+}
+
+void hv_fb_metal_set_content(HvFbDisplay *fb, double x, double y, double w, double h) {
+    HvFbMetalPresenter *p = ensure_presenter(fb);
+    if (!p) return;
+    [p setContentX:x y:y width:w height:h];
 }
 
 uint64_t hv_fb_metal_frames(HvFbDisplay *fb) {

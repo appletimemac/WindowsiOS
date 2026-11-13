@@ -37,6 +37,7 @@ static _Atomic int stop_requested;
 static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
 static CFTypeRef display_layer;
 static int display_layer_set;
+static double display_content[4]; /* the picture's place in the layer; no area: all of it */
 static _Atomic(HvFbDisplay *) display_fb;
 
 static void (*exit_cb)(int reason);
@@ -146,6 +147,17 @@ void hv_winvm_set_display_layer(void *layer) {
     if (previous) CFRelease(previous);
 }
 
+void hv_winvm_set_display_content(double x, double y, double w, double h) {
+    os_unfair_lock_lock(&display_lock);
+    display_content[0] = x;
+    display_content[1] = y;
+    display_content[2] = w;
+    display_content[3] = h;
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    if (fb) hv_fb_metal_set_content(fb, x, y, w, h);
+    os_unfair_lock_unlock(&display_lock);
+}
+
 int hv_winvm_display_size(uint32_t *w, uint32_t *h) {
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
     if (!fb) return -1;
@@ -249,7 +261,10 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     board.poll = board_poll;
 
     os_unfair_lock_lock(&display_lock);
-    if (display_layer_set && board.fb) hv_fb_metal_set_layer(board.fb, (void *)display_layer);
+    if (display_layer_set && board.fb) {
+        hv_fb_metal_set_layer(board.fb, (void *)display_layer);
+        hv_fb_metal_set_content(board.fb, display_content[0], display_content[1], display_content[2], display_content[3]);
+    }
     atomic_store_explicit(&display_fb, board.fb, memory_order_release);
     uint32_t want_w = wanted_width, want_h = wanted_height;
     os_unfair_lock_unlock(&display_lock);

@@ -735,6 +735,46 @@ static void test_threads(void) {
     check("threads: presenter saw frames", (uintptr_t)frames > 0, 1);
 }
 
+/* A value to the thousandth of a drawable pixel, so fractions compare exactly. */
+static uint64_t milli(double fraction, double pixels) {
+    return (uint64_t)(fraction * pixels * 1000.0 + 0.5);
+}
+
+/* Where the presenter puts the picture: fitted into the place the app gives it, which stops short of a phone's
+   rounded corners. */
+static void test_fit(void) {
+    HvFbRect whole = {0, 0, 1, 1};
+    HvFbRect q = hv_fb_fit(1600, 1200, 800, 600, whole);
+    check("same aspect fills: x", milli(q.x, 1600), 0);
+    check("same aspect fills: w", milli(q.w, 1600), 1600000);
+    check("same aspect fills: h", milli(q.h, 1200), 1200000);
+    q = hv_fb_fit(2000, 1000, 800, 600, whole); /* a wider drawable: bars left and right */
+    check("pillarbox: w", milli(q.w, 2000), 1333333);
+    check("pillarbox: x", milli(q.x, 2000), 333333);
+    check("pillarbox: h", milli(q.h, 1000), 1000000);
+    q = hv_fb_fit(1000, 2000, 800, 600, whole); /* a taller one: bars above and below */
+    check("letterbox: h", milli(q.h, 2000), 750000);
+    check("letterbox: y", milli(q.y, 2000), 625000);
+    /* The phone: a 2853 by 2007 drawable, the picture's place 49 pixels in from every edge except 50 on the
+       left (the pixel grid), and Windows at 1376 by 954: exactly two drawable pixels per guest pixel. */
+    HvFbRect place = {50.0 / 2853, 49.0 / 2007, 2752.0 / 2853, 1908.0 / 2007};
+    q = hv_fb_fit(2853, 2007, 1376, 954, place);
+    check("phone: x", milli(q.x, 2853), 50000);
+    check("phone: y", milli(q.y, 2007), 49000);
+    check("phone: w is two pixels per guest pixel", milli(q.w, 2853), 2752000);
+    check("phone: h", milli(q.h, 2007), 1908000);
+    /* The firmware's 4:3 screen in the same place: centred inside it, not in the drawable. */
+    q = hv_fb_fit(2853, 2007, 1024, 768, place);
+    check("firmware: h fills the place", milli(q.h, 2007), 1908000);
+    check("firmware: w keeps 4:3", milli(q.w, 2853), 2544000);
+    check("firmware: centred in the place", milli(q.x, 2853), 50000 + (2752000 - 2544000) / 2);
+    /* Nothing to fit, or nowhere to fit it: the place comes back as given. */
+    q = hv_fb_fit(2853, 2007, 0, 954, place);
+    check("no picture: unchanged", milli(q.w, 2853), 2752000);
+    q = hv_fb_fit(0, 0, 1376, 954, whole);
+    check("no drawable: unchanged", milli(q.w, 1000), 1000000);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     hv_machine_init(&m, 1 << 20);
@@ -759,6 +799,7 @@ int main(void) {
     test_formats();
     test_cursor();
     test_resize();
+    test_fit();
     test_reset();
     test_threads();
 

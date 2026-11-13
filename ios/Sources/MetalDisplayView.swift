@@ -12,6 +12,12 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     var rightClickArmed: Bool = false
     var onRightClickConsumed: (() -> Void)?
     var onThreeFingerTap: (() -> Void)?
+    /// Where the Windows picture sits in this view. The view itself runs to the display's edges
+    /// and continues the picture's edge pixels around it; touches out there land on the nearest
+    /// pixel of the picture.
+    var pictureFrame: CGRect? {
+        didSet { if pictureFrame != oldValue { sendPictureRect() } }
+    }
 
     private var activeDragButtons: UInt8 = 0
     private var panLastPoint: CGPoint = .zero
@@ -93,12 +99,22 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         updateDrawableScale()
         if window != nil {
             WinIOSBridge.shared.bindMetalLayer(metalLayer)
+            sendPictureRect()
         }
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
         updateDrawableScale()
+        sendPictureRect()
+    }
+
+    private func sendPictureRect() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let picture = pictureFrame ?? bounds
+        let rect = CGRect(x: picture.minX / bounds.width, y: picture.minY / bounds.height,
+                          width: picture.width / bounds.width, height: picture.height / bounds.height)
+        WinIOSBridge.shared.setPictureRect(rect, for: metalLayer)
     }
 
     // MARK: - Raw touches to the guest touchscreen
@@ -177,7 +193,7 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
         let scale = window.screen.scale
         contentScaleFactor = scale
         metalLayer.contentsScale = scale
-        // The canvas frame is a whole number of device pixels (GuestPicture), so this is exact.
+        // The window, or the lid, is a whole number of device pixels, so this is exact.
         let w = max(1.0, (bounds.width * scale).rounded())
         let h = max(1.0, (bounds.height * scale).rounded())
         metalLayer.drawableSize = CGSize(width: w, height: h)
@@ -187,21 +203,23 @@ final class MetalCanvasUIView: UIView, UIKeyInput {
     }
 
     private func normalizedPoint(for pt: CGPoint) -> (Double, Double) {
-        let bw = max(1.0, bounds.width)
-        let bh = max(1.0, bounds.height)
+        // The same fit the renderer makes: the guest's frame inside the picture's place.
+        let picture = pictureFrame ?? bounds
+        let bw = max(1.0, picture.width)
+        let bh = max(1.0, picture.height)
         let fbW = Double(WinIOSBridge.shared.framebufferWidth)
         let fbH = Double(WinIOSBridge.shared.framebufferHeight)
 
-        var rect = bounds
+        var rect = picture
         if fbW > 0 && fbH > 0 {
             let viewAspect = Double(bw / bh)
             let fbAspect = fbW / fbH
             if viewAspect > fbAspect {
                 let fittedW = CGFloat(Double(bh) * fbAspect)
-                rect = CGRect(x: (bw - fittedW) * 0.5, y: 0, width: fittedW, height: bh)
+                rect = CGRect(x: picture.minX + (bw - fittedW) * 0.5, y: picture.minY, width: fittedW, height: bh)
             } else {
                 let fittedH = CGFloat(Double(bw) / fbAspect)
-                rect = CGRect(x: 0, y: (bh - fittedH) * 0.5, width: bw, height: fittedH)
+                rect = CGRect(x: picture.minX, y: picture.minY + (bh - fittedH) * 0.5, width: bw, height: fittedH)
             }
         }
         let nx = min(1.0, max(0.0, Double((pt.x - rect.minX) / max(1.0, rect.width))))
@@ -403,6 +421,8 @@ struct MetalDisplayView: UIViewRepresentable {
     @Binding var trackpadMode: Bool
     @Binding var rightClickArmed: Bool
     @Binding var keyboardVisible: Bool
+    /// The picture's place in the view's own coordinates.
+    var pictureFrame: CGRect
     var onThreeFingerTap: () -> Void
 
     func makeUIView(context: Context) -> MetalCanvasUIView {
@@ -418,6 +438,7 @@ struct MetalDisplayView: UIViewRepresentable {
         uiView.trackpadMode = trackpadMode
         uiView.rightClickArmed = rightClickArmed
         uiView.onThreeFingerTap = onThreeFingerTap
+        uiView.pictureFrame = pictureFrame
         if keyboardVisible && !uiView.isFirstResponder {
             DispatchQueue.main.async { _ = uiView.becomeFirstResponder() }
         } else if !keyboardVisible && uiView.isFirstResponder {

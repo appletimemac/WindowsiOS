@@ -34,6 +34,7 @@ static WinIOSBridge *s_shared_bridge = nil;
     uint64_t _configuredRamMB;
     int _configuredCPUs;
     CAMetalLayer *__weak _pendingLayer;
+    CGRect _pictureRect; /* the picture's place in _pendingLayer, as fractions of it; null: all of it */
     uint64_t _diagTickCount;
     uint64_t _lastMachTicks;
     uint64_t _lastWfiTicks;
@@ -414,9 +415,23 @@ static size_t jit_region_bytes(void) {
 
 - (void)bindMetalLayer:(nullable CAMetalLayer *)layer {
     _pendingLayer = layer;
+    _pictureRect = CGRectNull; /* the canvas says where its picture goes right after binding */
     if (_vmRunning) {
         hv_winvm_set_display_layer((__bridge void *)layer);
+        hv_winvm_set_display_content(0, 0, 0, 0);
     }
+}
+
+- (void)setPictureRect:(CGRect)rect forLayer:(CAMetalLayer *)layer {
+    /* Two canvases exist for a moment when the layout changes; only the bound one places the picture. */
+    if (layer != _pendingLayer) return;
+    _pictureRect = rect;
+    if (_vmRunning) [self applyPictureRect];
+}
+
+- (void)applyPictureRect {
+    CGRect r = CGRectIsNull(_pictureRect) ? CGRectZero : _pictureRect;
+    hv_winvm_set_display_content(r.origin.x, r.origin.y, r.size.width, r.size.height);
 }
 
 - (void)prepareAndStartWithLayer:(nullable CAMetalLayer *)layer {
@@ -566,6 +581,7 @@ static size_t jit_region_bytes(void) {
     CAMetalLayer *layer = _pendingLayer;
     if (layer) {
         hv_winvm_set_display_layer((__bridge void *)layer);
+        [self applyPictureRect];
     }
 
     _vmRunning = YES;

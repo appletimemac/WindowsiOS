@@ -54,7 +54,7 @@ struct SessionView: View {
                 laptopLayout(size: size, layout: layout)
                     .transition(.opacity)
             } else {
-                canvas(layout.picture, keyboardVisible: $vm.systemKeyboardVisible)
+                canvas(layout.picture, in: layout.area, keyboardVisible: $vm.systemKeyboardVisible)
                     .transition(.opacity)
             }
 
@@ -178,26 +178,29 @@ struct SessionView: View {
 
     // MARK: - Layouts
 
-    /// The Windows picture: the canvas holds exactly the guest's pixels, so nothing letterboxes
-    /// once Windows has switched to the requested size.
+    /// Windows, full screen. The canvas fills `area` (the window, or the lid) to the display's
+    /// edges. The picture inside it holds exactly the guest's pixels and stops short of the rounded
+    /// corners, so nothing Windows draws is cut off, and the canvas carries the picture's edge
+    /// pixels on to the glass, so nothing around it is black.
     @ViewBuilder
-    private func canvas(_ picture: GuestPicture?, keyboardVisible: Binding<Bool>) -> some View {
+    private func canvas(_ picture: GuestPicture?, in area: CGRect, keyboardVisible: Binding<Bool>) -> some View {
         if let picture {
             MetalDisplayView(
                 trackpadMode: $vm.trackpadMode,
                 rightClickArmed: $vm.rightClickArmed,
                 keyboardVisible: keyboardVisible,
+                pictureFrame: picture.frame.offsetBy(dx: -area.minX, dy: -area.minY),
                 onThreeFingerTap: openFAB
             )
-            .frame(width: picture.frame.width, height: picture.frame.height)
-            .position(x: picture.frame.midX, y: picture.frame.midY)
+            .frame(width: area.width, height: area.height)
+            .position(x: area.midX, y: area.midY)
         }
     }
 
     /// Windows on the lid, the keyboard deck below; the split lands on the crease when folded.
     private func laptopLayout(size: CGSize, layout: SessionLayout) -> some View {
         VStack(spacing: 0) {
-            canvas(layout.picture, keyboardVisible: .constant(false))
+            canvas(layout.picture, in: layout.area, keyboardVisible: .constant(false))
                 .frame(width: size.width, height: layout.area.height)
 
             // The physical crease while half-folded: nothing interactive here.

@@ -101,8 +101,20 @@ void hv_fb_display_set_resize_handler(HvFbDisplay *fb, HvFbResizeFn fn, void *op
 /* Any thread. Clamps to even values in 640x480..3840x2160; the handler is called without fb->mu held. */
 void hv_fb_display_request_size(HvFbDisplay *fb, uint32_t width, uint32_t height);
 
+/* A rectangle in fractions of a drawable's width and height. */
+typedef struct HvFbRect {
+    double x, y, w, h;
+} HvFbRect;
+/* Where a tex_w by tex_h picture goes when it is fitted into `content` of a draw_w by draw_h pixel drawable:
+   aspect kept, centred, as large as fits. */
+HvFbRect hv_fb_fit(double draw_w, double draw_h, uint32_t tex_w, uint32_t tex_h, HvFbRect content);
+
 /* Metal layer presentation & PNG screenshot helpers (implemented in devices/fb_metal.m) */
 void hv_fb_metal_set_layer(HvFbDisplay *fb, void *ca_metal_layer);
+/* Where in the layer the guest picture goes, as fractions of its width and height. The rest of the layer
+   continues the picture's edge pixels, so the picture can stop short of a display's rounded corners while
+   nothing around it is left black. Width or height 0: the whole layer, letterboxed in black (the default). */
+void hv_fb_metal_set_content(HvFbDisplay *fb, double x, double y, double w, double h);
 uint64_t hv_fb_metal_frames(HvFbDisplay *fb);
 int hv_fb_save_png(HvFbDisplay *fb, const char *path);
 

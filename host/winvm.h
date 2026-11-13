@@ -42,6 +42,8 @@ void hv_winvm_set_posture(int laptop);
 
 /* Display & screenshot hooks (any thread) */
 void hv_winvm_set_display_layer(void *ca_metal_layer);
+/* The picture's place in that layer (fractions of its size; see hv_fb_metal_set_content). Kept for the next VM. */
+void hv_winvm_set_display_content(double x, double y, double w, double h);
 int hv_winvm_display_size(uint32_t *w, uint32_t *h);
 uint64_t hv_winvm_display_frames(void);
 int hv_winvm_save_png(const char *path);

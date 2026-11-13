@@ -255,6 +255,17 @@ static uint32_t clamp_even(uint32_t v, uint32_t lo, uint32_t hi) {
     return v & ~1u;
 }
 
+HvFbRect hv_fb_fit(double draw_w, double draw_h, uint32_t tex_w, uint32_t tex_h, HvFbRect content) {
+    if (!(draw_w > 0) || !(draw_h > 0) || !tex_w || !tex_h || !(content.w > 0) || !(content.h > 0)) return content;
+    double into = (content.w * draw_w) / (content.h * draw_h), aspect = (double)tex_w / (double)tex_h;
+    HvFbRect q = content;
+    if (into > aspect) q.w = content.w * aspect / into;
+    else q.h = content.h * into / aspect;
+    q.x = content.x + (content.w - q.w) / 2.0;
+    q.y = content.y + (content.h - q.h) / 2.0;
+    return q;
+}
+
 void hv_fb_display_request_size(HvFbDisplay *fb, uint32_t width, uint32_t height) {
     if (!fb) return;
     width = clamp_even(width, 640, 3840);
