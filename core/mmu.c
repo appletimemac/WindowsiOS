@@ -110,6 +110,7 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
         out->block_size = size;
         out->pa = (desc & OA_MASK & ~(size - 1)) | (va & (size - 1));
         out->attr = (cpu->mair_el1 >> (((desc >> 2) & 7) * 8)) & 0xff;
+        out->ng = (desc >> 11) & 1;
         if (!(desc & (1u << 10))) {
             out->fsc = HV_FSC_ACCESS(level);
             return;
@@ -147,6 +148,7 @@ void hv_tlb_flush(HvCpu *cpu) {
     memset(cpu->tlb, 0x80, sizeof cpu->tlb);
     cpu->nuser_fills = 0;
     cpu->nkernel_fills = 0;
+    cpu->kernel_asid_exec = 0;
     hv_tlb_stash_drop(cpu, -1);
     if (cpu->pc_state) {
         memset(cpu->pc_state->large_2m_bloom, 0, sizeof cpu->pc_state->large_2m_bloom);
@@ -580,7 +582,7 @@ void hv_tlb_flush_va_asid(HvCpu *cpu, uint64_t va, int asid) {
             for (uint32_t s = 0; s < (1u << (21 - HV_TLB_PAGE_BITS)); s++) {
                 uint32_t sl = ((uint32_t)(base >> HV_TLB_PAGE_BITS) + s) & (HV_TLB_SIZE - 1);
                 /* The kernel's cached targets in every page of the mapping, not only the page named and not
-                   only where a TLB entry is left. */
+                   only where a TLB entry is left: they are kept across address-space switches now. */
                 if ((va >> 55) & 1) ijc_drop_va(cpu, base + ((uint64_t)s << HV_TLB_PAGE_BITS), asid, 0, 0);
                 for (int el = 0; el < 3; el++) {
                     HvTlbEntry *e = hv_tlb_ent(cpu, sl, el);
@@ -725,7 +727,20 @@ void hv_kva_hist_dump(FILE *f) {
         if (kva_fills[g]) fprintf(f, "kva gb %d fills %llu pages %llu\n", g, (unsigned long long)kva_fills[g], (unsigned long long)kva_pages_n[g]);
 }
 
+/* HV_KTLB_FLUSH: every TTBR1 change empties the kernel half of the TLB and takes that TTBR1 value's own set
+   of cached kernel branch targets, as before global mappings were told apart (for comparison). */
+static int kernel_flush_always(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("HV_KTLB_FLUSH") != NULL;
+    return v;
+}
+
 static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
+    /* EL1 can run code from a kernel page that belongs to the ASID (not global). Branch targets in the
+       kernel half are cached by address alone, so those go with the ASID (hv_tlb_drop_kernel_asid). Here,
+       before the returns below: what counts is that the page can be fetched, not that it gets an entry.
+       (EL1 code in the process half caches no branch target: the fills check the half.) */
+    if (el && w->x && w->ng && ((va >> 55) & 1)) cpu->kernel_asid_exec = 1;
     if ((va >> 55) & 1) kva_note(va & ~(uint64_t)PAGE_MASK);
     if (w->block_size < (1ull << HV_TLB_PAGE_BITS)) return; /* smaller guest pages: slow path only */
     HvRam *ram = ram_of(cpu->m, w->pa);
@@ -740,7 +755,9 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
     if (!((page_va >> 55) & 1)) {
         if (cpu->nuser_fills < HV_USER_FILLS) cpu->user_fills[cpu->nuser_fills] = (uint16_t)hv_tlb_code(slot, table);
         if (cpu->nuser_fills <= HV_USER_FILLS) cpu->nuser_fills++;
-    } else {
+    } else if (w->ng || kernel_flush_always()) {
+        /* A kernel page of this ASID alone (Windows: the window onto the process's own page tables). The
+           global ones, nearly all, are not listed: they outlive every address-space switch. */
         if (cpu->nkernel_fills < HV_KERNEL_FILLS) cpu->kernel_fills[cpu->nkernel_fills] = (uint16_t)hv_tlb_code(slot, table);
         if (cpu->nkernel_fills <= HV_KERNEL_FILLS) cpu->nkernel_fills++;
     }
@@ -1074,10 +1091,17 @@ static int kernel_entry(const HvTlbEntry *e) {
     return (int)((tag >> 55) & 1);
 }
 
-void hv_tlb_flush_kernel(HvCpu *cpu) {
-    if (cpu->m) cpu->m->stats.tlb_flushes++;
+int hv_mmu_asid(const HvCpu *cpu) {
+    return current_asid((HvCpu *)cpu);
+}
+
+/* The listed kernel entries: the ones that belong to an ASID, or every kernel entry under HV_KTLB_FLUSH.
+   A slot may hold a global page by now; dropping that one too only costs its refill. */
+static void drop_kernel_fills(HvCpu *cpu) {
     uint32_t n = cpu->nkernel_fills;
     cpu->nkernel_fills = 0;
+    if (!n) return;
+    if (cpu->m) cpu->m->stats.tlb_flushes++;
     if (n <= HV_KERNEL_FILLS) {
         for (uint32_t k = 0; k < n; k++) {
             HvTlbEntry *e = &cpu->tlb[0] + cpu->kernel_fills[k];
@@ -1090,6 +1114,42 @@ void hv_tlb_flush_kernel(HvCpu *cpu) {
             HvTlbEntry *e = hv_tlb_ent(cpu, i, t);
             if (kernel_entry(e)) memset(e, 0x80, sizeof *e);
         }
+}
+
+int hv_tlb_drop_kernel_asid(HvCpu *cpu) {
+    drop_kernel_fills(cpu);
+    if (!kernel_flush_always() && !cpu->kernel_asid_exec) return 0;
+    /* EL1 ran, or could run, code from a kernel page of the ASID: the targets cached by its address may
+       name another ASID's page from here on. (In Windows only while it boots; the global kernel's go too.) */
+    cpu->kernel_asid_exec = 0;
+    hv_ijc_reset(cpu, 1);
+    return 1;
+}
+
+/* Windows gives every process its own top-level kernel table and, with TCR.A1, keeps the ASID in TTBR1
+   too, so TTBR1 is written twice on every process switch (measured: 40,000 times a second while
+   browsing). Global mappings are by definition the same under every ASID, and a TLB keeps them across
+   these writes: only a TLBI removes them. So the kernel half stays, 99% of it in Windows, with the branch
+   targets cached from it. Emptying it here made 96% of all kernel TLB fills refills (2.3 million a
+   second). What goes is what belongs to the ASID: its kernel entries, also when only the table changed
+   (Windows passes through ASID 0 with the next process's table, and nothing filled there may outlive
+   it), and the kernel's return table, as at every TTBR1 write before: a return is matched by address
+   alone, and an invalidation renews the table only for a page whose entry it still finds. */
+void hv_tlb_switch_kernel(HvCpu *cpu, uint64_t old_ttbr1) {
+    if (kernel_flush_always()) {
+        drop_kernel_fills(cpu);
+        hv_ijc_switch_kernel(cpu, cpu->ttbr1_el1);
+        return;
+    }
+    if (!(old_ttbr1 & OA_MASK) || !(cpu->ttbr1_el1 & OA_MASK)) {
+        /* The first kernel table, or none any more: nothing cached under the other is kept. */
+        cpu->nkernel_fills = HV_KERNEL_FILLS + 1; /* scan: the global entries are not listed */
+        drop_kernel_fills(cpu);
+        cpu->kernel_asid_exec = 0;
+        hv_ijc_reset(cpu, 1);
+        return;
+    }
+    if (!hv_tlb_drop_kernel_asid(cpu)) ret_new(cpu, 1);
 }
 
 static int user_entry(const HvTlbEntry *e) {

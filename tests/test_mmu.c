@@ -446,6 +446,130 @@ int main(void) {
 #undef CHECK
     }
 
+    /* Windows writes TTBR1 twice on every process switch: each process has its own top-level kernel table and,
+       with TCR.A1, its ASID there. The kernel's global mappings stay in the TLB through that, with the branch
+       targets cached from them, as on hardware; what belongs to the ASID goes, and the kernel's return table
+       is renewed as it always was. A TLBI removes either kind. */
+    {
+#define CHECK(what, cond)                          \
+    do {                                           \
+        checks++;                                  \
+        if (!(cond)) {                             \
+            printf("  FAIL kernel switch: %s\n", what); \
+            failures++;                            \
+        }                                          \
+    } while (0)
+#define MSR_TTBR1(v) (cpu.x[0] = (v), hv_sysreg_msr(&cpu, 0xd5182020u, 0))
+#define MSR_TTBR0(v) (cpu.x[0] = (v), hv_sysreg_msr(&cpu, 0xd5182000u, 0))
+#define SLOT(va, table) hv_tlb_ent(&cpu, (uint32_t)((va) >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table)
+        const uint64_t NG = 1ull << 11, TCR_A1 = 25 | 25u << 16 | 1u << 22 | 2u << 30 | 5ull << 32 | 1ull << 36;
+        const uint64_t kg = 0xffffffc000100000ull, kn = 0xffffffc000200000ull, kx = 0xffffffc000300000ull;
+        const uint64_t pg = PT_PA + 0xe0000, pn_a = PT_PA + 0xe1000, pn_b = PT_PA + 0xe2000, px = PT_PA + 0xe3000;
+        hv_cpu_reset(&cpu, &m);
+        cpu.el = 1;
+        pt_next = 1 * 65536;
+        uint64_t ka = alloc_table(), kb = alloc_table(); /* two processes' kernel tables */
+        cpu.mair_el1 = 0x00ff;
+        cpu.tcr_el1 = TCR_A1; /* 4K, 39 bits each, the ASID in TTBR1, 16 bits of it */
+        cpu.sctlr_el1 |= 1;
+        for (int t = 0; t < 2; t++) {
+            uint64_t root = t ? kb : ka;
+            map(root, 12, 39, kg, 3, pg | PAGE | AF, 0);                          /* global, the same in both */
+            map(root, 12, 39, kn, 3, (t ? pn_b : pn_a) | PAGE | AF | NG | PXN, 0); /* each process's own data */
+            map(root, 12, 39, kx, 3, px | PAGE | AF | NG, 0);                     /* its own, and code can run from it */
+        }
+        HvTlbEntry *eg = SLOT(kg, 1), *en = SLOT(kn, 1);
+        uint64_t got;
+        /* Process A's tables, set the way the guest does. */
+        MSR_TTBR1((11ull << 48) | ka);
+        MSR_TTBR0(0x40010000ull);
+        CHECK("global page reads", hv_mmu_access(&cpu, kg, HV_ACC_READ, 1, &got) == 0 && got == pg);
+        CHECK("process A's page reads", hv_mmu_access(&cpu, kn, HV_ACC_READ, 1, &got) == 0 && got == pn_a);
+        CHECK("both are in the TLB", eg->read_tag == kg - HV_TLB_ADJ && en->read_tag == kn - HV_TLB_ADJ);
+        uint64_t ksalt = cpu.ijc_salt[1], rsalt = cpu.ret_salt[1];
+        /* To process B as KiSwapProcess goes: TTBR1 to (ASID 0, B's table), TTBR0, TTBR1 to (B's ASID, B's table). */
+        MSR_TTBR1(kb);
+        MSR_TTBR0(0x40050000ull);
+        MSR_TTBR1((22ull << 48) | kb);
+        CHECK("the global page stays through a process switch", eg->read_tag == kg - HV_TLB_ADJ);
+        CHECK("the other process's page is gone", en->read_tag == HV_TLB_INVALID);
+        CHECK("cached kernel branch targets are kept", cpu.ijc_salt[1] == ksalt);
+        CHECK("the kernel's return table is renewed", cpu.ret_salt[1] != rsalt);
+        CHECK("process B reads its own page", hv_mmu_access(&cpu, kn, HV_ACC_READ, 1, &got) == 0 && got == pn_b);
+        CHECK("and the TLB holds B's", en->read_tag == kn - HV_TLB_ADJ &&
+                                           en->addend == (int64_t)((uint64_t)(uintptr_t)(pt + 0xe2000) - kn));
+        /* With TCR.A1 the top bits of TTBR0 are not the ASID: writing them ends nothing in the kernel half. */
+        MSR_TTBR0((77ull << 48) | 0x40050000ull);
+        CHECK("TTBR0's top bits are not the ASID here", en->read_tag == kn - HV_TLB_ADJ && eg->read_tag == kg - HV_TLB_ADJ);
+        /* Many switches later the global page is still there. */
+        for (int i = 0; i < 100; i++) {
+            MSR_TTBR1(i & 1 ? kb : ka);
+            MSR_TTBR1(((uint64_t)(i & 1 ? 22 : 11) << 48) | (i & 1 ? kb : ka));
+        }
+        CHECK("the global page stays through a hundred switches", eg->read_tag == kg - HV_TLB_ADJ && cpu.ijc_salt[1] == ksalt);
+        /* TLBI by ASID is not for global pages; TLBI by address is. */
+        hv_mmu_access(&cpu, kn, HV_ACC_READ, 1, &got);
+        cpu.x[0] = 22ull << 48;
+        hv_sysreg_sys(&cpu, 0xd5088740u, 0); /* tlbi aside1, x0 */
+        CHECK("TLBI by ASID keeps the global page", eg->read_tag == kg - HV_TLB_ADJ);
+        CHECK("TLBI by ASID drops the ASID's kernel page", en->read_tag == HV_TLB_INVALID);
+        CHECK("TLBI by ASID keeps the kernel branch targets", cpu.ijc_salt[1] == ksalt);
+        cpu.x[0] = (kg >> 12) & 0xfffffffffffull;
+        hv_sysreg_sys(&cpu, 0xd5088760u, 0); /* tlbi vaae1, x0 */
+        CHECK("TLBI by address drops the global page", eg->read_tag == HV_TLB_INVALID);
+        /* Code that EL1 can run from a kernel page of the ASID: its cached branch targets must not outlive the ASID. */
+        CHECK("the ASID's code page fetches", hv_mmu_access(&cpu, kx, HV_ACC_EXEC, 1, &got) == 0 && got == px);
+        cpu.x[0] = 22ull << 48;
+        hv_sysreg_sys(&cpu, 0xd5088740u, 0);
+        CHECK("TLBI by ASID after the ASID's code ran: the kernel branch targets go", cpu.ijc_salt[1] != ksalt);
+        ksalt = cpu.ijc_salt[1];
+        hv_mmu_access(&cpu, kx, HV_ACC_EXEC, 1, &got);
+        MSR_TTBR1(kb);
+        CHECK("a switch after the ASID's code ran: the kernel branch targets go", cpu.ijc_salt[1] != ksalt);
+        ksalt = cpu.ijc_salt[1];
+        MSR_TTBR1((11ull << 48) | ka);
+        CHECK("and only once", cpu.ijc_salt[1] == ksalt);
+        /* Under ASID 0 (the middle of every switch) a page of one table must not outlive the table. */
+        hv_tlb_flush(&cpu);
+        MSR_TTBR1(ka);
+        hv_mmu_access(&cpu, kg, HV_ACC_READ, 1, &got);
+        hv_mmu_access(&cpu, kn, HV_ACC_READ, 1, &got);
+        MSR_TTBR1(kb);
+        CHECK("same ASID, another table: the table's own page goes", en->read_tag == HV_TLB_INVALID);
+        CHECK("same ASID, another table: the global page stays", eg->read_tag == kg - HV_TLB_ADJ);
+        /* Without TCR.A1 the ASID is in TTBR0: a TTBR0 write ends it, and a TTBR1 write still changes tables. */
+        cpu.tcr_el1 &= ~(1ull << 22);
+        hv_tlb_flush(&cpu);
+        cpu.ttbr0_el1 = (5ull << 48) | 0x40010000ull;
+        cpu.ttbr1_el1 = ka;
+        hv_mmu_access(&cpu, kg, HV_ACC_READ, 1, &got);
+        hv_mmu_access(&cpu, kn, HV_ACC_READ, 1, &got);
+        MSR_TTBR0((6ull << 48) | 0x40050000ull);
+        CHECK("ASID in TTBR0: its kernel page goes on a TTBR0 write", en->read_tag == HV_TLB_INVALID);
+        CHECK("ASID in TTBR0: the global page stays", eg->read_tag == kg - HV_TLB_ADJ);
+        hv_mmu_access(&cpu, kn, HV_ACC_READ, 1, &got);
+        MSR_TTBR1(kb);
+        CHECK("ASID in TTBR0: a TTBR1 write drops the old table's own page", en->read_tag == HV_TLB_INVALID);
+        CHECK("ASID in TTBR0: and keeps the global page", eg->read_tag == kg - HV_TLB_ADJ);
+        /* No kernel table before, or none after: nothing cached under the other is kept. */
+        cpu.tcr_el1 = TCR_A1;
+        hv_tlb_flush(&cpu);
+        cpu.ttbr1_el1 = (11ull << 48) | ka;
+        hv_mmu_access(&cpu, kg, HV_ACC_READ, 1, &got);
+        MSR_TTBR1(0);
+        CHECK("no kernel table any more: the global page goes too", eg->read_tag == HV_TLB_INVALID);
+        cpu.ttbr1_el1 = (11ull << 48) | ka;
+        hv_mmu_access(&cpu, kg, HV_ACC_READ, 1, &got);
+        cpu.ttbr1_el1 = 0; /* as if the entry were left from before any table */
+        MSR_TTBR1((22ull << 48) | kb);
+        CHECK("the first kernel table: nothing older is kept", eg->read_tag == HV_TLB_INVALID);
+
+#undef SLOT
+#undef MSR_TTBR0
+#undef MSR_TTBR1
+#undef CHECK
+    }
+
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

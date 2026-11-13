@@ -226,20 +226,19 @@ static int write_reg(HvCpu *cpu, uint32_t reg, uint64_t v) {
     case R(3, 0, 1, 0, 2): cpu->cpacr_el1 = v; return 0;
     case R(3, 0, 2, 0, 0): { /* a process switch */
         uint64_t old = cpu->ttbr0_el1, old_ukey = hv_mmu_ukey(cpu);
+        int old_asid = hv_mmu_asid(cpu);
         cpu->ttbr0_el1 = v;
         uint64_t new_ukey = hv_mmu_ukey(cpu);
         if (old_ukey != new_ukey) hv_tlb_switch_user(cpu, old_ukey, new_ukey);
         else if (old != v) hv_tlb_flush_user(cpu);
         if (old != v) hv_ijc_switch(cpu);
+        if (hv_mmu_asid(cpu) != old_asid) hv_tlb_drop_kernel_asid(cpu); /* without TCR.A1 the ASID is here */
         return 0;
     }
     case R(3, 0, 2, 0, 1): { /* TTBR1: Windows switches TTBR1 per process (with TCR.A1 == 1) and on KVA shadow transitions */
         uint64_t old = cpu->ttbr1_el1, old_ukey = hv_mmu_ukey(cpu);
         cpu->ttbr1_el1 = v;
-        if (old != v) {
-            hv_tlb_flush_kernel(cpu);
-            hv_ijc_switch_kernel(cpu, v);
-        }
+        if (old != v) hv_tlb_switch_kernel(cpu, old);
         if ((cpu->tcr_el1 >> 22) & 1) {
             uint64_t new_ukey = hv_mmu_ukey(cpu);
             if (old_ukey != new_ukey) hv_tlb_switch_user(cpu, old_ukey, new_ukey);
@@ -431,9 +430,7 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
     } else if (by_asid) {
         hv_tlb_flush_user(cpu);
         hv_tlb_stash_drop(cpu, tasid);
-        hv_tlb_flush_kernel(cpu);
-        hv_ijc_reset(cpu, 1);
-        cpu->m->stats.reset_why[1]++;
+        if (hv_tlb_drop_kernel_asid(cpu)) cpu->m->stats.reset_why[1]++; /* by ASID: not the global kernel mappings */
         hv_ijc_drop_asid(cpu, (uint16_t)tasid);
     } else {
         if (cpu->m->log >= 2)

@@ -133,8 +133,11 @@ typedef struct HvCpu {
     uint16_t user_fills[HV_USER_FILLS];
     uint32_t nuser_fills;
 #define HV_KERNEL_FILLS 4096
+    /* The same for kernel addresses, but only the entries that belong to an ASID (not global): the global
+       ones stay through every address-space switch and are found by scanning on the rare full kernel flush. */
     uint16_t kernel_fills[HV_KERNEL_FILLS];
     uint32_t nkernel_fills;
+    int kernel_asid_exec;    /* EL1 can fetch from one of them (tlb_fill): the kernel's cached branch targets go with the ASID */
 #define HV_KTTBR_SLOTS 64
     struct { uint64_t ttbr1; uint16_t kgen; } kttbr_map[HV_KTTBR_SLOTS];
     uint32_t kttbr_next, kttbr_count;
