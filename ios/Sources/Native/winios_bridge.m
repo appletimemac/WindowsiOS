@@ -525,8 +525,9 @@ static size_t jit_region_bytes(void) {
     [[NSFileManager defaultManager] createDirectoryAtPath:sharedDir withIntermediateDirectories:YES attributes:nil error:nil];
     /* Keep AF_UNIX sun_path well under Darwin's 104-byte limit (~82 bytes vs 106 bytes) */
     NSString *rawTmp = [NSTemporaryDirectory() stringByReplacingOccurrencesOfString:@"/private/var/" withString:@"/var/"];
+    /* Not removed here: the share binds it once for the life of the process (removing a stale one first), so a
+       second start of Windows in one run has to find it where the first left it. */
     NSString *shareSock = [rawTmp stringByAppendingPathComponent:@"s"];
-    unlink(shareSock.fileSystemRepresentation);
 
     NSString *codePath = [dir stringByAppendingPathComponent:@"code.fd"];
     NSString *varsPath = [dir stringByAppendingPathComponent:@"vars.fd"];
