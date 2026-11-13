@@ -52,7 +52,9 @@ static void dump_virtio(FILE *f, const char *name, const HvVirtio *v) {
     for (int q = 0; q < v->nq; q++) {
         uint16_t flags = 0xffff;
         const HvVirtq *vq = &v->q[q];
-        if (vq->enabled && vq->avail) hv_phys_read(v->m, vq->avail, &flags, 2);
+        /* From RAM only, as everything this dump reads from guest addresses: a device read can change state. */
+        const void *p = vq->enabled && vq->avail ? hv_phys_ptr(v->m, vq->avail, 2) : NULL;
+        if (p) memcpy(&flags, p, 2);
         fprintf(f, " q%d: enabled=%u avail_flags=%x", q, vq->enabled, flags);
     }
     fprintf(f, "\n");
@@ -97,7 +99,8 @@ void hv_winvm_cpu_insns(HvCpu *cpu, uint64_t pc, uint32_t words[17]) {
         HvWalk w = {0};
         hv_mmu_walk(cpu, va, HV_ACC_READ, cpu->el, &w);
         words[j] = 0;
-        if (w.fsc == 0) hv_phys_read(cpu->m, w.pa, &words[j], 4);
+        const void *p = w.fsc == 0 ? hv_phys_ptr(cpu->m, w.pa, 4) : NULL;
+        if (p) memcpy(&words[j], p, 4);
     }
 }
 

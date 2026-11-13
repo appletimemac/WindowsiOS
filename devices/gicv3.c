@@ -164,9 +164,11 @@ void hv_gicv3_dump(HvGic *g, FILE *f) {
         for (int w = 0; w < HV_GIC_MAX_LPIS / 64; w++)
             for (uint64_t bits = k->lpi_pending[w]; bits; bits &= bits - 1) {
                 int lpi = HV_GIC_LPI_BASE + w * 64 + __builtin_ctzll(bits);
-                uint8_t lp = 0;
-                int en = lpi_prop_read(g, c, lpi, &lp);
-                fprintf(f, "  lpi %d: pending enabled=%d prio=%x\n", lpi, en, lp);
+                /* Read from RAM only: the table's address is the guest's, and a read through the device path
+                   would take the device lock under this one, the reverse of a device raising an interrupt. */
+                const uint8_t *prop = hv_phys_ptr(g->m, (k->propbaser & 0x000ffffffffff000ULL) + (uint64_t)(lpi - HV_GIC_LPI_BASE), 1);
+                if (prop) fprintf(f, "  lpi %d: pending enabled=%d prio=%x\n", lpi, *prop & 1, *prop & 0xfcu);
+                else fprintf(f, "  lpi %d: pending, properties not in RAM\n", lpi);
             }
     }
     for (int i = 32; i < HV_GIC_NUM_IRQS; i++)

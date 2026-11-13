@@ -35,7 +35,10 @@ static void state_code(FILE *f, HvMachine *m, HvCpu *c, const char *what, uint64
         uint32_t insn = 0;
         hv_mmu_walk(c, va + (uint64_t)(int64_t)o, HV_ACC_READ, 1, &w);
         if (o == 0) fprintf(f, " >");
-        if ((w.fsc && !w.block_size) || hv_phys_read(m, w.pa, &insn, 4) != 0) fprintf(f, " ????????");
+        /* From RAM only: a read through a device can have an effect (a virtio ISR clears on read). */
+        const void *p = w.fsc && !w.block_size ? NULL : hv_phys_ptr(m, w.pa, 4);
+        if (p) memcpy(&insn, p, 4);
+        if (!p) fprintf(f, " ????????");
         else fprintf(f, " %08x", insn);
     }
     fprintf(f, "\n");
