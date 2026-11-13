@@ -2,6 +2,7 @@
 #include "cmdfile.h"
 #include "gicv3.h"
 #include "mmu.h"
+#include "share.h"
 #include "winvm.h"
 
 #include <stdint.h>
@@ -254,6 +255,10 @@ int hv_cmdfile_exec(const HvCmdFile *cmd, const char *line) {
         }
         c.tip = 0;
         hv_winvm_touch(&c, 1);
+    } else if (sscanf(line, "notetap %d %d", &code, &yi) == 2) {
+        hv_share_note_tap(code, yi);
+    } else if (!strcmp(line, "notelook")) {
+        hv_share_note_look();
     } else if (!strcmp(line, "touchready")) {
         fprintf(cmd->err, "TOUCH_READY %d\n", hv_winvm_touch_ready());
     } else if (sscanf(line, "combo %i %i", &code, &yi) == 2) {

@@ -23,6 +23,18 @@ void hv_share_request_hibernate(void);
 /* Forget an untaken request (a new VM is starting). */
 void hv_share_clear_hibernate(void);
 
+/* A tap landed on the Windows picture at guest pixel (x, y). Wakes the agent's GET /.henge/focus-wait. Returns
+   the event's number, which its reports carry. */
+unsigned long hv_share_note_tap(int x, int y);
+/* Nothing was tapped, but focus may have moved (Enter was typed): the agent looks again. */
+unsigned long hv_share_note_look(void);
+/* Each report from the agent, on a share server thread: seq = the event it answers (a caller that has noted a
+   newer one since drops it), editable = the focused element takes text, inside = the tap was inside it (0 for a
+   look). fn NULL removes the handler. */
+void hv_share_set_text_focus_handler(void (*fn)(unsigned long seq, int editable, int inside, void *ctx), void *ctx);
+/* Seconds since the agent last waited for a tap (so it is one that reports text focus), or -1 if never. */
+long hv_share_focus_agent_seen(void);
+
 /* Enable/disable host SafariSheet handling of guest `/.henge/open-url` requests (0 -> guest falls back to Edge). */
 void hv_share_set_url_handler_enabled(int enabled);
 int hv_share_url_handler_enabled(void);

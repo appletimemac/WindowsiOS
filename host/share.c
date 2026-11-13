@@ -67,6 +67,53 @@ void hv_share_request_hibernate(void) {
 }
 void hv_share_clear_hibernate(void) { __atomic_store_n(&hibernate_requested_at, 0, __ATOMIC_RELAXED); }
 
+/* Text focus. The agent inside Windows long-polls GET /.henge/focus-wait; the app calls hv_share_note_tap when a
+   touch lands on the picture (or hv_share_note_look after Enter) and the poll answers with that event. The agent
+   then asks UI Automation what has focus and reports it at GET /.henge/focus, which reaches the app's handler. Only
+   the newest event is kept: a report for an older one is dropped because a newer tap is already being looked at.
+   The limits are variables so tests/test_share_focus.c can shorten them. */
+unsigned hv_share_focus_wait_ms = 8000;   /* how long a poll waits for an event before answering "none" */
+unsigned hv_share_focus_stale_ms = 2000;  /* an event older than this is not worth popping a keyboard for */
+unsigned hv_share_focus_report_ms = 4000; /* nor is a report this long after its event (a hung app held the agent) */
+
+enum { FOCUS_NONE, FOCUS_TAP, FOCUS_LOOK };
+static pthread_mutex_t focus_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t focus_cond = PTHREAD_COND_INITIALIZER;
+static unsigned long focus_seq;
+static int focus_kind, focus_x, focus_y;
+static uint64_t focus_at; /* CLOCK_UPTIME_RAW ns */
+static void (*focus_handler)(unsigned long, int, int, void *);
+static void *focus_handler_ctx;
+static uint64_t focus_agent_at; /* atomic; CLOCK_UPTIME_RAW ns, 0 for never */
+
+static unsigned long focus_note(int kind, int x, int y) {
+    pthread_mutex_lock(&focus_mu);
+    unsigned long seq = ++focus_seq;
+    focus_kind = kind;
+    focus_x = x;
+    focus_y = y;
+    focus_at = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_cond_broadcast(&focus_cond);
+    pthread_mutex_unlock(&focus_mu);
+    return seq;
+}
+
+unsigned long hv_share_note_tap(int x, int y) { return focus_note(FOCUS_TAP, x, y); }
+unsigned long hv_share_note_look(void) { return focus_note(FOCUS_LOOK, -1, -1); }
+
+void hv_share_set_text_focus_handler(void (*fn)(unsigned long seq, int editable, int inside, void *ctx), void *ctx) {
+    pthread_mutex_lock(&focus_mu);
+    focus_handler = fn;
+    focus_handler_ctx = ctx;
+    pthread_mutex_unlock(&focus_mu);
+}
+
+long hv_share_focus_agent_seen(void) {
+    uint64_t at = __atomic_load_n(&focus_agent_at, __ATOMIC_RELAXED);
+    if (!at) return -1;
+    return (long)((clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - at) / 1000000000ull);
+}
+
 static int is_url_handler_on(void) {
     if (url_handler_enabled < 0) {
 #if TARGET_OS_IPHONE
@@ -768,6 +815,76 @@ static int open_url_put(Conn *c, Request *r) {
     return respond_empty(c, r, 400, "Bad Request");
 }
 
+/* The value of key in a query string ("a=1&b=2") as a plain decimal, 1 if it is there and well formed. */
+static int query_number(const char *query, const char *key, unsigned long *out) {
+    size_t n = strlen(key);
+    for (const char *p = query; p && *p; p = strchr(p, '&') ? strchr(p, '&') + 1 : NULL) {
+        if (strncmp(p, key, n) != 0 || p[n] != '=') continue;
+        const char *v = p + n + 1;
+        size_t digits = 0;
+        unsigned long value = 0;
+        for (; v[digits] >= '0' && v[digits] <= '9'; digits++) {
+            if (digits >= 18) return 0;
+            value = value * 10 + (unsigned long)(v[digits] - '0');
+        }
+        if (!digits || (v[digits] && v[digits] != '&')) return 0;
+        *out = value;
+        return 1;
+    }
+    return 0;
+}
+
+static int focus_wait(Conn *c, Request *r) {
+    if (body_discard(c, r) != 0) return -1;
+    __atomic_store_n(&focus_agent_at, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
+    unsigned long after = 0;
+    int have_after = query_number(r->query, "after", &after);
+    unsigned long seq;
+    int kind = FOCUS_NONE, x = -1, y = -1;
+    pthread_mutex_lock(&focus_mu);
+    if (have_after) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += hv_share_focus_wait_ms / 1000;
+        deadline.tv_nsec += (long)(hv_share_focus_wait_ms % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) deadline.tv_sec++, deadline.tv_nsec -= 1000000000L;
+        while (focus_seq == after) {
+            if (pthread_cond_timedwait(&focus_cond, &focus_mu, &deadline) != 0) break;
+        }
+        uint64_t age_ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - focus_at) / 1000000ull;
+        if (focus_seq != after && age_ms <= hv_share_focus_stale_ms) {
+            kind = focus_kind;
+            x = focus_x;
+            y = focus_y;
+        }
+    }
+    seq = focus_seq;
+    pthread_mutex_unlock(&focus_mu);
+    __atomic_store_n(&focus_agent_at, clock_gettime_nsec_np(CLOCK_UPTIME_RAW), __ATOMIC_RELAXED);
+    char text[64];
+    int len = snprintf(text, sizeof text, "%lu %s %d %d", seq, kind == FOCUS_TAP ? "tap" : kind == FOCUS_LOOK ? "look" : "none", x, y);
+    return respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n", text, (size_t)len);
+}
+
+static int focus_report(Conn *c, Request *r) {
+    if (body_discard(c, r) != 0) return -1;
+    unsigned long seq, editable, inside;
+    if (!query_number(r->query, "seq", &seq) || !query_number(r->query, "editable", &editable) ||
+        !query_number(r->query, "inside", &inside) || editable > 1 || inside > 1)
+        return respond_empty(c, r, 400, "Bad Request");
+    void (*fn)(unsigned long, int, int, void *) = NULL;
+    void *ctx = NULL;
+    pthread_mutex_lock(&focus_mu);
+    uint64_t age_ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - focus_at) / 1000000ull;
+    if (seq == focus_seq && age_ms <= hv_share_focus_report_ms) {
+        fn = focus_handler;
+        ctx = focus_handler_ctx;
+    }
+    pthread_mutex_unlock(&focus_mu);
+    if (fn) fn(seq, (int)editable, (int)inside, ctx);
+    return respond_empty(c, r, 204, "No Content");
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
@@ -786,6 +903,8 @@ static int serve_henge(Conn *c, Request *r) {
         const char *text = at && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - at < HIBERNATE_TTL_NS ? "hibernate" : "none";
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\nCache-Control: no-store\r\n", text, strlen(text));
     }
+    if (!strcmp(what, "focus-wait") && !strcmp(r->method, "GET")) return focus_wait(c, r);
+    if (!strcmp(what, "focus") && !strcmp(r->method, "GET")) return focus_report(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
     if (!strcmp(what, "open-url") && (!strcmp(r->method, "PUT") || !strcmp(r->method, "POST"))) return open_url_put(c, r);

@@ -236,6 +236,14 @@ void hv_winvm_request_display_size(uint32_t width, uint32_t height) {
     if (fb) hv_fb_display_request_size(fb, width, height);
 }
 
+#if !TARGET_OS_IPHONE
+/* The Mac host has no keyboard to raise: HV_FOCUS_LOG prints what the agent reports instead. */
+static void log_text_focus(unsigned long seq, int editable, int inside, void *ctx) {
+    (void)ctx;
+    fprintf(stderr, "text_focus editable=%d inside=%d seq=%lu\n", editable, inside, seq);
+}
+#endif
+
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)
         return fail(err, errlen, "UEFI firmware (code.fd) and NVRAM (vars.fd) are required.");
@@ -289,6 +297,9 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     share_on = 0;
     if (c->share_dir && *c->share_dir && c->share_sock && *c->share_sock) {
         hv_share_clear_hibernate();
+#if !TARGET_OS_IPHONE
+        if (getenv("HV_FOCUS_LOG")) hv_share_set_text_focus_handler(log_text_focus, NULL);
+#endif
         if (hv_share_start(c->share_dir, c->share_sock, NULL) == 0) {
             hv_net_set_share_socket(c->share_sock);
             share_on = 1;
