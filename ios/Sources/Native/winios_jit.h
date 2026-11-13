@@ -20,7 +20,9 @@ typedef struct WinIosDualMapping {
     size_t   size;
 } WinIosDualMapping;
 
-#define WINIOS_JIT_DEFAULT_BYTES ((size_t)384u << 20) /* 384 MiB */
+#define WINIOS_JIT_DEFAULT_BYTES ((size_t)768u << 20) /* 768 MiB: 384 thrashed in Store and Edge use (13 flushes a minute) */
+/* The low __DATA hold is sized for the largest region a launch may ask for (WINIOS_JIT_MB). */
+#define WINIOS_JIT_MAX_BYTES ((size_t)768u << 20)
 
 void winios_jit_install_trap_handler(void);
 bool winios_jit_is_debugger_attached(void);

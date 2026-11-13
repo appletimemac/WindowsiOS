@@ -503,6 +503,7 @@ static void usage(const char *prog) {
             "  --disk1 <img|dmg>         Secondary/installer NVMe image (read-only)\n"
             "  --cpus <N>                Number of vCPUs (default: 4)\n"
             "  --ram <MB>                Guest RAM in MB (default: 4096)\n"
+            "  --jit <MB>                JIT region in MB (default: 768; the iPhone app uses 384)\n"
             "  --share <dir>             Host folder shared at http://10.0.2.4/\n"
             "  --headless                Run without Cocoa GUI window\n"
             "  --screenshot <png>        Save guest framebuffer PNG\n"
@@ -569,6 +570,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--disk1"))        cfg.disk1 = argv[++i];
         else if (!strcmp(argv[i], "--cpus"))         cfg.ncpus = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ram"))          cfg.ram_mb = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--jit"))          cfg.jit_bytes = (size_t)strtoull(argv[++i], NULL, 0) << 20;
         else if (!strcmp(argv[i], "--share"))        cfg.share_dir = argv[++i];
         else if (!strcmp(argv[i], "--screenshot"))   targs.screenshot_path = argv[++i];
         else if (!strcmp(argv[i], "--screenshot-after")) targs.screenshot_after = atoi(argv[++i]);

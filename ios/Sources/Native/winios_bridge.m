@@ -244,8 +244,17 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
     [self notifyChanged];
 }
 
+/* The translated-code region: 768 MiB unless the launch asks for another size (WINIOS_JIT_MB, or the
+   winios.jitMB default) between 128 and WINIOS_JIT_MAX_BYTES, for measuring the trade-off on the device. */
+static size_t jit_region_bytes(void) {
+    const char *env = getenv("WINIOS_JIT_MB");
+    long mb = env ? strtol(env, NULL, 10) : (long)[[NSUserDefaults standardUserDefaults] integerForKey:@"winios.jitMB"];
+    if (mb < 128 || (size_t)mb << 20 > WINIOS_JIT_MAX_BYTES) return WINIOS_JIT_DEFAULT_BYTES;
+    return (size_t)mb << 20;
+}
+
 - (BOOL)tryAcquireJIT:(BOOL)detachAfter {
-    BOOL ok = winios_jit_acquire(WINIOS_JIT_DEFAULT_BYTES, detachAfter);
+    BOOL ok = winios_jit_acquire(jit_region_bytes(), detachAfter);
     dispatch_async(_diagQueue, ^{
         [self writeDiagnosticsSnapshot];
     });
