@@ -440,12 +440,10 @@ static void test_capability_window(void) {
     static const uint32_t cap[8] = {0x01000040, 0x03000408, 0x10, 0, 0x02000001, 0x2000, 0x1000, 0};
     for (uint64_t i = 0; i < 8; i++) check("capability register", mmio_r(4 * i, 4), cap[i]);
     check("a wide read of the last one stops at the table", mmio_r(0x1c, 8), 0);
-    check("reserved 0x20", mmio_r(0x20, 4), 0);
-    check("reserved 0x24", mmio_r(0x24, 4), 0);
-    check("reserved 0x38", mmio_r(0x38, 4), 0);
-    check("reserved 0x3c", mmio_r(0x3c, 4), 0);
-    check("reserved 0x20, wide", mmio_r(0x20, 8), 0);
-    check("reserved 0x38, wide", mmio_r(0x38, 8), 0);
+    /* Every reserved word, narrow and wide: a read past the table returns whatever lies behind it, so one
+       word that happens to be zero there must not be the whole test. */
+    for (uint64_t off = 0x20; off < 0x40; off += 4) check("reserved word", mmio_r(off, 4), 0);
+    for (uint64_t off = 0x20; off < 0x40; off += 8) check("reserved, wide", mmio_r(off, 8), 0);
 }
 
 static void test_root_hub(void) {
