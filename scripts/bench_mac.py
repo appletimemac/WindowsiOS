@@ -9,11 +9,12 @@ file (PUT to the share) and the runner's perf CSV. Runs of different configurati
 
   scripts/bench_mac.py --jit 384,768 --rounds 3 --label jit
   scripts/bench_mac.py --size 1426x952,952x636 --cpus 4,3 --qos default,ui
+  scripts/bench_mac.py --env none,HV_KTLB_FLUSH=1 --rounds 2      an engine setting against the default
   scripts/bench_mac.py --aa 5                 same configuration 5 times: the noise floor
   scripts/bench_mac.py --summarize DIR        rebuild the summary of a finished results directory
 
 Axes (comma lists; the matrix is their product): --jit MiB, --size WxH, --cpus N, --qos default|ui|init
-(the HV_QOS variable of the runner). Output goes to build/bench/<label>-<time>/ (or --out): one folder
+(the HV_QOS variable of the runner), --env (other variables of the runner). Output goes to build/bench/<label>-<time>/ (or --out): one folder
 per run (cmds, winvm.log, perf.csv, bench.txt, run.json), summary.txt and summary.csv.
 
 The guest image, its vars and the tools disk are never written: the runs use clones, and the tools disk
@@ -121,12 +122,27 @@ def qos_name(text):
 
 def config_id(c):
     name = 'jit%d_%dx%d_c%d_%s' % (c['jit'], c['size'][0], c['size'][1], c['cpus'], c['qos'])
+    if c.get('env'):
+        name += '_' + '+'.join(n.lower().replace('hv_', '', 1) + ('' if v == '1' else v) for n, v in c['env'])
     return name if c['runner'][0] == 'base' else name + '_' + c['runner'][0]
 
 
 def build_configs(args):
-    combos = itertools.product(args.runner, args.jit, args.size, args.cpus, args.qos)
-    return [dict(runner=r, jit=j, size=s, cpus=n, qos=q) for r, j, s, n, q in combos]
+    combos = itertools.product(args.runner, args.jit, args.size, args.cpus, args.qos, args.env)
+    return [dict(runner=r, jit=j, size=s, cpus=n, qos=q, env=e) for r, j, s, n, q, e in combos]
+
+
+def parse_env(text):
+    """'none', or settings of the runner's environment joined with '+': NAME=VALUE+NAME=VALUE."""
+    if text == 'none':
+        return ()
+    out = []
+    for item in text.split('+'):
+        name, eq, value = item.partition('=')
+        if not eq or not re.fullmatch(r'[A-Z][A-Z0-9_]*', name):
+            raise argparse.ArgumentTypeError('env must be none or NAME=VALUE[+NAME=VALUE]: %r' % text)
+        out.append((name, value))
+    return tuple(out)
 
 
 def parse_runners(text):
@@ -257,7 +273,7 @@ def run_one(cfg, n, total, rnd, args, outdir, tools_img):
     cmd = [cfg['runner'][1], '--headless', '--code', args.code, '--vars', vars_, '--disk', img, '--disk1', tools_img,
            '--cpus', str(cfg['cpus']), '--ram', str(args.ram), '--jit', str(cfg['jit']), '--share', share,
            '--perf-csv', perf, '--perf-ms', str(args.perf_ms), '--cmd-file', cmds, '--timeout', str(deadline_s + 90)]
-    env = dict(os.environ, HV_QOS=cfg['qos'])
+    env = dict(os.environ, HV_QOS=cfg['qos'], **dict(cfg.get('env', ())))
     res = {'id': rid, 'round': rnd, 'config': cfg, 'cid': cid, 'flags': [], 'metrics': {}}
     result_path = os.path.join(share, RESULT_NAME)
     first = last = None  # (mtime_ms, guest clock ms) of the first and the latest state of the result file
@@ -575,6 +591,8 @@ def main():
     ap.add_argument('--cpus', type=csv_list(int), default=[4], help='vCPU count (default 4)')
     ap.add_argument('--qos', type=csv_list(qos_name), default=['ui'],
                     help='HV_QOS: default, ui or init (default ui, what the runner uses when HV_QOS is unset)')
+    ap.add_argument('--env', type=csv_list(parse_env), default=[()],
+                    help="runner environment settings to compare: none, or NAME=VALUE joined with '+' (default none)")
     ap.add_argument('--rounds', type=int, default=1, help='interleaved rounds over the whole matrix (default 1)')
     ap.add_argument('--aa', type=int, metavar='N', help='run the first configuration N times: the noise floor')
     ap.add_argument('--label', default='bench')
