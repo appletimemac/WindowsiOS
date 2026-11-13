@@ -369,7 +369,7 @@ static int bank0(uint32_t a) {
 
 static uint64_t dist_read_body(void *opaque, uint64_t off, unsigned size) {
     HvGic *g = opaque;
-    if (off >= 0x6100 && off < 0x6100 + 8 * HV_GIC_NUM_IRQS) { /* IROUTER<n>, n >= 32 */
+    if (off >= 0x6100 && off < 0x6000 + 8 * HV_GIC_NUM_IRQS) { /* IROUTER<n>, 32 <= n < HV_GIC_NUM_IRQS */
         uint64_t v = g->route[(off - 0x6000) / 8];
         return size == 8 ? v : (uint32_t)(v >> ((off & 4) * 8));
     }
@@ -388,11 +388,12 @@ static uint64_t dist_read_body(void *opaque, uint64_t off, unsigned size) {
 
 static void dist_write_body(void *opaque, uint64_t off, uint64_t v, unsigned size) {
     HvGic *g = opaque;
-    if (off >= 0x6100 && off < 0x6100 + 8 * HV_GIC_NUM_IRQS) {
+    if (off >= 0x6100 && off < 0x6000 + 8 * HV_GIC_NUM_IRQS) {
         uint64_t *r = &g->route[(off - 0x6000) / 8];
         if (size == 8) *r = v;
         else if (off & 4) *r = (*r & 0xffffffffull) | v << 32;
         else *r = (*r & ~0xffffffffull) | (uint32_t)v;
+        hv_gicv3_update(g);
         return;
     }
     uint32_t a = (uint32_t)off & ~3u, mask = size_mask(off, size);

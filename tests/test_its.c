@@ -1,5 +1,6 @@
 // GICv3 ITS: mappings made through the command queue must survive the ITS losing its state while guest RAM
 // keeps it, which is what resuming Windows from hibernation looks like (it never maps its devices again).
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 #define GPA 0x40000000ull
 #define MEM_SIZE (4u << 20)
 #define ITS_PA 0x08080000ull
+#define DIST_PA 0x08000000ull
 #define DEV_TABLE (GPA + 0x100000)  /* 64 KB: 8192 devices of 8 bytes */
 #define COLL_TABLE (GPA + 0x110000) /* 4 KB */
 #define CMD_RING (GPA + 0x120000)   /* 4 KB: 128 commands */
@@ -160,6 +162,65 @@ static void test_movi(void) {
     check("MOVI reached the tables", pending(1, HV_GIC_LPI_BASE + 7), 1);
 }
 
+static uint64_t dist_r(uint64_t off, unsigned size) {
+    uint64_t v = 0;
+    hv_phys_read(&m, DIST_PA + off, &v, size);
+    return v;
+}
+
+static void dist_w(uint64_t off, uint64_t v, unsigned size) {
+    hv_phys_write(&m, DIST_PA + off, &v, size);
+}
+
+#define IROUTER(n) (0x6000 + 8 * (uint64_t)(n))
+
+/* Only SPIs (INTIDs 32 to HV_GIC_NUM_IRQS - 1) have a routing register: the offsets past the last one are not
+   the fields that follow the route table in the struct. */
+static void test_irouter_bounds(void) {
+    dist_w(IROUTER(287), 0x0000000100000002ull, 8);
+    check("IROUTER287 reads back", dist_r(IROUTER(287), 8), 0x0000000100000002ull);
+    check("IROUTER287 low word", dist_r(IROUTER(287), 4), 2);
+    check("IROUTER287 high word", dist_r(IROUTER(287) + 4, 4), 1);
+
+    size_t tail = sizeof *gic - offsetof(HvGic, spi_on);
+    uint8_t *before = malloc(tail);
+    memcpy(before, &gic->spi_on, tail);
+    uint64_t last = gic->route[HV_GIC_NUM_IRQS - 1];
+    dist_w(IROUTER(288), ~0ull, 8);
+    check("IROUTER288 reads 0", dist_r(IROUTER(288), 8), 0);
+    dist_w(IROUTER(319), 0x5a5a5a5a5a5a5a5aull, 8);
+    check("IROUTER319 reads 0", dist_r(IROUTER(319), 8), 0);
+    dist_w(IROUTER(319) + 4, 0xffffffff, 4);
+    check("IROUTER319 high word reads 0", dist_r(IROUTER(319) + 4, 4), 0);
+    check("writes past the route table leave what follows it alone", memcmp(before, &gic->spi_on, tail), 0);
+    check("nor the last route", gic->route[HV_GIC_NUM_IRQS - 1], last);
+    memcpy(&gic->spi_on, before, tail);
+    free(before);
+}
+
+/* A new route applies at once: the pending interrupt moves to the new CPU without another access to the GIC. */
+static void test_irouter_rescan(void) {
+    dist_w(0x0000, 2, 4); /* GICD_CTLR: EnableGrp1 */
+    for (int c = 0; c < 2; c++) {
+        gic->cpu[c].igrpen1 = 1;
+        gic->cpu[c].pmr = 0xff;
+    }
+    dist_w(0x084, 1u << 8, 4);  /* IGROUPR1: SPI 40 is group 1 */
+    dist_w(0x104, 1u << 8, 4);  /* ISENABLER1: and enabled */
+    dist_w(IROUTER(40), 0, 8);  /* CPU 0 */
+    hv_gicv3_set_irq(gic, 40, 1);
+    check("a pending level SPI routed to CPU 0 raises its line", m.percpu[0].irq_line, 1);
+    check("and not CPU 1's", m.percpu[1].irq_line, 0);
+    dist_w(IROUTER(40), 1, 8);  /* CPU 1 */
+    check("rerouted: CPU 0's line is down at once", m.percpu[0].irq_line, 0);
+    check("rerouted: CPU 1's line is up at once", m.percpu[1].irq_line, 1);
+
+    hv_gicv3_set_irq(gic, 40, 0);
+    dist_w(0x184, 1u << 8, 4);
+    dist_w(0x0000, 0, 4);
+    for (int c = 0; c < 2; c++) gic->cpu[c].igrpen1 = 0;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (hv_machine_init(&m, 4 << 20) != 0) return 1;
@@ -180,6 +241,10 @@ int main(void) {
     test_cache_overflow();
     printf("== MOVI\n");
     test_movi();
+    printf("== IROUTER bounds\n");
+    test_irouter_bounds();
+    printf("== IROUTER rescan\n");
+    test_irouter_rescan();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
