@@ -15,6 +15,13 @@
  *
  * It also asks `GET http://10.0.2.4/.henge/power` each round; "hibernate" (the app's Hibernate action, answered
  * once) runs shutdown /h, so Windows saves its session and powers off, and the next boot resumes it.
+ *
+ * A second thread tells the app when to raise the iOS keyboard. It long-polls `GET /.henge/focus-wait`, which the
+ * host answers when the user tapped the picture (with the tap's pixel) or typed Enter. It then asks UI Automation
+ * (IUIAutomation::GetFocusedElement) whether the focused element takes text and whether the tap was inside it, and
+ * reports that at `GET /.henge/focus?seq=..&editable=..&inside=..`, looking again for a moment after a tap. The process is per-monitor DPI aware so UI
+ * Automation rectangles are physical pixels, the same pixels as the guest framebuffer the host's tap is in.
+ * If UI Automation can't start, the thread logs it and retries; the posture loop is never affected.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -50,6 +57,10 @@ typedef uintptr_t SOCKET;
 #define DIGCF_PRESENT        0x00000002U
 #define DIGCF_DEVICEINTERFACE 0x00000010U
 #define ERROR_INSUFFICIENT_BUFFER 122U
+#define RPC_E_CHANGED_MODE   ((int32_t)0x80010106)
+#define CLSCTX_INPROC_SERVER 1U
+#define COINIT_MULTITHREADED 0U
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((HANDLE)(intptr_t)-4)
 
 /* Network byte order IPv4 constant on little-endian ARM64 */
 #define IPV4_HENGE_SHARE     0x0402000AU /* 10.0.2.4 */
@@ -59,6 +70,14 @@ typedef uintptr_t SOCKET;
 #define BACKOFF_FAILED_MS    3000U
 #define BACKOFF_NOEFFECT_MS  10000U
 #define LOG_LINES_MAX        200
+#define FOCUS_WAIT_RECV_MS   12000U /* longer than the host's 8 s long poll */
+/* After a tap the agent looks at 200, 600 and 1400 ms until it finds text under the tap: a field that has to
+   open first (the taskbar's search box) takes the focus late. The last look stays well inside the host's 2 s
+   limit for an event, so the next tap is never dropped for waiting behind this one. */
+static const DWORD kFocusLooksMs[] = {200U, 400U, 800U};
+#define FOCUS_RETRY_MS       2000U
+#define UIA_RETRY_MS         30000U
+#define TAP_SLOP_PX          8
 
 typedef struct {
     uint32_t d1;
@@ -106,6 +125,9 @@ __declspec(dllimport) HANDLE GetProcessHeap(void);
 __declspec(dllimport) void  *HeapAlloc(HANDLE hHeap, DWORD dwFlags, size_t dwBytes);
 __declspec(dllimport) BOOL   HeapFree(HANDLE hHeap, DWORD dwFlags, void *lpMem);
 __declspec(dllimport) void   ExitProcess(DWORD uExitCode);
+__declspec(dllimport) HANDLE CreateThread(void *lpThreadAttributes, size_t dwStackSize,
+                                          DWORD (*lpStartAddress)(void *), void *lpParameter,
+                                          DWORD dwCreationFlags, DWORD *lpThreadId);
 
 typedef struct {
     DWORD    cb;
@@ -155,6 +177,42 @@ __declspec(dllimport) int    connect(SOCKET s, const SockAddrIn *name, int namel
 __declspec(dllimport) int    send(SOCKET s, const char *buf, int len, int flags);
 __declspec(dllimport) int    recv(SOCKET s, char *buf, int len, int flags);
 __declspec(dllimport) int    closesocket(SOCKET s);
+
+/* user32.dll */
+__declspec(dllimport) BOOL SetProcessDpiAwarenessContext(HANDLE value);
+
+/* ole32.dll */
+__declspec(dllimport) int32_t CoInitializeEx(void *pvReserved, DWORD dwCoInit);
+__declspec(dllimport) int32_t CoCreateInstance(const Guid *rclsid, void *pUnkOuter, DWORD dwClsContext,
+                                               const Guid *riid, void **ppv);
+
+/* oleaut32.dll */
+typedef struct {
+    uint16_t vt, reserved1, reserved2, reserved3;
+    union { int16_t boolVal; int32_t lVal; void *parray; void *punkVal; uint8_t pad[16]; } u; /* 16: VARIANT's BRECORD arm */
+} Variant;
+typedef struct {
+    uint32_t cElements;
+    int32_t  lLbound;
+} SafeArrayBound;
+typedef struct {
+    uint16_t       cDims, fFeatures;
+    uint32_t       cbElements, cLocks;
+    void          *pvData;
+    SafeArrayBound rgsabound[1];
+} SafeArray;
+_Static_assert(sizeof(Variant) == 24, "VARIANT on 64-bit Windows");
+_Static_assert(offsetof(Variant, u) == 8, "VARIANT value offset");
+_Static_assert(sizeof(SafeArray) == 32, "SAFEARRAY with one dimension on 64-bit Windows");
+_Static_assert(offsetof(SafeArray, pvData) == 16, "SAFEARRAY pvData offset on 64-bit Windows");
+#define VT_I4    3
+#define VT_R8    5
+#define VT_BOOL  11
+#define VT_UNKNOWN 13
+#define VT_ARRAY 0x2000
+__declspec(dllimport) int32_t VariantClear(Variant *pvarg);
+__declspec(dllimport) int32_t SafeArrayAccessData(SafeArray *psa, void **ppvData);
+__declspec(dllimport) int32_t SafeArrayUnaccessData(SafeArray *psa);
 
 /* GUID_GPIOBUTTONS_LAPTOPSLATE_INTERFACE {317fc439-3f77-41c8-b09e-08ad63272aa3} */
 static const Guid kLaptopSlateInterface = {
@@ -221,12 +279,12 @@ static int send_all(SOCKET s, const char *buf, int len) {
 }
 
 /* GET http://10.0.2.4<path>. Returns the body length (the body is copied to body, NUL-terminated) or -1 if the
-   share can't be reached yet or does not answer 200. The host closes the connection after the reply. */
-static int share_get(const char *req, int req_len, char *body, int body_cap) {
+   share can't be reached yet or does not answer 200. The host closes the connection after the reply. timeout_ms
+   bounds each send and receive. */
+static int share_get(const char *req, int req_len, char *body, int body_cap, DWORD timeout_ms) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return -1;
 
-    DWORD timeout_ms = 1500;
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout_ms, sizeof(timeout_ms));
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
 
@@ -282,7 +340,7 @@ static int starts_with(const char *s, int len, const char *word) {
 static int fetch_posture(void) {
     static const char req[] = "GET /.henge/posture HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n";
     char body[64];
-    int n = share_get(req, (int)sizeof(req) - 1, body, (int)sizeof(body));
+    int n = share_get(req, (int)sizeof(req) - 1, body, (int)sizeof(body), 1500);
     if (starts_with(body, n, "laptop")) return 1;
     if (starts_with(body, n, "tablet")) return 0;
     return -1;
@@ -292,7 +350,7 @@ static int fetch_posture(void) {
 static int fetch_hibernate(void) {
     static const char req[] = "GET /.henge/power HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n";
     char body[64];
-    int n = share_get(req, (int)sizeof(req) - 1, body, (int)sizeof(body));
+    int n = share_get(req, (int)sizeof(req) - 1, body, (int)sizeof(body), 1500);
     return starts_with(body, n, "hibernate");
 }
 
@@ -392,7 +450,301 @@ static ToggleResult toggle_indicator(DWORD *err) {
     return rc;
 }
 
+/* ---- text focus ---- */
+
+/* CLSID_CUIAutomation {ff48dba4-60ef-4201-aa87-54103eef594e} and IID_IUIAutomation {30cbe57d-d9d0-452a-ab13-7ac5ac4825ee},
+   both from the CUIAutomation coclass and IUIAutomation interface in Wine's include/uiautomationclient.idl and in
+   mingw-w64's generated uiautomationclient.h (DEFINE_GUID lines). */
+static const Guid kClsidUIAutomation = {
+    0xff48dba4U, 0x60efU, 0x4201U, {0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e}
+};
+static const Guid kIidUIAutomation = {
+    0x30cbe57dU, 0xd9d0U, 0x452aU, {0xab, 0x13, 0x7a, 0xc5, 0xac, 0x48, 0x25, 0xee}
+};
+
+/* vtable slots, counted from the method order in Wine's include/uiautomationclient.idl and checked against the
+   Vtbl structs in mingw-w64's uiautomationclient.h (IUIAutomationVtbl, IUIAutomationElementVtbl).
+   Every COM interface starts QueryInterface 0, AddRef 1, Release 2.
+   IUIAutomation: CompareElements 3, CompareRuntimeIds 4, GetRootElement 5, ElementFromHandle 6,
+     ElementFromPoint 7, GetFocusedElement 8.
+   IUIAutomationElement: SetFocus 3, GetRuntimeId 4, FindFirst 5, FindAll 6, FindFirstBuildCache 7,
+     FindAllBuildCache 8, BuildUpdatedCache 9, GetCurrentPropertyValue 10. */
+#define COM_RELEASE                 2
+#define UIA_GET_FOCUSED_ELEMENT     8
+#define UIAE_GET_CURRENT_PROP_VALUE 10
+/* Same sources. IUIAutomationElement goes on: GetCurrentPropertyValueEx 11, GetCachedPropertyValue 12,
+   GetCachedPropertyValueEx 13, GetCurrentPatternAs 14.
+   IUIAutomationTextPattern: RangeFromPoint 3, RangeFromChild 4, GetSelection 5, GetVisibleRanges 6,
+     get_DocumentRange 7.
+   IUIAutomationTextRange: Clone 3, Compare 4, CompareEndpoints 5, ExpandToEnclosingUnit 6, FindAttribute 7,
+     FindText 8, GetAttributeValue 9. */
+#define UIAE_GET_CURRENT_PATTERN_AS 14
+#define UIATP_GET_DOCUMENT_RANGE    7
+#define UIATR_GET_ATTRIBUTE_VALUE   9
+/* IUIAutomation, much further on: ... CheckNotSupported 53, get_ReservedNotSupportedValue 54,
+   get_ReservedMixedAttributeValue 55, ElementFromIAccessible 56. */
+#define UIA_GET_RESERVED_MIXED      55
+/* Pattern and text attribute ids, and IID_IUIAutomationTextPattern {32eba289-3583-42c9-9c59-3b6d9a1e9b6a},
+   from the same IDL. */
+#define UIA_TextPatternId         10014
+#define UIA_IsReadOnlyAttributeId 40015
+static const Guid kIidUIAutomationTextPattern = {
+    0x32eba289U, 0x3583U, 0x42c9U, {0x9c, 0x59, 0x3b, 0x6d, 0x9a, 0x1e, 0x9b, 0x6a}
+};
+
+/* Property ids (UIAutomationClient.h, learn.microsoft.com .../winauto/uiauto-automation-element-propids) */
+#define UIA_BoundingRectanglePropertyId       30001
+#define UIA_ControlTypePropertyId             30003
+#define UIA_IsEnabledPropertyId               30010
+#define UIA_IsTextPatternAvailablePropertyId  30040
+#define UIA_IsValuePatternAvailablePropertyId 30043
+#define UIA_ValueIsReadOnlyPropertyId         30046
+/* Control type ids (.../winauto/uiauto-controltype-ids) */
+#define UIA_ComboBoxControlTypeId 50003
+#define UIA_EditControlTypeId     50004
+#define UIA_TextControlTypeId     50020
+#define UIA_CustomControlTypeId   50025
+#define UIA_GroupControlTypeId    50026
+#define UIA_DocumentControlTypeId 50030
+#define UIA_PaneControlTypeId     50033
+
+typedef struct { void **vtbl; } ComObject;
+
+static void com_release(void *obj) {
+    if (obj) ((uint32_t (*)(void *))((ComObject *)obj)->vtbl[COM_RELEASE])(obj);
+}
+
+/* 1 only for a VT_BOOL true; anything else, including a failed call or another type, is 0. */
+static int prop_bool(void *el, int id) {
+    Variant v;
+    mem_zero(&v, sizeof(v));
+    int32_t hr = ((int32_t (*)(void *, int, Variant *))((ComObject *)el)->vtbl[UIAE_GET_CURRENT_PROP_VALUE])(el, id, &v);
+    int r = hr >= 0 && v.vt == VT_BOOL && v.u.boolVal != 0;
+    VariantClear(&v);
+    return r;
+}
+
+/* The VT_I4 value of a property, or -1. */
+static int32_t prop_int(void *el, int id) {
+    Variant v;
+    mem_zero(&v, sizeof(v));
+    int32_t hr = ((int32_t (*)(void *, int, Variant *))((ComObject *)el)->vtbl[UIAE_GET_CURRENT_PROP_VALUE])(el, id, &v);
+    int32_t r = hr >= 0 && v.vt == VT_I4 ? v.u.lVal : -1;
+    VariantClear(&v);
+    return r;
+}
+
+/* 1 when (x, y) is inside the element's BoundingRectangle (VT_R8 | VT_ARRAY: left, top, width, height in
+   physical screen pixels) grown by TAP_SLOP_PX on each side. */
+static int point_in_element(void *el, int x, int y) {
+    Variant v;
+    mem_zero(&v, sizeof(v));
+    int32_t hr = ((int32_t (*)(void *, int, Variant *))((ComObject *)el)->vtbl[UIAE_GET_CURRENT_PROP_VALUE])(el, UIA_BoundingRectanglePropertyId, &v);
+    int inside = 0;
+    SafeArray *sa = (SafeArray *)v.u.parray;
+    if (hr >= 0 && v.vt == (VT_R8 | VT_ARRAY) && sa && sa->cDims == 1 && sa->cbElements == 8 &&
+        sa->rgsabound[0].cElements == 4) {
+        double *r = NULL;
+        if (SafeArrayAccessData(sa, (void **)&r) >= 0 && r) {
+            double left = r[0], top = r[1], right = r[0] + r[2], bottom = r[1] + r[3];
+            inside = x >= left - TAP_SLOP_PX && x <= right + TAP_SLOP_PX &&
+                     y >= top - TAP_SLOP_PX && y <= bottom + TAP_SLOP_PX;
+            SafeArrayUnaccessData(sa);
+        }
+    }
+    VariantClear(&v);
+    return inside;
+}
+
+/* What a text range answers for an attribute that differs along it: UI Automation's one "mixed" object, compared
+   by identity. Fetched once (focus_thread); NULL if that failed, and then nothing counts as mixed. */
+static void *uia_mixed_value;
+
+/* 1 when the element's TextPattern says its text can be changed: the IsReadOnly attribute of the document range
+   is false, or mixed (an editor with a fixed piece inside it, like a name chip in a message box). A web page's
+   body and any viewer answer true there. An attribute the provider does not have counts as read-only. */
+static int text_range_writable(void *el) {
+    void *pattern = NULL, *range = NULL;
+    int writable = 0;
+    int32_t hr = ((int32_t (*)(void *, int, const Guid *, void **))((ComObject *)el)->vtbl[UIAE_GET_CURRENT_PATTERN_AS])(
+        el, UIA_TextPatternId, &kIidUIAutomationTextPattern, &pattern);
+    if (hr < 0 || !pattern) return 0;
+    hr = ((int32_t (*)(void *, void **))((ComObject *)pattern)->vtbl[UIATP_GET_DOCUMENT_RANGE])(pattern, &range);
+    if (hr >= 0 && range) {
+        Variant v;
+        mem_zero(&v, sizeof(v));
+        hr = ((int32_t (*)(void *, int, Variant *))((ComObject *)range)->vtbl[UIATR_GET_ATTRIBUTE_VALUE])(
+            range, UIA_IsReadOnlyAttributeId, &v);
+        writable = hr >= 0 && ((v.vt == VT_BOOL && v.u.boolVal == 0) ||
+                               (v.vt == VT_UNKNOWN && uia_mixed_value && v.u.punkVal == uia_mixed_value));
+        VariantClear(&v);
+        com_release(range);
+    }
+    com_release(pattern);
+    return writable;
+}
+
+/* Whether the focused element takes text (*editable) and, for a tap at (x, y) (x < 0 for a look), whether the
+   tap was inside it (*inside). Anything unexpected is "not editable". */
+static void evaluate_focus(void *uia, int x, int y, int *editable, int *inside) {
+    *editable = 0;
+    *inside = 0;
+    void *el = NULL;
+    int32_t hr = ((int32_t (*)(void *, void **))((ComObject *)uia)->vtbl[UIA_GET_FOCUSED_ELEMENT])(uia, &el);
+    if (hr < 0 || !el) return;
+
+    /* IsKeyboardFocusable is not asked: the element has the focus, and the edit of a Win32 combo box (the
+       Run box) answers false there while it does. */
+    int ok = prop_bool(el, UIA_IsEnabledPropertyId);
+    if (ok && prop_bool(el, UIA_IsValuePatternAvailablePropertyId) && prop_bool(el, UIA_ValueIsReadOnlyPropertyId)) ok = 0;
+    if (ok) {
+        int32_t type = prop_int(el, UIA_ControlTypePropertyId);
+        if (type == UIA_EditControlTypeId) {
+            *editable = 1;
+        } else if (type == UIA_DocumentControlTypeId || type == UIA_TextControlTypeId || type == UIA_CustomControlTypeId ||
+                   type == UIA_GroupControlTypeId || type == UIA_PaneControlTypeId || type == UIA_ComboBoxControlTypeId) {
+            *editable = prop_bool(el, UIA_IsTextPatternAvailablePropertyId) && text_range_writable(el);
+        }
+    }
+    if (*editable && x >= 0) *inside = point_in_element(el, x, y);
+    com_release(el);
+}
+
+static size_t append_str(char *out, size_t at, size_t cap, const char *s) {
+    while (*s && at + 1 < cap) out[at++] = *s++;
+    out[at] = 0;
+    return at;
+}
+
+static size_t append_u64(char *out, size_t at, size_t cap, uint64_t v) {
+    char num[24];
+    int n = 0;
+    do {
+        num[n++] = (char)('0' + (v % 10U));
+        v /= 10U;
+    } while (v > 0 && n < 23);
+    num[n] = 0;
+    for (int i = 0; i < n / 2; i++) {
+        char t = num[i];
+        num[i] = num[n - 1 - i];
+        num[n - 1 - i] = t;
+    }
+    return append_str(out, at, cap, num);
+}
+
+/* "<seq> <kind> <x> <y>" as focus-wait answers. Returns 0 and fills the outputs, or -1. kind: 0 none, 1 tap, 2 look. */
+static int parse_focus_event(const char *s, uint64_t *seq, int *kind, int *x, int *y) {
+    uint64_t v = 0;
+    int digits = 0;
+    while (*s >= '0' && *s <= '9' && digits < 19) v = v * 10U + (uint64_t)(*s++ - '0'), digits++;
+    if (!digits || *s != ' ') return -1;
+    s++;
+    if (starts_with(s, (int)str_len(s), "tap ")) *kind = 1, s += 4;
+    else if (starts_with(s, (int)str_len(s), "look ")) *kind = 2, s += 5;
+    else if (starts_with(s, (int)str_len(s), "none ")) *kind = 0, s += 5;
+    else return -1;
+    int *out[2] = {x, y};
+    for (int i = 0; i < 2; i++) {
+        int neg = *s == '-';
+        if (neg) s++;
+        int n = 0, got = 0;
+        while (*s >= '0' && *s <= '9' && got < 9) n = n * 10 + (*s++ - '0'), got++;
+        if (!got) return -1;
+        *out[i] = neg ? -n : n;
+        if (i == 0) {
+            if (*s != ' ') return -1;
+            s++;
+        }
+    }
+    *seq = v;
+    return 0;
+}
+
+static void focus_report(uint64_t seq, int editable, int inside) {
+    char req[192];
+    size_t at = append_str(req, 0, sizeof(req), "GET /.henge/focus?seq=");
+    at = append_u64(req, at, sizeof(req), seq);
+    at = append_str(req, at, sizeof(req), editable ? "&editable=1" : "&editable=0");
+    at = append_str(req, at, sizeof(req), inside ? "&inside=1" : "&inside=0");
+    at = append_str(req, at, sizeof(req), " HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n");
+    char body[16];
+    share_get(req, (int)at, body, (int)sizeof(body), 1500);
+}
+
+/* The host answers a report with 204 and no body, which share_get reports as -1 (it wants a blank line then a
+   body); that is fine, the answer is not used. */
+
+static DWORD focus_thread(void *arg) {
+    (void)arg;
+    void *uia = NULL;
+    int com_ok = 0, logged = 0;
+    for (;;) {
+        int32_t hr = com_ok ? 0 : CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        if (hr >= 0 || hr == RPC_E_CHANGED_MODE) {
+            com_ok = 1;
+            hr = CoCreateInstance(&kClsidUIAutomation, NULL, CLSCTX_INPROC_SERVER, &kIidUIAutomation, &uia);
+            if (hr >= 0 && uia) break;
+            uia = NULL;
+        }
+        if (!logged) {
+            char hex[12] = "0x";
+            for (int i = 0; i < 8; i++) hex[2 + i] = "0123456789abcdef"[((uint32_t)hr >> (28 - 4 * i)) & 15U];
+            hex[10] = 0;
+            log_line("focus_uia_failed ", hex);
+            logged = 1;
+        }
+        Sleep(UIA_RETRY_MS);
+    }
+
+    ((int32_t (*)(void *, void **))((ComObject *)uia)->vtbl[UIA_GET_RESERVED_MIXED])(uia, &uia_mixed_value);
+
+    uint64_t after = 0;
+    int have_after = 0, ready = 0;
+    for (;;) {
+        char req[160];
+        size_t at = append_str(req, 0, sizeof(req), "GET /.henge/focus-wait");
+        if (have_after) {
+            at = append_str(req, at, sizeof(req), "?after=");
+            at = append_u64(req, at, sizeof(req), after);
+        }
+        at = append_str(req, at, sizeof(req), " HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n");
+        char body[64];
+        int n = share_get(req, (int)at, body, (int)sizeof(body), FOCUS_WAIT_RECV_MS);
+        uint64_t seq = 0;
+        int kind = 0, x = -1, y = -1;
+        if (n < 0 || parse_focus_event(body, &seq, &kind, &x, &y) != 0) {
+            Sleep(FOCUS_RETRY_MS);
+            continue;
+        }
+        after = seq;
+        have_after = 1;
+        if (!ready) {
+            log_line("focus_ready", "");
+            ready = 1;
+        }
+        if (kind == 0) continue;
+
+        int looks = kind == 1 ? (int)(sizeof(kFocusLooksMs) / sizeof(kFocusLooksMs[0])) : 1;
+        int sent = 0, sent_editable = 0, sent_inside = 0;
+        for (int i = 0; i < looks; i++) {
+            Sleep(kFocusLooksMs[i]);
+            int editable, inside;
+            evaluate_focus(uia, kind == 1 ? x : -1, y, &editable, &inside);
+            if (!sent || editable != sent_editable || inside != sent_inside) {
+                focus_report(seq, editable, inside);
+                sent = 1;
+                sent_editable = editable;
+                sent_inside = inside;
+            }
+            if (editable && inside) break;
+        }
+    }
+}
+
 void WinMainCRTStartup(void) {
+    /* Before any window or COM use: UI Automation then reports physical pixels. */
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     /* Single instance. Any failure to get the mutex (including access denied on one an elevated copy
        made) means another agent is already running. */
     HANDLE mutex = CreateMutexW(NULL, 0, u"Global\\WindowsiOSAgent");
@@ -403,6 +755,7 @@ void WinMainCRTStartup(void) {
     HeapFree(GetProcessHeap(), 0, wsa);
 
     log_line("started", "");
+    if (!CreateThread(NULL, 0, focus_thread, NULL, 0, NULL)) log_line("focus_thread_failed", "");
     uint64_t next_toggle_at = 0;
     int share_up = 0;
     ToggleResult last_failure = T_OK;

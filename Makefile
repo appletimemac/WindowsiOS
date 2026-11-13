@@ -134,6 +134,9 @@ ADVAPI32_IMPORTS = AdjustTokenPrivileges LookupPrivilegeValueW OpenProcessToken 
 WS2_32_IMPORTS = WSAStartup accept bind closesocket connect listen recv send setsockopt shutdown socket
 SETUPAPI_IMPORTS = SetupDiDestroyDeviceInfoList SetupDiEnumDeviceInterfaces SetupDiGetClassDevsW \
                    SetupDiGetDeviceInterfaceDetailW
+OLE32_IMPORTS = CoCreateInstance CoInitializeEx
+OLEAUT32_IMPORTS = SafeArrayAccessData SafeArrayUnaccessData VariantClear
+USER32_IMPORTS = SetProcessDpiAwarenessContext
 
 empty :=
 space := $(empty) $(empty)
@@ -147,6 +150,9 @@ $(eval $(call WINLIB,kernel32,$(KERNEL32_IMPORTS)))
 $(eval $(call WINLIB,advapi32,$(ADVAPI32_IMPORTS)))
 $(eval $(call WINLIB,ws2_32,$(WS2_32_IMPORTS)))
 $(eval $(call WINLIB,setupapi,$(SETUPAPI_IMPORTS)))
+$(eval $(call WINLIB,ole32,$(OLE32_IMPORTS)))
+$(eval $(call WINLIB,oleaut32,$(OLEAUT32_IMPORTS)))
+$(eval $(call WINLIB,user32,$(USER32_IMPORTS)))
 
 $(WL):
 	mkdir -p $(WL)
@@ -155,9 +161,10 @@ $(B)/opt_hive_arm64.exe: tools/opt_hive_arm64.c $(WL)/kernel32.lib $(WL)/advapi3
 	$(WIN_CC) -Wl,/entry:mainCRTStartup -Wl,/subsystem:console $< $(WL)/kernel32.lib $(WL)/advapi32.lib -o $@
 $(B)/winios_browser_arm64.exe: tools/winios_browser_arm64.c $(WL)/kernel32.lib $(WL)/ws2_32.lib
 	$(WIN_CC) -Wl,/entry:WinMainCRTStartup -Wl,/subsystem:windows $< $(WL)/kernel32.lib $(WL)/ws2_32.lib -o $@
-$(B)/winios_agent_arm64.exe: tools/winios_agent_arm64.c $(WL)/kernel32.lib $(WL)/advapi32.lib $(WL)/ws2_32.lib $(WL)/setupapi.lib
+$(B)/winios_agent_arm64.exe: tools/winios_agent_arm64.c $(WL)/kernel32.lib $(WL)/advapi32.lib $(WL)/ws2_32.lib $(WL)/setupapi.lib \
+    $(WL)/ole32.lib $(WL)/oleaut32.lib $(WL)/user32.lib
 	$(WIN_CC) -Wl,/entry:WinMainCRTStartup -Wl,/subsystem:windows $< $(WL)/kernel32.lib $(WL)/advapi32.lib \
-	    $(WL)/ws2_32.lib $(WL)/setupapi.lib -o $@
+	    $(WL)/ws2_32.lib $(WL)/setupapi.lib $(WL)/ole32.lib $(WL)/oleaut32.lib $(WL)/user32.lib -o $@
 
 guest-tools: $(B)/winios_agent_arm64.exe $(B)/opt_hive_arm64.exe $(B)/winios_browser_arm64.exe
 
