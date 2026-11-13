@@ -36,6 +36,13 @@ void hv_tlb_flush(HvCpu *cpu);
 void hv_tlb_flush_va(HvCpu *cpu, uint64_t va);
 void hv_tlb_flush_user(HvCpu *cpu);
 void hv_kva_hist_dump(FILE *f); /* HV_KVA_HIST, see mmu.c */
+/* HV_KTLB_CHECK (see mmu.c): the kernel entries kept across address-space switches, checked against the page
+   tables. The count of entries found wrong in way `why` (1 unmapped, 2 another page, 3 not writable, 4 not
+   executable, 5 not readable, 6 access flag clear, 7 not global): those the table they were filled from
+   still maps as the entry says (gone_at_source 0), or that one neither (1). */
+extern int hv_ktlb_check_every;
+uint64_t hv_ktlb_check_count(int why, int gone_at_source);
+void hv_ktlb_check_dump(FILE *f);
 /* A big range of kernel VAs: its kernel entries and cached branch targets, not every process's entries. */
 void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len);
 void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len);

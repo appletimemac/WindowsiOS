@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "cmdfile.h"
+#include "gicv3.h"
+#include "mmu.h"
 #include "winvm.h"
 
 #include <stdint.h>
@@ -74,6 +76,7 @@ int hv_cmdfile_state(const char *path) {
     }
     fprintf(f, "exceptions=%llu interrupts=%llu\n", (unsigned long long)m->stats.exceptions,
             (unsigned long long)m->stats.interrupts);
+    hv_ktlb_check_dump(f);
     int rc = ferror(f) ? -1 : 0;
     if (fclose(f) != 0) rc = -1;
     return rc;

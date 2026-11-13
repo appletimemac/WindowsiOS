@@ -564,6 +564,56 @@ int main(void) {
         MSR_TTBR1((22ull << 48) | kb);
         CHECK("the first kernel table: nothing older is kept", eg->read_tag == HV_TLB_INVALID);
 
+        /* HV_KTLB_CHECK walks the kept kernel entries again at a switch. One counts when two checks running
+           find it wrong the same way, and is told apart by whether the table it was filled from still maps it. */
+#define SWITCH_TO(asid, root) (MSR_TTBR1(root), MSR_TTBR1(((uint64_t)(asid) << 48) | (root)))
+#define COUNTED(why) (hv_ktlb_check_count(why, 0) + hv_ktlb_check_count(why, 1))
+        hv_ktlb_check_every = 1;
+        hv_tlb_flush(&cpu);
+        cpu.ttbr1_el1 = (11ull << 48) | ka;
+        hv_mmu_access(&cpu, kg, HV_ACC_WRITE, 1, &got);
+        SWITCH_TO(22, kb);
+        SWITCH_TO(11, ka);
+        uint64_t all = 0;
+        for (int w = 1; w <= 7; w++) all += COUNTED(w);
+        CHECK("check: an entry the tables agree with is not counted", eg->read_tag == kg - HV_TLB_ADJ && all == 0);
+        /* taken away in every table with no TLBI (Windows flushes such addresses later, before using them again) */
+        map(ka, 12, 39, kg, 3, 0, 0);
+        map(kb, 12, 39, kg, 3, 0, 0);
+        MSR_TTBR1(kb);
+        CHECK("check: wrong once is not counted yet", COUNTED(1) == 0);
+        MSR_TTBR1((22ull << 48) | kb);
+        CHECK("check: unmapped everywhere counts as gone at its source", hv_ktlb_check_count(1, 1) > 0 && hv_ktlb_check_count(1, 0) == 0);
+        /* another page there now: what would make keeping the entry wrong */
+        map(ka, 12, 39, kg, 3, pn_a | PAGE | AF, 0);
+        map(kb, 12, 39, kg, 3, pn_a | PAGE | AF, 0);
+        SWITCH_TO(22, kb);
+        SWITCH_TO(11, ka);
+        SWITCH_TO(22, kb);
+        CHECK("check: another page under the address counts", COUNTED(2) > 0);
+        /* read-only now while the entry lets writes through */
+        map(ka, 12, 39, kg, 3, pg | PAGE | AF | AP(2), 0);
+        map(kb, 12, 39, kg, 3, pg | PAGE | AF | AP(2), 0);
+        SWITCH_TO(11, ka);
+        SWITCH_TO(22, kb);
+        SWITCH_TO(11, ka);
+        CHECK("check: a writable entry for a read-only page counts", COUNTED(3) > 0);
+        /* a global mapping that only one table has: the claim that global means the same everywhere fails */
+        hv_tlb_flush(&cpu);
+        map(ka, 12, 39, kg, 3, pg | PAGE | AF, 0);
+        map(kb, 12, 39, kg, 3, 0, 0);
+        hv_mmu_access(&cpu, kg, HV_ACC_READ, 1, &got); /* filled under A's table */
+        uint64_t before = hv_ktlb_check_count(1, 0);
+        SWITCH_TO(22, kb);
+        MSR_TTBR1((23ull << 48) | kb); /* a second check with B's table still there */
+        CHECK("check: mapped by the table it came from, not by this one", hv_ktlb_check_count(1, 0) > before);
+        CHECK("check: nothing is repaired", eg->read_tag == kg - HV_TLB_ADJ);
+        hv_ktlb_check_every = 0;
+        map(kb, 12, 39, kg, 3, pg | PAGE | AF, 0);
+        hv_tlb_flush(&cpu);
+#undef COUNTED
+#undef SWITCH_TO
+
 #undef SLOT
 #undef MSR_TTBR0
 #undef MSR_TTBR1

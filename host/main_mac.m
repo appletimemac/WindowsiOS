@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "mmu.h"
 #include "winvm.h"
 #include "cmdfile.h"
 #include "disk.h"
@@ -639,6 +640,7 @@ int main(int argc, char **argv) {
         hv_winvm_start(0, NULL);
         int r = hv_winvm_run_cpu0();
         fprintf(stderr, "\nwinvm: stopped (%s)\n", g_sig_stop ? "interrupted" : hv_winvm_reason_name(r));
+        hv_ktlb_check_dump(stderr);
         if (targs.screenshot_path && targs.screenshot_after == 0) {
             int rc = hv_winvm_save_png(targs.screenshot_path);
             fprintf(stderr, "winvm: saved screenshot %s (rc=%d)\n", targs.screenshot_path, rc);
