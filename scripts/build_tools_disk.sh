@@ -15,6 +15,8 @@ OUT="${1:-work/tools.img}"
 SIZE_MB="${TOOLS_IMG_MB:-64}"
 LABEL="WINIOSTOOLS"
 CMD_SRC="scripts/install_windowsios_tools.cmd"
+DIAG_CMD_SRC="scripts/run_windowsios_diagnostics.cmd"
+DIAG_PS_SRC="scripts/winios_diag.ps1"
 TUNE_PS_SRC="scripts/winios_tune.ps1"
 
 AGENT="build/winios_agent_arm64.exe"
@@ -23,7 +25,7 @@ BROWSER="build/winios_browser_arm64.exe"
 if [ ! -f "$AGENT" ] || [ ! -f "$BROWSER" ]; then
     make -s guest-tools
 fi
-for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$TUNE_PS_SRC"; do
+for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC"; do
     [ -f "$f" ] || { echo "build_tools_disk: missing $f" >&2; exit 1; }
 done
 
@@ -40,7 +42,7 @@ attach() {
 }
 
 need=0
-for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$TUNE_PS_SRC"; do need=$((need + $(stat -f %z "$f"))); done
+for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC"; do need=$((need + $(stat -f %z "$f"))); done
 if [ $((need * 2)) -gt $((SIZE_MB * 1024 * 1024 / 2)) ]; then
     echo "build_tools_disk: $need bytes of files do not leave headroom in $SIZE_MB MiB; raise TOOLS_IMG_MB" >&2
     exit 1
@@ -61,7 +63,9 @@ cp -X "$AGENT" "$MNT/WinIOSAgent.exe"
 cp -X "$BROWSER" "$MNT/WinIOSBrowser.exe"
 # cmd.exe wants CRLF, whatever the source has
 sed 's/\r$//; s/$/\r/' "$CMD_SRC" > "$MNT/Install WindowsiOS Tools.cmd"
+sed 's/\r$//; s/$/\r/' "$DIAG_CMD_SRC" > "$MNT/Run WindowsiOS Diagnostics.cmd"
 # PowerShell reads LF scripts fine
+cp -X "$DIAG_PS_SRC" "$MNT/winios_diag.ps1"
 cp -X "$TUNE_PS_SRC" "$MNT/winios_tune.ps1"
 
 # What macOS leaves on a FAT volume: AppleDouble files, Spotlight and FSEvents state
