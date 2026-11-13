@@ -641,6 +641,7 @@ static int do_vector(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint64_
 
 int hv_mem_emulate(HvCpu *cpu, uint32_t insn, uint64_t pc) {
     cpu->m->access_pc = pc;
+    hv_access_pc = pc;
     HvMemOp op;
     if (hv_mem_decode(insn, &op) != 0) {
         hv_raise_undef(cpu, pc);

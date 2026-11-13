@@ -42,6 +42,7 @@ void hv_flush_blocks(HvMachine *m) {
         for (uint64_t pg = 0; pg < pages; pg++) /* only where code was, so the rest of the maps stays untouched */
             if (r->code_pages[pg]) { /* a chain list or marks only exist where code is */
                 memset(r->code_grains + pg * HV_CODE_GRAIN_WORDS, 0, HV_CODE_GRAIN_WORDS * sizeof *r->code_grains);
+                if (r->diag_words) memset(r->diag_words + pg * ((1u << HV_TLB_PAGE_BITS) / 32), 0, (1u << HV_TLB_PAGE_BITS) / 32);
                 r->code_miss[pg] = 0;
                 r->chain_in[pg] = 0;
             }
@@ -194,6 +195,7 @@ again:;
     uint32_t used = hv_knob[HV_K_GROUPS] ? nread : nb.ninsns; /* grouping looks ahead of the block's end */
     uint32_t at = (uint32_t)((pa - ram->pa) & ((1u << HV_TLB_PAGE_BITS) - 1));
     hv_code_grains_mark(ram, pg, at, at + 4u * used);
+    hv_code_diag_mark(ram, pg, at, at + 4u * used);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (memcmp(words, code, 4u * used) != 0) {
         m->stats.code_retranslates++;

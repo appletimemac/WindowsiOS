@@ -31,6 +31,7 @@ typedef struct HvRam {
        page's blocks go anyway, so a page mostly written as data stops trapping every store (until it runs again). */
     uint16_t *code_miss;
     uint32_t *chain_in; /* per page: the first cross-page chain slot into it, plus 1 (0: none); under tr_mu */
+    uint8_t *diag_words; /* HV_CODE_DIAG only: one bit per guest word a live translation was made from */
     uint32_t pages_log2;
     uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
     /* Per page and CPU: up to three TLB entries (slot << 2 | table, plus 1;
@@ -130,6 +131,9 @@ typedef struct HvStats {
        blocks (overlapping translated pieces, or HV_CODE_MISS_MAX misses: forced), and translations dropped because
        their words changed meanwhile. */
     uint64_t code_writes, code_write_hits, code_retranslates, code_write_forced;
+    /* HV_CODE_DIAG only, of the writes that dropped a page: on translated words (not just their 32-byte pieces),
+       storing what was there already, storing zeros, from EL1, from a device, 256 bytes or more. */
+    uint64_t diag_word, diag_same, diag_zero, diag_el1, diag_dev, diag_big, diag_g8, diag_g16;
     uint64_t stw_count, stw_ticks, stw_max_ticks;
 } HvStats;
 
@@ -328,6 +332,13 @@ void hv_ram_written(HvMachine *m, uint64_t pa, uint64_t len);
 /* The 32-byte pieces of page pg holding bytes [lo, hi) of it: mark them translated, or ask if any is. */
 void hv_code_grains_mark(HvRam *r, uint64_t pg, uint32_t lo, uint32_t hi);
 int hv_code_grains_hit(const HvRam *r, uint64_t pg, uint32_t lo, uint32_t hi);
+/* HV_CODE_DIAG: why writes drop pages. Set when the environment variable is; the dump lists the guest PCs whose
+   writes dropped pages most, with the instructions around them. */
+int hv_code_diag_on(void);
+void hv_code_diag_mark(HvRam *r, uint64_t pg, uint32_t lo, uint32_t hi);
+int hv_code_diag_dump(HvMachine *m, const char *path);
+extern __thread uint64_t hv_access_pc;
+extern __thread int hv_diag_same;
 void hv_ret_clear(HvCpu *cpu);
 int hv_ic_ivau_drops(void);
 /* Settings that say how to translate or wait, to compare ways of doing it in one running guest

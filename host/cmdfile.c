@@ -249,6 +249,11 @@ int hv_cmdfile_exec(const HvCmdFile *cmd, const char *line) {
         int rc = cmd_path(cmd, line + 6, path, sizeof path);
         if (rc == 0) rc = hv_cmdfile_state(path);
         fprintf(cmd->err, "winvm: state -> %s (rc=%d)\n", line + 6, rc);
+    } else if (!strncmp(line, "codehits ", 9)) {
+        char path[4096];
+        int rc = cmd_path(cmd, line + 9, path, sizeof path);
+        if (rc == 0) rc = hv_code_diag_dump(hv_winvm_machine(), path);
+        fprintf(cmd->err, "winvm: codehits -> %s (rc=%d)\n", line + 9, rc);
     } else if (!strcmp(line, "cpus")) {
         HvMachine *m = hv_winvm_machine();
         for (int i = 0; i < m->ncpus; i++)
