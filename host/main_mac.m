@@ -506,7 +506,7 @@ static void usage(const char *prog) {
             "  --disk1 <img|dmg>         Secondary/installer NVMe image (read-only)\n"
             "  --cpus <N>                Number of vCPUs (default: 4)\n"
             "  --ram <MB>                Guest RAM in MB (default: 4096)\n"
-            "  --jit <MB>                JIT region in MB (default: 768; the iPhone app uses 384)\n"
+            "  --jit <MB>                JIT region in MB (default: 768, as on the iPhone)\n"
             "  --share <dir>             Host folder shared at http://10.0.2.4/\n"
             "  --headless                Run without Cocoa GUI window\n"
             "  --screenshot <png>        Save guest framebuffer PNG\n"
