@@ -1,5 +1,6 @@
 // Stage 1 walker: granules, block sizes, TTBR0/TTBR1, TBI, permissions and
 // fault codes, checked directly against hv_mmu_walk.
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,21 @@
 static uint8_t *pt;
 static uint64_t pt_next;
 static int failures, checks;
+
+/* The engine's own calls of these two land here and are counted, to show that a TLB refill makes none: it
+   comes from translated code with the guest's vector registers live, and libc is free to use those. */
+static int getenv_calls, calloc_calls;
+char *getenv(const char *name) {
+    (void)name;
+    getenv_calls++;
+    return NULL;
+}
+void *calloc(size_t count, size_t size) {
+    static void *(*real)(size_t, size_t);
+    if (!real) real = (void *(*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
+    calloc_calls++;
+    return real(count, size);
+}
 
 static uint64_t *host(uint64_t pa) {
     return (uint64_t *)(pt + (pa - PT_PA));
@@ -80,6 +96,29 @@ int main(void) {
     cpu.mair_el1 = 0x00ff;
     cpu.tcr_el1 = 16 | 2u << 14 | 25u << 16 | 1u << 30 | 5ull << 32 | 1ull << 37; /* T0SZ 16, TG0 16K, T1SZ 25, TG1 16K, TBI0 */
     cpu.sctlr_el1 |= 1;
+
+    /* The first kernel refill of the run, then one with the kept-entry checker on: neither may reach libc.
+       Settings are read and the checker's state is made while the machine is set up, not at first use. */
+    {
+        const uint64_t kv = 0xffffff8000004000ull, read8_el1 = 1u << 1 | 7u << 3;
+        map(r1, 14, 39, kv, 3, (PT_PA + 0xf0000) | PAGE | AF, 0);
+        int env = getenv_calls, made = calloc_calls;
+        int missed = hv_tlb_refill(&cpu, kv, read8_el1);
+        checks += 3;
+        if (missed) printf("  FAIL refill: the kernel page did not fill\n"), failures++;
+        if (getenv_calls != env) printf("  FAIL refill: the first kernel refill read the environment\n"), failures++;
+        if (calloc_calls != made) printf("  FAIL refill: the first kernel refill allocated\n"), failures++;
+        hv_ktlb_check_set(1);
+        hv_tlb_flush(&cpu);
+        env = getenv_calls, made = calloc_calls;
+        missed = hv_tlb_refill(&cpu, kv + 0x10, read8_el1); /* another address: the same one again counts as a miss */
+        checks += 3;
+        if (missed) printf("  FAIL refill: the kernel page did not fill with the checker on\n"), failures++;
+        if (getenv_calls != env) printf("  FAIL refill: a refill with the checker on read the environment\n"), failures++;
+        if (calloc_calls != made) printf("  FAIL refill: a refill with the checker on allocated\n"), failures++;
+        hv_ktlb_check_set(0);
+        hv_tlb_flush(&cpu);
+    }
 
     map(r0, 14, 48, 0x100004000, 3, 0x40008000 | PAGE | AF | AP(0), 0);
     expect("16K page", &cpu, 0x100004abc, HV_ACC_READ, 1, 0x40008abc, 0);
@@ -568,7 +607,7 @@ int main(void) {
            find it wrong the same way, and is told apart by whether the table it was filled from still maps it. */
 #define SWITCH_TO(asid, root) (MSR_TTBR1(root), MSR_TTBR1(((uint64_t)(asid) << 48) | (root)))
 #define COUNTED(why) (hv_ktlb_check_count(why, 0) + hv_ktlb_check_count(why, 1))
-        hv_ktlb_check_every = 1;
+        hv_ktlb_check_set(1);
         hv_tlb_flush(&cpu);
         cpu.ttbr1_el1 = (11ull << 48) | ka;
         hv_mmu_access(&cpu, kg, HV_ACC_WRITE, 1, &got);
@@ -608,7 +647,7 @@ int main(void) {
         MSR_TTBR1((23ull << 48) | kb); /* a second check with B's table still there */
         CHECK("check: mapped by the table it came from, not by this one", hv_ktlb_check_count(1, 0) > before);
         CHECK("check: nothing is repaired", eg->read_tag == kg - HV_TLB_ADJ);
-        hv_ktlb_check_every = 0;
+        hv_ktlb_check_set(0);
         map(kb, 12, 39, kg, 3, pg | PAGE | AF, 0);
         hv_tlb_flush(&cpu);
 #undef COUNTED

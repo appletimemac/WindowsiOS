@@ -702,15 +702,9 @@ static uint64_t KVA_BASE = 0xfffffe0000000000ull;
 static int kva_shift = 30;
 static uint64_t kva_fills[KVA_GBS], kva_pages_n[KVA_GBS], kva_below, kva_above;
 static uint8_t *kva_seen; /* one bit per page */
-static int kva_on = -1;
+static int kva_on;        /* set by hv_mmu_env_init */
 static void kva_note(uint64_t va) {
-    if (kva_on < 0) {
-        kva_on = getenv("HV_KVA_HIST") != NULL;
-        if (getenv("HV_KVA_BASE")) KVA_BASE = strtoull(getenv("HV_KVA_BASE"), NULL, 16);
-        if (getenv("HV_KVA_SHIFT")) kva_shift = atoi(getenv("HV_KVA_SHIFT"));
-    }
     if (!kva_on) return;
-    if (!kva_seen) kva_seen = calloc((size_t)KVA_GBS << (kva_shift - HV_TLB_PAGE_BITS - 3), 1);
     if (va < KVA_BASE) { __atomic_add_fetch(&kva_below, 1, __ATOMIC_RELAXED); return; }
     uint64_t off = va - KVA_BASE, gb = off >> kva_shift;
     if (gb >= KVA_GBS) { __atomic_add_fetch(&kva_above, 1, __ATOMIC_RELAXED); return; }
@@ -721,7 +715,7 @@ static void kva_note(uint64_t va) {
 }
 
 void hv_kva_hist_dump(FILE *f) {
-    if (kva_on <= 0) return;
+    if (!kva_on) return;
     fprintf(f, "kva below %llu above %llu (outside %d buckets of 2^%d bytes from %llx)\n", (unsigned long long)kva_below, (unsigned long long)kva_above, KVA_GBS, kva_shift, (unsigned long long)KVA_BASE);
     for (int g = 0; g < KVA_GBS; g++)
         if (kva_fills[g]) fprintf(f, "kva gb %d fills %llu pages %llu\n", g, (unsigned long long)kva_fills[g], (unsigned long long)kva_pages_n[g]);
@@ -729,11 +723,8 @@ void hv_kva_hist_dump(FILE *f) {
 
 /* HV_KTLB_FLUSH: every TTBR1 change empties the kernel half of the TLB and takes that TTBR1 value's own set
    of cached kernel branch targets, as before global mappings were told apart (for comparison). */
-static int kernel_flush_always(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("HV_KTLB_FLUSH") != NULL;
-    return v;
-}
+static int kernel_flush_all; /* set by hv_mmu_env_init */
+static int kernel_flush_always(void) { return kernel_flush_all; }
 
 static void kt_note_fill(HvCpu *cpu, uint32_t code); /* HV_KTLB_CHECK */
 
@@ -1155,20 +1146,37 @@ static struct {
     uint64_t gb, n;
 } kt_region[KT_REGIONS]; /* confirmed ones by GiB of address space */
 
-int hv_ktlb_check_every = -1; /* -1: from HV_KTLB_CHECK at first use (tests set it) */
+static int ktlb_check_every; /* 0: off (hv_ktlb_check_set) */
 
-static int ktlb_check_period(void) {
-    if (hv_ktlb_check_every < 0) {
-        const char *s = getenv("HV_KTLB_CHECK");
-        hv_ktlb_check_every = !s ? 0 : atoi(s) > 0 ? atoi(s) : 256;
-    }
-    return hv_ktlb_check_every;
+static int ktlb_check_period(void) { return ktlb_check_every; }
+
+/* The state is made by hv_ktlb_check_set, never here: this is on the refill path (see hv_mmu_env_init). */
+static struct KtCheck *kt_of(HvCpu *cpu) { return cpu->index < HV_MAX_CPUS ? kt_check[cpu->index] : NULL; }
+
+void hv_ktlb_check_set(int every) {
+    if (every > 0)
+        for (int i = 0; i < HV_MAX_CPUS; i++)
+            if (!kt_check[i]) kt_check[i] = calloc(1, sizeof *kt_check[0]);
+    __atomic_store_n(&ktlb_check_every, every > 0 ? every : 0, __ATOMIC_RELAXED);
 }
 
-static struct KtCheck *kt_of(HvCpu *cpu) {
-    if (cpu->index >= HV_MAX_CPUS) return NULL;
-    if (!kt_check[cpu->index]) kt_check[cpu->index] = calloc(1, sizeof *kt_check[0]);
-    return kt_check[cpu->index];
+/* This file's environment settings, read once while the machine is set up. tlb_fill is reached from the refill
+   thunk (host/enter.S) with the guest's vector registers live and only the general ones saved, and this file is
+   built without vector instructions for that reason, so nothing on that path may call into libc: getenv and
+   calloc are free to use those registers. A setting read at its first use there would do exactly that. */
+void hv_mmu_env_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    if (getenv("HV_KVA_BASE")) KVA_BASE = strtoull(getenv("HV_KVA_BASE"), NULL, 16);
+    if (getenv("HV_KVA_SHIFT")) kva_shift = atoi(getenv("HV_KVA_SHIFT"));
+    if (getenv("HV_KVA_HIST")) {
+        kva_seen = calloc((size_t)KVA_GBS << (kva_shift - HV_TLB_PAGE_BITS - 3), 1);
+        kva_on = kva_seen != NULL;
+    }
+    kernel_flush_all = getenv("HV_KTLB_FLUSH") != NULL;
+    const char *check = getenv("HV_KTLB_CHECK");
+    if (check) hv_ktlb_check_set(atoi(check) > 0 ? atoi(check) : 256);
 }
 
 static void kt_note_fill(HvCpu *cpu, uint32_t code) {

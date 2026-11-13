@@ -40,7 +40,10 @@ void hv_kva_hist_dump(FILE *f); /* HV_KVA_HIST, see mmu.c */
    tables. The count of entries found wrong in way `why` (1 unmapped, 2 another page, 3 not writable, 4 not
    executable, 5 not readable, 6 access flag clear, 7 not global): those the table they were filled from
    still maps as the entry says (gone_at_source 0), or that one neither (1). */
-extern int hv_ktlb_check_every;
+/* Read this file's environment settings (HV_KTLB_CHECK, HV_KTLB_FLUSH, HV_KVA_HIST); hv_machine_init does. */
+void hv_mmu_env_init(void);
+/* Check the kept kernel TLB entries at every Nth address-space switch; 0 turns it off. Not while CPUs run. */
+void hv_ktlb_check_set(int every);
 uint64_t hv_ktlb_check_count(int why, int gone_at_source);
 void hv_ktlb_check_dump(FILE *f);
 /* A big range of kernel VAs: its kernel entries and cached branch targets, not every process's entries. */

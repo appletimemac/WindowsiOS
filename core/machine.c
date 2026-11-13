@@ -46,6 +46,7 @@ int hv_machine_init(HvMachine *m, size_t jit_bytes) {
 
 int hv_machine_init_jit(HvMachine *m, void *rx, void *rw, size_t jit_bytes) {
     knobs_init();
+    hv_mmu_env_init();
     memset(m, 0, sizeof *m);
     if (hv_jit_region_attach(&m->jit, rx, rw, jit_bytes) != 0) return -1;
     return init_rest(m);
