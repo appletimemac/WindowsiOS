@@ -71,6 +71,12 @@ typedef struct WinIOSTouchContact {
 - (void)requestDisplayWidth:(uint32_t)width height:(uint32_t)height;
 /// Laptop deck showing (YES) or full-screen tablet (NO); Windows' slate indicator follows it.
 - (void)setLaptopPosture:(BOOL)laptop;
+/// The display scale Windows should run at, in percent. The WindowsiOS Tools agent writes it down and
+/// Windows takes it at its next sign-in.
+- (void)setWindowsScalePercent:(NSInteger)percent;
+/// The scale Windows is running at, in percent, as the agent reports it; 0 until one has (Windows is
+/// still starting, or its Tools are from before the report). onStateChanged follows a change.
+@property (nonatomic, readonly) NSInteger windowsRunningScalePercent;
 /// A tap reached Windows at this guest pixel; the agent answers through onGuestTextFocus.
 - (void)noteTapAtGuestX:(int32_t)x y:(int32_t)y;
 /// Nothing was tapped, but the focus may have moved (Return was typed): the agent looks again.

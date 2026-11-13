@@ -90,7 +90,7 @@ struct SessionView: View {
                 .preferredColorScheme(.dark)
         }
         .sheet(isPresented: $showingSettings) {
-            SettingsSheet(vm: vm)
+            SettingsSheet(vm: vm, drawnPixelsPerPoint: layout.picture?.pixelsPerPoint)
                 .preferredColorScheme(.dark)
         }
         .alert("Hibernate Windows?", isPresented: $confirmingHibernate) {
@@ -164,7 +164,7 @@ struct SessionView: View {
         return SessionLayout(
             corners: corners, cornersFromSystem: fromSystem, cameras: regions.map(\.frame), camerasActive: regions.map(\.isActive),
             area: area, margins: margins,
-            picture: GuestPicture(in: margins.inset(area), scale: displayScale),
+            picture: GuestPicture(in: margins.inset(area), density: vm.pictureDensity, scale: displayScale),
             deckArea: deckArea,
             deckMargins: ScreenMargins.insets(in: deckArea, radii: corners, cameras: cameras, mode: .deck, scale: displayScale)
         )
@@ -344,11 +344,29 @@ private struct SystemBarEdgeReader<Content: View>: View {
 
 private struct SettingsSheet: View {
     @ObservedObject var vm: VMViewModel
+    /// What the picture behind the sheet really got, which a small display can push above the setting.
+    let drawnPixelsPerPoint: CGFloat?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Picker("Resolution", selection: $vm.displayDensity) {
+                        ForEach(DisplayDensity.allCases, id: \.self) { density in
+                            Text(density.title).tag(density)
+                        }
+                    }
+                    Picker("Size of Text and Apps", selection: $vm.displayUISize) {
+                        ForEach(DisplayUISize.allCases, id: \.self) { size in
+                            Text(size.title).tag(size)
+                        }
+                    }
+                } header: {
+                    Text("Display")
+                } footer: {
+                    Text(displayFooter)
+                }
                 Section {
                     Toggle("Keyboard for Text Fields", isOn: $vm.autoKeyboard)
                 } footer: {
@@ -374,6 +392,13 @@ private struct SettingsSheet: View {
         }
         .presentationDetents([.medium, .large])
         .onAppear { vm.refreshTextFocusAgent() }
+    }
+
+    private var displayFooter: String {
+        WindowsScale.note(density: vm.displayDensity, uiSize: vm.displayUISize, toolsReport: vm.toolsReportScale,
+                          windowsRunning: vm.isVMRunning, runningPercent: vm.windowsRunningScale,
+                          framebuffer: GuestSize(width: Int(vm.fbWidth), height: Int(vm.fbHeight)),
+                          drawnPixelsPerPoint: drawnPixelsPerPoint)
     }
 }
 

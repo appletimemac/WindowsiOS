@@ -168,6 +168,12 @@ static void apply_launch_env_file(NSString *docs) {
     return s_shared_bridge;
 }
 
+/* The agent in Windows reported another running scale, on a share thread. */
+static void running_scale_changed(void *ctx) {
+    (void)ctx;
+    [s_shared_bridge notifyChanged];
+}
+
 - (instancetype)init {
     if ((self = [super init])) {
         apply_launch_env_file([self documentsPath]); /* before anything reads the environment */
@@ -180,6 +186,7 @@ static void apply_launch_env_file(NSString *docs) {
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         BOOL safariDefault = ([ud objectForKey:@"winios.safariOAuthV2"] == nil) ? YES : [ud boolForKey:@"winios.safariOAuthV2"];
         hv_share_set_url_handler_enabled(safariDefault ? 1 : 0);
+        hv_share_set_agent_display_scale_handler(running_scale_changed, NULL);
         dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
         _diagQueue = dispatch_queue_create("me.ammaar.windowsios.diag", attr);
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
@@ -928,6 +935,14 @@ static int sysctl_int(const char *name) {
 
 - (void)setLaptopPosture:(BOOL)laptop {
     hv_winvm_set_posture(laptop ? 1 : 0);
+}
+
+- (void)setWindowsScalePercent:(NSInteger)percent {
+    hv_share_set_display_scale((int)percent);
+}
+
+- (NSInteger)windowsRunningScalePercent {
+    return hv_share_agent_display_scale();
 }
 
 - (void)sendTabletNormalizedX:(double)x y:(double)y buttons:(uint8_t)buttons wheel:(int8_t)wheel {
