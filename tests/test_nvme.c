@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -22,6 +23,7 @@ static HvMachine m;
 static HvNvme *nv;
 static HvDisk disk;
 static uint8_t *ram, *expected;
+static uint64_t block_size;
 static int checks, failures;
 static uint16_t next_cid;
 
@@ -122,6 +124,10 @@ static void fill(void) {
     check("sync image", fsync(disk.fd), 0);
 }
 
+static void expect_zero(uint64_t off, uint64_t len) {
+    memset(expected + IMAGE_OFFSET + off, 0, len);
+}
+
 static void check_image(void) {
     uint8_t buf[65536];
     int same = 1;
@@ -133,6 +139,92 @@ static void check_image(void) {
     check("whole image including offset prefix and neighbours", same, 1);
 }
 
+static void read_zero(uint64_t off, uint64_t len) {
+    int zero = 1;
+    while (len) {
+        uint32_t n = len < 4096 ? (uint32_t)len : 4096;
+        memset(host(DATA), 0xcc, n);
+        check("NVMe read", io(0x02, off / 512, n / 512, 0), 0);
+        for (uint32_t i = 0; i < n; i++) if (host(DATA)[i]) zero = 0;
+        off += n;
+        len -= n;
+    }
+    check("NVMe reads deallocated bytes as zero", zero, 1);
+}
+
+static void test_trim(void) {
+    uint8_t ranges[4096] = {0};
+    struct stat before, after;
+    uint64_t trim_n = nv->trim_n, trim_bytes = nv->trim_bytes;
+    fill();
+    uint64_t off = (1u << 20) - IMAGE_OFFSET, len = 2u << 20;
+    range(ranges, off / 512, (uint32_t)(len / 512));
+    check("stat before trim", fstat(disk.fd, &before), 0);
+    check("aligned deallocate", trim(ranges, 1, 1), 0);
+    check("sync trim", fsync(disk.fd), 0);
+    check("stat after trim", fstat(disk.fd, &after), 0);
+    check("allocated blocks decrease", after.st_blocks < before.st_blocks, 1);
+    expect_zero(off, len);
+    read_zero(off, len);
+    check_image();
+
+    fill();
+    off = block_size * 2;
+    len = block_size * 3;
+    range(ranges, off / 512, (uint32_t)(len / 512));
+    check("unaligned deallocate", trim(ranges, 1, 1), 0);
+    expect_zero(off, len);
+    read_zero(off, len);
+    check_image();
+
+    fill();
+    range(ranges, 0, 1);
+    range(ranges + 16, UINT64_MAX, 0);
+    range(ranges + 32, 123, 5);
+    check("multiple ranges and zero-length skip", trim(ranges, 3, 1), 0);
+    expect_zero(0, 512);
+    expect_zero(123 * 512, 5 * 512);
+    read_zero(0, 512);
+    read_zero(123 * 512, 5 * 512);
+    check_image();
+
+    fill();
+    range(ranges, 10, 10);
+    range(ranges + 16, DISK_SIZE / 512 - 1, 2);
+    check("invalid later range rejects entire command", trim(ranges, 2, 1), 0x80);
+    check_image();
+    range(ranges + 16, UINT64_MAX, 1);
+    check("overflowing LBA rejected", trim(ranges, 2, 1), 0x80);
+    check_image();
+    check("AD=0 hints ignore range bounds", trim(ranges, 2, 0), 0);
+    check_image();
+
+    memset(ranges, 0, sizeof ranges);
+    range(ranges + 255 * 16, 77, 1);
+    check("maximum NR", trim(ranges, 256, 1), 0);
+    expect_zero(77 * 512, 512);
+    read_zero(77 * 512, 512);
+    check_image();
+    check("DSM command count", nv->trim_n - trim_n, 4);
+    check("DSM byte count", nv->trim_bytes - trim_bytes, (2u << 20) + block_size * 3 + 7 * 512);
+}
+
+static void test_zeroes(void) {
+    for (int deac = 0; deac < 2; deac++) {
+        uint64_t trim_n = nv->trim_n, trim_bytes = nv->trim_bytes;
+        fill();
+        check("Write Zeroes", io(0x08, 1, 40, deac ? 1u << 25 : 0), 0);
+        expect_zero(512, 40 * 512);
+        read_zero(512, 40 * 512);
+        check_image();
+        check("Write Zeroes out of range", io(0x08, DISK_SIZE / 512 - 1, 2, deac ? 1u << 25 : 0), 0x80);
+        check("Write Zeroes overflowing LBA", io(0x08, UINT64_MAX, 1, deac ? 1u << 25 : 0), 0x80);
+        check_image();
+        check("Write Zeroes discard count", nv->trim_n - trim_n, deac);
+        check("Write Zeroes discard bytes", nv->trim_bytes - trim_bytes, deac ? 40 * 512 : 0);
+    }
+}
+
 static void identify(int readonly) {
     uint8_t cmd[64] = {0x06};
     wr32(cmd + 4, 1);
@@ -142,6 +234,7 @@ static void identify(int readonly) {
 }
 
 static void test_readonly(const char *path) {
+    uint64_t trim_n = nv->trim_n, trim_bytes = nv->trim_bytes;
     fill();
     identify(0);
     hv_disk_close(&disk);
@@ -158,6 +251,8 @@ static void test_readonly(const char *path) {
     check("read-only Read", io(0x02, 0, 1, 0), 0);
     check("read-only Read data", memcmp(host(DATA), expected + IMAGE_OFFSET, 512), 0);
     check_image();
+    check("read-only discard count unchanged", nv->trim_n, trim_n);
+    check("read-only discard bytes unchanged", nv->trim_bytes, trim_bytes);
 }
 
 int main(void) {
@@ -168,6 +263,9 @@ int main(void) {
     if (ftruncate(fd, DISK_SIZE + IMAGE_OFFSET) != 0) return 1;
     close(fd);
     if (hv_disk_open(&disk, path, IMAGE_OFFSET, 0) != 0) return 1;
+    struct statfs fs;
+    if (fstatfs(disk.fd, &fs) != 0) return 1;
+    block_size = fs.f_bsize;
     expected = malloc(DISK_SIZE + IMAGE_OFFSET);
     if (hv_machine_init(&m, 4 << 20) != 0) return 1;
     ram = aligned_alloc(4096, RAM_SIZE);
@@ -178,6 +276,8 @@ int main(void) {
     HvPcie *bus = hv_pcie_create(&m, gic, 0x50000000, 0x10000000, 0x20000000, 0x10000000, 35);
     nv = hv_nvme_create(&m, bus, &disk, "TRIMTEST");
     driver_init();
+    test_trim();
+    test_zeroes();
     test_readonly(path);
     hv_disk_close(&disk);
     unlink(path);

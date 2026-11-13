@@ -1,7 +1,10 @@
 #include "../core/machine.h"
 #include "disk.h"
 
+#include <errno.h>
 #include <fcntl.h>
+#include <sys/fcntl.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -15,6 +18,9 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
     }
     d->offset = offset;
     d->size = (uint64_t)st.st_size - offset;
+    struct statfs fs;
+    d->block_size = fstatfs(d->fd, &fs) == 0 && fs.f_bsize ? fs.f_bsize :
+                    st.st_blksize > 0 ? (uint32_t)st.st_blksize : 4096u;
     d->readonly = readonly;
     return 0;
 }
@@ -48,6 +54,42 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
         len -= (uint64_t)n;
     }
     return 0;
+}
+
+static int disk_zero(HvDisk *d, uint64_t off, uint64_t len) {
+    static const uint8_t zero[65536];
+    while (len) {
+        uint64_t n = len < sizeof zero ? len : sizeof zero;
+        if (hv_disk_write(d, off, zero, n) != 0) return -1;
+        off += n;
+        len -= n;
+    }
+    return 0;
+}
+
+int hv_disk_discard(HvDisk *d, uint64_t off, uint64_t len) {
+    if (d->readonly || off > d->size || len > d->size - off) return -1;
+    if (!len) return 0;
+    uint64_t bs = d->block_size ? d->block_size : 4096; /* a disk that was never opened has none */
+    uint64_t rem = (d->offset + off) % bs;
+    uint64_t head = rem ? bs - rem : 0;
+    if (head > len) head = len;
+    if (disk_zero(d, off, head) != 0) return -1;
+    off += head;
+    len -= head;
+
+    /* Align in the backing file, which may contain an image prefix. */
+    uint64_t middle = len - len % bs;
+    if (middle) {
+        fpunchhole_t hole = {.fp_offset = (off_t)(d->offset + off), .fp_length = (off_t)middle};
+        if (fcntl(d->fd, F_PUNCHHOLE, &hole) == -1) {
+            if (errno != ENOTSUP && errno != EINVAL) return -1;
+            if (disk_zero(d, off, middle) != 0) return -1;
+        }
+        off += middle;
+        len -= middle;
+    }
+    return disk_zero(d, off, len);
 }
 
 /* HV_FLUSH: 0 fsync; 1 nothing here, what was written is safe in the host's cache as long as the

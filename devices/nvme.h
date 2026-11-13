@@ -58,6 +58,7 @@ typedef struct HvNvme {
     uint8_t *io_buf;
     uint32_t io_buf_cap;
     uint64_t rd_bytes, wr_bytes;
+    uint64_t trim_n, trim_bytes;
 } HvNvme;
 
 HvNvme *hv_nvme_create(HvMachine *m, HvPcie *bus, HvDisk *disk, const char *serial);

@@ -157,7 +157,7 @@ static uint16_t handle_identify(HvNvme *nv, const NvmeCmd *cmd) {
         buf[24] = 0;                  /* NSFEAT */
         buf[25] = 0;                  /* NLBAF = 0 (1 format) */
         buf[26] = 0;                  /* FLBAS = format 0 */
-        buf[33] = 0x08;               /* DLFEAT: read bytes from deallocated blocks are 0 */
+        buf[33] = 0x09;               /* DLFEAT: Write Zeroes takes DEAC (bit 3); deallocated blocks read as 0 (001b, hv_disk_discard) */
         buf[99] = nv->disk->readonly ? 1 : 0; /* NSATTR: write protected */
         /* LBAF 0 at byte 128: MS=0, LBADS=9 (2^9 = 512 bytes), RP=0 */
         buf[130] = 9;
@@ -398,7 +398,8 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         uint32_t nlb = (cmd->cdw12 & 0xffff) + 1u;
         uint64_t off = slba * 512ull;
         uint32_t bytes = nlb * 512u;
-        if (bytes > NVME_MAX_XFER || off + bytes > nv->disk->size) {
+        uint64_t blocks = nv->disk->size / 512ull;
+        if (bytes > NVME_MAX_XFER || slba > blocks || nlb > blocks - slba) {
             status = 0x0080; /* LBA Out of Range */
             break;
         }
@@ -429,8 +430,17 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         uint32_t nlb = (cmd->cdw12 & 0xffff) + 1u;
         uint64_t off = slba * 512ull;
         uint32_t bytes = nlb * 512u;
-        if (off + bytes > nv->disk->size) {
+        uint64_t blocks = nv->disk->size / 512ull;
+        if (slba > blocks || nlb > blocks - slba) {
             status = 0x0080;
+            break;
+        }
+        if (cmd->cdw12 & (1u << 25)) {
+            if (hv_disk_discard(nv->disk, off, bytes) != 0) status = 0x0004;
+            else {
+                nv->trim_n++;
+                nv->trim_bytes += bytes;
+            }
             break;
         }
         uint8_t zero[4096] = {0};
@@ -445,9 +455,46 @@ static void process_io_cmd(HvNvme *nv, HvNvmeSq *sq, uint16_t sqid, const NvmeCm
         }
         break;
     }
-    case 0x09: /* Dataset Management (TRIM / Deallocate) */
-        status = 0;
+    case 0x09: { /* Dataset Management (TRIM / Deallocate) */
+        static int trim_off = -1; /* HV_NO_TRIM: accept and ignore, as before deallocation was real */
+        if (trim_off < 0) trim_off = getenv("HV_NO_TRIM") != NULL;
+        if (!(cmd->cdw11 & 4) || trim_off) break;
+        uint32_t nr = (cmd->cdw10 & 0xff) + 1u;
+        uint8_t ranges[256 * 16];
+        if (nvme_dma_prp(nv, cmd->prp1, cmd->prp2, ranges, nr * 16, 0) != 0) {
+            status = 0x0004;
+            break;
+        }
+        uint64_t blocks = nv->disk->size / 512ull;
+        for (uint32_t i = 0; i < nr; i++) {
+            uint32_t nlb;
+            uint64_t slba;
+            memcpy(&nlb, ranges + i * 16 + 4, 4);
+            memcpy(&slba, ranges + i * 16 + 8, 8);
+            if (nlb && (slba > blocks || nlb > blocks - slba)) {
+                status = 0x0080;
+                break;
+            }
+        }
+        if (status) break;
+        uint64_t bytes = 0;
+        for (uint32_t i = 0; i < nr; i++) {
+            uint32_t nlb;
+            uint64_t slba;
+            memcpy(&nlb, ranges + i * 16 + 4, 4);
+            memcpy(&slba, ranges + i * 16 + 8, 8);
+            if (!nlb) continue;
+            uint64_t len = (uint64_t)nlb * 512ull;
+            if (hv_disk_discard(nv->disk, slba * 512ull, len) != 0) {
+                status = 0x0004;
+                break;
+            }
+            bytes += len;
+            nv->trim_bytes += len;
+        }
+        if (!status && bytes) nv->trim_n++;
         break;
+    }
     default:
         status = 0x0001; /* Invalid Command Opcode */
         break;
