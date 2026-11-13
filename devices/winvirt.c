@@ -208,9 +208,8 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
     if (disk0) b->nvme0 = hv_nvme_create(m, b->pcie, disk0, "WIN11IOS01");
     b->usb = hv_xhci_create(m, b->pcie);
     b->hda = hv_hda_create(m, b->pcie);
-    /* Off unless HV_VIRTIO_GPU is set: virtio-win's viogpudo bug-checks Windows on this board
-       (IRQL_NOT_LESS_OR_EQUAL seconds after it starts), so Windows stays on ramfb for now. */
-    if (getenv("HV_VIRTIO_GPU")) b->gpu = hv_virtio_gpu_create(m, b->pcie, b->fb);
+    /* Windows draws on ramfb until viogpudo is installed (the tools disk does it), then on this. */
+    b->gpu = hv_virtio_gpu_create(m, b->pcie, b->fb);
     if (disk1) b->nvme1 = hv_nvme_create(m, b->pcie, disk1, "WIN11INST");
     (void)enable_sound;
 

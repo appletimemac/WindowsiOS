@@ -20,9 +20,8 @@
 #define HV_VGPU_MAX_RESOURCES 64
 #define HV_VGPU_DEFAULT_WIDTH 1280
 #define HV_VGPU_DEFAULT_HEIGHT 900
-/* The EDID reports a ~7.8 inch, 1.42:1 panel whatever the pixel size. */
-/* The EDID reports a physical size that puts the requested pixels at this density, so Windows
-   recommends about 150% scaling whatever size the host asks for. */
+/* The EDID reports a physical size that puts the requested pixels at this density. Windows still
+   starts this monitor at 100% (measured at 1280x900 and 1426x1004), so the tools installer sets 150%. */
 #define HV_VGPU_EDID_DPI 144
 static inline uint32_t hv_vgpu_phys_mm(uint32_t px) { return (uint32_t)((px * 254u + HV_VGPU_EDID_DPI * 5u) / (HV_VGPU_EDID_DPI * 10u)); }
 

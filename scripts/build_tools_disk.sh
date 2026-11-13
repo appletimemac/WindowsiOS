@@ -1,10 +1,13 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Builds work/tools.img: a small raw disk (MBR, one FAT32 volume labeled WINIOSTOOLS) that Windows mounts
-# with the guest pieces on it: WinIOSAgent.exe, WinIOSBrowser.exe and "Install WindowsiOS Tools.cmd"
-# (one UAC prompt installs all).
+# with the guest pieces on it: the virtio-gpu display driver and its resolution service from the virtio-win
+# ISO, WinIOSAgent.exe, WinIOSBrowser.exe and "Install WindowsiOS Tools.cmd" (one UAC prompt installs all),
+# plus performance tuning (winios_tune.ps1) and the read-only CPU diagnostics:
+# "Run WindowsiOS Diagnostics.cmd" and winios_diag.ps1.
 #
 #   scripts/build_tools_disk.sh [OUT]        OUT defaults to work/tools.img
+#   VIRTIO_ISO=...   the virtio-win ISO (default work/downloads/virtio-win.iso)
 #   TOOLS_IMG_MB=... image size in MiB (default 64; FAT32 needs about 33 MiB at the very least)
 set -euo pipefail
 
@@ -12,8 +15,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 OUT="${1:-work/tools.img}"
+ISO="${VIRTIO_ISO:-work/downloads/virtio-win.iso}"
 SIZE_MB="${TOOLS_IMG_MB:-64}"
 LABEL="WINIOSTOOLS"
+DRV_DIR="viogpudo/w11/ARM64"
 CMD_SRC="scripts/install_windowsios_tools.cmd"
 DIAG_CMD_SRC="scripts/run_windowsios_diagnostics.cmd"
 DIAG_PS_SRC="scripts/winios_diag.ps1"
@@ -25,14 +30,20 @@ BROWSER="build/winios_browser_arm64.exe"
 if [ ! -f "$AGENT" ] || [ ! -f "$BROWSER" ]; then
     make -s guest-tools
 fi
-for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC"; do
+for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC" "$ISO"; do
     [ -f "$f" ] || { echo "build_tools_disk: missing $f" >&2; exit 1; }
 done
 
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/tools-disk.XXXXXX")"
+ISO_MP="$TMP/iso"
+mkdir -p "$ISO_MP"
+ISO_DEV=""
 IMG_DEV=""
 
 cleanup() {
     [ -n "$IMG_DEV" ] && hdiutil detach -quiet -force "$IMG_DEV" 2>/dev/null || true
+    [ -n "$ISO_DEV" ] && hdiutil detach -quiet -force "$ISO_DEV" 2>/dev/null || true
+    rm -rf "$TMP"
 }
 trap cleanup EXIT
 
@@ -41,8 +52,16 @@ attach() {
     hdiutil attach "$@" 2> >(grep -v "is deprecated" >&2)
 }
 
+echo "build_tools_disk: mounting $ISO read-only"
+ISO_DEV="$(attach -readonly -nobrowse -noverify -mountpoint "$ISO_MP" "$ISO" | awk 'NR==1 {print $1}')"
+DRV="$ISO_MP/$DRV_DIR"
+DRIVER_FILES=(viogpudo.inf viogpudo.sys viogpudo.cat vgpusrv.exe viogpuap.exe viogpures.exe)
+for f in "${DRIVER_FILES[@]}"; do
+    [ -f "$DRV/$f" ] || { echo "build_tools_disk: $DRV_DIR/$f is not on the ISO" >&2; exit 1; }
+done
 need=0
 for f in "$AGENT" "$BROWSER" "$CMD_SRC" "$DIAG_CMD_SRC" "$DIAG_PS_SRC" "$TUNE_PS_SRC"; do need=$((need + $(stat -f %z "$f"))); done
+for f in "${DRIVER_FILES[@]}"; do need=$((need + $(stat -f %z "$DRV/$f"))); done
 if [ $((need * 2)) -gt $((SIZE_MB * 1024 * 1024 / 2)) ]; then
     echo "build_tools_disk: $need bytes of files do not leave headroom in $SIZE_MB MiB; raise TOOLS_IMG_MB" >&2
     exit 1
@@ -59,6 +78,8 @@ MNT="$(diskutil info -plist "${IMG_DEV}s1" | plutil -extract MountPoint raw -o -
 [ -d "$MNT" ] || { echo "build_tools_disk: the new volume did not mount" >&2; exit 1; }
 
 echo "build_tools_disk: copying files to $MNT"
+mkdir -p "$MNT/drivers/viogpudo"
+for f in "${DRIVER_FILES[@]}"; do cp -X "$DRV/$f" "$MNT/drivers/viogpudo/$f"; done
 cp -X "$AGENT" "$MNT/WinIOSAgent.exe"
 cp -X "$BROWSER" "$MNT/WinIOSBrowser.exe"
 # cmd.exe wants CRLF, whatever the source has
