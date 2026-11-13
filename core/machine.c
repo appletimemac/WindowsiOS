@@ -105,11 +105,17 @@ static int init_rest(HvMachine *m) {
 }
 
 __thread HvCpu *hv_self;
+/* Device lock depth of this thread: a code invalidation under it came from a device (DMA), not a store. */
+static __thread int dev_depth;
 
 void hv_dev_lock(HvMachine *m) {
-    if (pthread_mutex_trylock(&m->dev_mu) == 0) return;
+    if (pthread_mutex_trylock(&m->dev_mu) == 0) {
+        dev_depth++;
+        return;
+    }
     uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
     pthread_mutex_lock(&m->dev_mu);
+    dev_depth++;
     if (m->stats_interval) {
         m->stats.dev_waits++;
         m->stats.dev_wait_ticks += mach_absolute_time() - t0;
@@ -117,6 +123,7 @@ void hv_dev_lock(HvMachine *m) {
 }
 
 void hv_dev_unlock(HvMachine *m) {
+    dev_depth--;
     pthread_mutex_unlock(&m->dev_mu);
 }
 
@@ -260,6 +267,7 @@ void hv_machine_free(HvMachine *m) {
     hv_jit_region_close(&m->jit);
     for (int i = 0; i < m->nram; i++) {
         free(m->ram[i].code_pages);
+        free(m->ram[i].inval_pages);
         free(m->ram[i].page_gen);
     }
     free(m->blocks);
@@ -293,10 +301,11 @@ int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int
     while ((1ull << r->pages_log2) < pages) r->pages_log2++;
     /* A power of two, so translated code bounds-checks a page index with one shift (IC IVAU). */
     r->code_pages = calloc((size_t)1 << r->pages_log2, 1);
+    r->inval_pages = calloc((pages + 7) / 8, 1);
     if (!m->main_ram || size > m->main_ram->size) m->main_ram = r;
     r->page_gen = calloc(pages, sizeof *r->page_gen);
     r->whint = calloc(pages * HV_MAX_CPUS, sizeof *r->whint);
-    return r->code_pages && r->page_gen && r->whint ? 0 : -1;
+    return r->code_pages && r->inval_pages && r->page_gen && r->whint ? 0 : -1;
 }
 
 int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
@@ -319,32 +328,55 @@ uint32_t *hv_smc_counts;
 uint64_t *hv_smc_last;
 uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
 
-void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+static int invalidated_page(HvRam *r, uint64_t first, uint64_t last, const uint8_t *pages, uint64_t xpa) {
+    uint64_t pg = ((xpa & ~1ull) - r->pa) >> HV_TLB_PAGE_BITS;
+    return pg >= first && pg <= last && xpa == ((r->pa + (pg << HV_TLB_PAGE_BITS)) | 1) &&
+           (pages[(pg - first) >> 3] & (1u << ((pg - first) & 7)));
+}
+
+static void hv_invalidate_code_range(HvMachine *m, uint64_t pa, uint64_t len) {
     HvRam *r = hv_ram_lookup(m, pa);
-    if (!r) return;
-    uint64_t pg = (pa - r->pa) >> HV_TLB_PAGE_BITS;
-    if (!r->code_pages[pg]) return;
+    if (!r || !len || len > r->size - (pa - r->pa)) return;
+    uint64_t first = (pa - r->pa) >> HV_TLB_PAGE_BITS;
+    uint64_t last = (pa - r->pa + len - 1) >> HV_TLB_PAGE_BITS;
+    while (first <= last && !__atomic_load_n(&r->code_pages[first], __ATOMIC_ACQUIRE)) first++;
+    if (first > last) return;
+    uint64_t t0 = mach_absolute_time();
+    size_t bytes = (size_t)((last - first) / 8 + 1);
+    uint8_t *pages = r->inval_pages;
     /* Blocks remember the generation they were made under; a stale one is
        retranslated the next time it is looked up. The block running now may
        finish with the old code, as it would with a real instruction pipeline. */
-    r->code_pages[pg] = 0;
-    __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
-    m->stats.flush_smc++;
-    if (hv_smc_counts && pg < hv_smc_pages) {
-        hv_smc_counts[pg]++;
-        uint64_t caller = hv_self ? hv_self->pc : 0;
-        hv_smc_last[pg] = caller;
-        if (hv_self) hv_smc_cpu++;
-        else hv_smc_dma++;
+    pthread_mutex_lock(&m->tr_mu);
+    /* Reserved with RAM so allocation failure cannot split a batch. */
+    memset(pages, 0, bytes);
+    int any = 0;
+    for (uint64_t pg = first; pg <= last; pg++) {
+        if (!__atomic_exchange_n(&r->code_pages[pg], 0, __ATOMIC_SEQ_CST)) continue;
+        pages[(pg - first) >> 3] |= 1u << ((pg - first) & 7);
+        any = 1;
+        __atomic_add_fetch(&r->page_gen[pg], 1, __ATOMIC_SEQ_CST);
+        m->stats.flush_smc++;
+        if (hv_smc_counts && pg < hv_smc_pages) {
+            hv_smc_counts[pg]++;
+            uint64_t caller = hv_self ? hv_self->pc : 0;
+            hv_smc_last[pg] = caller;
+            if (hv_self) hv_smc_cpu++;
+            else hv_smc_dma++;
+        }
     }
+    if (!any) {
+        pthread_mutex_unlock(&m->tr_mu);
+        return;
+    }
+    if (dev_depth || !hv_self) m->stats.inval_dev++;
     /* Exits from other pages chained into the stale blocks go back to their stub
        (whose next chain finds the new translation). Under the translation lock,
        as chaining them is: one that saw the old generation is done by now. */
-    pthread_mutex_lock(&m->tr_mu);
-    uint64_t tpa = (r->pa + (pg << HV_TLB_PAGE_BITS)) | 1;
+    m->stats.inval_scanned += m->nxchained;
     for (uint32_t k = 0; k < m->nxchained;) {
         uint32_t idx = m->xchained[k];
-        if (m->slot_xpa[idx] != tpa) {
+        if (!invalidated_page(r, first, last, pages, m->slot_xpa[idx])) {
             k++;
             continue;
         }
@@ -358,6 +390,12 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
         }
         m->xchained[k] = m->xchained[--m->nxchained];
     }
+    if (m->gen_checks)
+        for (uint32_t k = 0; k < m->nxchained; k++) {
+            uint32_t idx = m->xchained[k];
+            if (invalidated_page(r, first, last, pages, m->slot_xpa[idx]))
+                fprintf(stderr, "hengevm: invalidation left chain slot %u to pa %llx\n", idx, (unsigned long long)m->slot_xpa[idx]);
+        }
     pthread_mutex_unlock(&m->tr_mu);
     /* The indirect-branch cache may lead into the stale blocks: start it over,
        here at once and on the other CPUs before they next leave a block (their
@@ -378,14 +416,15 @@ void hv_invalidate_code(HvMachine *m, uint64_t pa) {
     m->stats.reset_why[4]++;
     /* Make a running chain leave (chains stay patched: see chain() in dispatch.c). */
     hv_machine_kick_all(m);
+    m->stats.inval_ticks += mach_absolute_time() - t0;
+}
+
+void hv_invalidate_code(HvMachine *m, uint64_t pa) {
+    hv_invalidate_code_range(m, pa, 1);
 }
 
 void hv_dma_written(HvMachine *m, uint64_t pa, uint64_t len) {
-    HvRam *r = hv_ram_lookup(m, pa);
-    if (!r || !len || pa + len - r->pa > r->size) return;
-    uint64_t first = (pa - r->pa) >> HV_TLB_PAGE_BITS, last = (pa + len - 1 - r->pa) >> HV_TLB_PAGE_BITS;
-    for (uint64_t pg = first; pg <= last; pg++)
-        if (__atomic_load_n(&r->code_pages[pg], __ATOMIC_ACQUIRE)) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS));
+    hv_invalidate_code_range(m, pa, len);
 }
 
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa) {
@@ -423,12 +462,10 @@ int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len) {
 
 int hv_phys_write(HvMachine *m, uint64_t pa, const void *buf, unsigned len) {
     HvRam *r = hv_ram_lookup(m, pa);
-    if (r && pa + len - r->pa <= r->size) {
+    if (r && len <= r->size - (pa - r->pa)) {
         if (r->readonly) return 0; /* ROM: writes are ignored */
         uint64_t off = pa - r->pa;
-        uint64_t first = off >> HV_TLB_PAGE_BITS, last = (off + len - 1) >> HV_TLB_PAGE_BITS;
-        for (uint64_t pg = first; pg <= last; pg++)
-            if (r->code_pages[pg]) hv_invalidate_code(m, r->pa + (pg << HV_TLB_PAGE_BITS)); /* a write to code */
+        hv_invalidate_code_range(m, pa, len);
         if (m->watch_pa && m->watch_pa - pa < len) {
             uint64_t v = 0;
             memcpy(&v, (const uint8_t *)buf + (m->watch_pa - pa), len - (m->watch_pa - pa) < 8 ? len - (m->watch_pa - pa) : 8);

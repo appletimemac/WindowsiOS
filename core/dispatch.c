@@ -35,6 +35,9 @@ void hv_flush_blocks(HvMachine *m) {
     m->nblocks = 0;
     m->nslots = 0;
     m->nxchained = 0;
+    /* No translations remain. A new one protects its page before reading code. */
+    for (int i = 0; i < m->nram; i++)
+        memset(m->ram[i].code_pages, 0, (size_t)1 << m->ram[i].pages_log2);
     hv_jit_reset(&m->jit);
     m->jit.limit = hv_knob[HV_K_JITCAP] > 0 ? ((size_t)hv_knob[HV_K_JITCAP] << 20) / sizeof(uint32_t) : 0; /* MB of it to use (testing) */
     /* HV_JIT_POISON: nothing old is left to run, so a stale pointer faults where it is used. */

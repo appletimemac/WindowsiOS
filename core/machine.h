@@ -15,6 +15,7 @@ typedef struct HvRam {
     uint8_t *host;
     int readonly;
     uint8_t *code_pages; /* one byte per 16 KB page: a translated block came from here (2^pages_log2 of them) */
+    uint8_t *inval_pages; /* batch membership bitmap, under tr_mu */
     uint32_t pages_log2;
     uint32_t *page_gen;  /* per page: bumped to invalidate the blocks translated from it */
     /* Per page and CPU: up to three TLB entries (slot << 2 | table, plus 1;
@@ -105,6 +106,7 @@ typedef struct HvStats {
     uint64_t helper[12];      /* by HV_OP_* */
     uint64_t tlb_flushes, fetch_walks, exceptions, interrupts;
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
+    uint64_t inval_ticks, inval_scanned, inval_dev;
 } HvStats;
 
 #if TARGET_OS_IPHONE
