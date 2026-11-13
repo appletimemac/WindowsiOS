@@ -28,6 +28,8 @@ static HvMachine m;
 static uint8_t *ram;
 static HvVirtioGpu *gpu;
 static HvFbDisplay *fb;
+static HvGic *gic;
+static HvPcie *pcie;
 static int checks, failures;
 static uint16_t avail_idx[2];
 
@@ -210,6 +212,7 @@ static void test_identity(void) {
 
 /* viogpudo maps the config vector even on INTx and gives up when the mapping reads back NO_VECTOR. */
 static void test_msix_vectors(void) {
+    check("one vector for config changes and one per queue", gpu->vio.msix_vectors, 3);
     check("config vector starts unmapped", bar_read(COMMON + 0x10, 2), 0xffff);
     bar_write(COMMON + 0x10, 0, 2);
     check("config vector 0 echoes", bar_read(COMMON + 0x10, 2), 0);
@@ -231,11 +234,6 @@ static void test_msix_vectors(void) {
     bar_write(COMMON + 0x16, 1, 2);
     check("reset unmaps queue vectors", bar_read(COMMON + 0x1a, 2), 0xffff);
     bar_write(COMMON + 0x16, 0, 2);
-    uint16_t vectors = gpu->vio.msix_vectors;
-    gpu->vio.msix_vectors = 0; /* a device that does not opt in, as virtio-net */
-    bar_write(COMMON + 0x10, 0, 2);
-    check("without the opt-in every mapping reads NO_VECTOR", bar_read(COMMON + 0x10, 2), 0xffff);
-    gpu->vio.msix_vectors = vectors;
 }
 
 static void test_edid(void) {
@@ -660,6 +658,158 @@ static void test_resize(void) {
     hv_virtio_gpu_set_size(gpu, 1280, 900);
 }
 
+/* How the driver is interrupted. On INTx a set ISR bit holds a level line up until the driver reads the
+   register, and the line is shared (with the network device on the board): raised when the driver is not
+   looking, it is taken again for ever. So the driver's wish for no interrupts on a queue is honoured, MSI-X
+   delivers messages and leaves the ISR and the line alone, and a function whose bus mastering the OS turned
+   off has no running driver. Config space is written through ECAM, as the guest writes it. */
+#define ECAM 0x4010000000ull
+#define DOORBELL 0x08020040ull
+#define MSIX 0x98
+static void cfg_write16(uint32_t reg, uint16_t val) {
+    uint64_t pa = ECAM + ((uint64_t)gpu->vio.pci.slot << 15) + reg;
+    HvMmio *e = hv_mmio_lookup(&m, pa);
+    hv_dev_lock(&m);
+    e->write(e->opaque, pa - e->pa, val, 2);
+    hv_dev_unlock(&m);
+}
+static void set_avail_flags(int q, uint16_t flags) {
+    memcpy(host(RING_PA(q) + 0x1000), &flags, 2);
+}
+static void display_info(void) {
+    hdr(req_buf, 0x0100);
+    submit(0, req_buf, 24, resp_buf, 408);
+}
+/* the INTx line as the device, the bus and the interrupt controller each hold it */
+static int line_up(void) {
+    HvPciDev *d = &gpu->vio.pci;
+    int line = d->slot & 3; /* pin A with the gpex swizzle */
+    return d->intx + pcie->line_count[line] * 2 + gic->level[35 + line] * 4 + ((d->config[0x06] >> 3) & 1) * 8;
+}
+static void test_interrupts(void) {
+    HvPciDev *d = &gpu->vio.pci;
+    const uint8_t *c = d->config;
+    check("an MSI-X capability heads the list", c[0x34] == MSIX && c[MSIX] == 0x11, 1);
+    check("and leads to the virtio ones", c[MSIX + 1], 0x40);
+    check("it lies past the last virtio capability", c[0x71] == 0 && MSIX >= 0x70 + 20, 1);
+    check("table size 3", (c[MSIX + 2] | c[MSIX + 3] << 8) & 0x7ff, 2);
+    check("MSI-X starts disabled", hv_pci_msix_enabled(d), 0);
+    check("table at the start of BAR 1", rd32(c + MSIX + 4), 1);
+    check("pending bits in BAR 1", rd32(c + MSIX + 8), 0x800 | 1);
+    check("BAR 1 is 4 KB of 32-bit memory", d->bar_size[1] == 0x1000 && !d->bar64[1], 1);
+
+    /* INTx: no interrupt for a queue whose driver asked for none. */
+    cfg_write16(0x04, 0x0006);
+    bar_read(ISR, 1);
+    set_avail_flags(0, 1);
+    display_info();
+    check("NO_INTERRUPT: no line", line_up(), 0);
+    check("NO_INTERRUPT: no ISR bit", bar_read(ISR, 1), 0);
+    set_avail_flags(0, 0);
+    display_info();
+    check("flag clear: the line, all the way to the interrupt controller", line_up(), 1 + 2 + 4 + 8);
+    check("flag clear: ISR reads 1", bar_read(ISR, 1), 1);
+    check("the read drops the line", line_up(), 0);
+    check("the cursor queue's flag is its own", (set_avail_flags(1, 1), cursor_cmd(0x0301, 1, 1, 0, 0, 0), line_up()), 0);
+    set_avail_flags(1, 0);
+
+    /* The guest turns MSI-X on with an INTx interrupt still unread: the line goes down at once. */
+    display_info();
+    check("an unread INTx interrupt", line_up(), 15);
+    cfg_write16(MSIX + 2, 0x8000);
+    check("MSI-X on: the line is down everywhere but the status bit", line_up(), 8);
+    check("the unread ISR bit is still the driver's to read", bar_read(ISR, 1), 1);
+    check("and then nothing is left", line_up(), 0);
+
+    /* MSI-X: each source is its vector's message. */
+    hv_pcie_set_msi_doorbell(pcie, DOORBELL);
+    for (uint32_t i = 0; i < 3; i++)
+        d->msix_table[i] = (HvPciMsixEntry){.addr_lo = (uint32_t)DOORBELL, .addr_hi = 0, .data = 100 + i, .ctrl = 0};
+    bar_write(COMMON + 0x10, 0, 2);
+    bar_write(COMMON + 0x16, 0, 2);
+    bar_write(COMMON + 0x1a, 1, 2);
+    bar_write(COMMON + 0x16, 1, 2);
+    bar_write(COMMON + 0x1a, 2, 2);
+    bar_write(COMMON + 0x16, 0, 2);
+    gic->latch[100] = gic->latch[101] = gic->latch[102] = 0;
+    display_info();
+    check("MSI-X: the control queue's message", gic->latch[101], 1);
+    check("MSI-X: nobody else's", gic->latch[100] | gic->latch[102], 0);
+    check("MSI-X: no line, no status bit", line_up(), 0);
+    check("MSI-X: the ISR register stays clear", gpu->vio.isr, 0);
+    cursor_cmd(0x0301, 2, 2, 0, 0, 0);
+    check("MSI-X: the cursor queue's message", gic->latch[102], 1);
+    hv_fb_display_request_size(fb, 1000, 700);
+    check("MSI-X: a config change is the config vector's message", gic->latch[100], 1);
+    check("MSI-X: still no line and no ISR bit", line_up() == 0 && gpu->vio.isr == 0, 1);
+    gic->latch[101] = 0;
+    set_avail_flags(0, 1);
+    display_info();
+    check("MSI-X: NO_INTERRUPT holds for messages too", gic->latch[101], 0);
+    set_avail_flags(0, 0);
+    bar_write(COMMON + 0x1a, 0xffff, 2);
+    display_info();
+    check("MSI-X: a queue with no vector sends nothing", gic->latch[101] == 0 && line_up() == 0, 1);
+    bar_write(COMMON + 0x1a, 1, 2);
+
+    /* The function mask holds a message back; lifting it sends that message once. */
+    cfg_write16(MSIX + 2, 0xc000);
+    display_info();
+    check("function mask: the message waits in the pending bits", gic->latch[101] == 0 && d->msix_pba == 2, 1);
+    cfg_write16(MSIX + 2, 0x8000);
+    check("mask lifted: the message goes", gic->latch[101] == 1 && d->msix_pba == 0, 1);
+    gic->latch[101] = 0;
+    cfg_write16(MSIX + 2, 0x8000);
+    check("and only once", gic->latch[101], 0);
+
+    /* The guest turns MSI-X off again, with no device reset in between: what went out as messages must not
+       come back as a line. */
+    display_info();
+    hv_fb_display_request_size(fb, 1002, 702);
+    cfg_write16(MSIX + 2, 0x0000);
+    check("MSI-X off: no line, no status bit, no ISR bit", line_up() == 0 && gpu->vio.isr == 0, 1);
+    display_info();
+    check("and INTx works again", line_up(), 15);
+    bar_read(ISR, 1);
+
+    /* A vector the driver masked, then a device reset: the pending message is not for the next driver. */
+    cfg_write16(MSIX + 2, 0x8000);
+    bar_write(COMMON + 0x1a, 1, 2);
+    d->msix_table[1].ctrl = 1;
+    gic->latch[101] = 0;
+    display_info();
+    check("a masked vector waits in the pending bits", gic->latch[101] == 0 && d->msix_pba == 2, 1);
+    bar_write(COMMON + 0x14, 0, 1);
+    check("a device reset drops what was pending", d->msix_pba, 0);
+    d->msix_table[1].ctrl = 0;
+    cfg_write16(MSIX + 2, 0x0000);
+    driver_init();
+
+    /* Bus mastering off: no running driver. */
+    check("bus master on: the status is kept", bar_read(COMMON + 0x14, 1), 1 | 2 | 4 | 8);
+    cfg_write16(0x04, 0x0002);
+    check("bus master off: DRIVER_OK goes", bar_read(COMMON + 0x14, 1), 1 | 2 | 8);
+    hv_fb_display_request_size(fb, 1280, 900);
+    check("bus master off: a config change raises nothing", line_up() == 0 && gpu->vio.isr == 0, 1);
+    hv_dev_lock(&m);
+    hv_virtio_interrupt(&gpu->vio, 0); /* a completion that was still on its way */
+    hv_dev_unlock(&m);
+    check("bus master off: a late completion raises nothing", line_up() == 0 && gpu->vio.isr == 0, 1);
+    uint16_t used_before, used_after, idx = (uint16_t)(avail_idx[0] + 1);
+    memcpy(&used_before, host(RING_PA(0) + 0x2000) + 2, 2);
+    memcpy(host(RING_PA(0) + 0x1000) + 2, &idx, 2);
+    bar_write(NOTIFY, 0, 2);
+    memcpy(&used_after, host(RING_PA(0) + 0x2000) + 2, 2);
+    check("bus master off: a kick does nothing", used_after, used_before);
+    cfg_write16(0x04, 0x0006);
+    check("bus master back: the driver has to start the device again", bar_read(COMMON + 0x14, 1) & 4, 0);
+    driver_init();
+    bar_write(0x2000 + 4, 1, 4);
+    check("and then it works", create_2d(9, 2, 16, 16), 0x1100);
+    check("its resource can go", simple(0x0102, 9), 0x1100);
+    bar_read(ISR, 1);
+}
+
 static void test_reset(void) {
     check("create", create_2d(8, 2, 64, 64), 0x1100);
     check("scanout", set_scanout(0, 8, 0, 0, 64, 64), 0x1100);
@@ -781,8 +931,8 @@ int main(void) {
     ram = aligned_alloc(65536, RAM_SIZE);
     memset(ram, 0, RAM_SIZE);
     hv_machine_add_ram(&m, RAM_PA, RAM_SIZE, ram, 0);
-    HvGic *gic = hv_gicv3_create(&m, 0x08000000, 0x080a0000);
-    HvPcie *pcie = hv_pcie_create(&m, gic, 0x4010000000ull, 0x10000000, 0x10000000, 0x2eff0000, 35);
+    gic = hv_gicv3_create(&m, 0x08000000, 0x080a0000);
+    pcie = hv_pcie_create(&m, gic, 0x4010000000ull, 0x10000000, 0x10000000, 0x2eff0000, 35);
     hv_pcie_set_gpex_swizzle(pcie, 1);
     fb = hv_fb_display_create(&m, NULL);
     gpu = hv_virtio_gpu_create(&m, pcie, fb);
@@ -800,6 +950,7 @@ int main(void) {
     test_cursor();
     test_resize();
     test_fit();
+    test_interrupts();
     test_reset();
     test_threads();
 

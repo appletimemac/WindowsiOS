@@ -23,7 +23,7 @@ static void notify(HvVirtio *v, int q) {
         hv_virtq_push(v, q, &e, 0);
         any = 1;
     }
-    if (any) hv_virtio_interrupt(v);
+    if (any) hv_virtio_interrupt(v, q);
 }
 
 int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
@@ -32,7 +32,7 @@ int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
     if (!(v->status & 4) || !v->q[RXQ].enabled || hv_virtq_pop(v, RXQ, &e) <= 0) return 0;
     if (hv_virtq_writable(&e) < HDR_LEN + len) { /* too small for it: drop the frame, return the buffer */
         hv_virtq_push(v, RXQ, &e, 0);
-        hv_virtio_interrupt(v);
+        hv_virtio_interrupt(v, RXQ);
         n->rx_dropped++;
         return 1;
     }
@@ -41,7 +41,7 @@ int hv_virtio_net_receive(HvVirtioNet *n, const uint8_t *frame, uint32_t len) {
     hv_virtq_write(v, &e, 0, hdr, HDR_LEN);
     hv_virtq_write(v, &e, HDR_LEN, frame, len);
     hv_virtq_push(v, RXQ, &e, HDR_LEN + len);
-    hv_virtio_interrupt(v);
+    hv_virtio_interrupt(v, RXQ);
     n->rx_frames++;
     return 1;
 }

@@ -4,8 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Layout of the one BAR (BAR 4, 16 KB), as QEMU's virtio-pci lays it out. */
+/* Layout of the device's own BAR (BAR 4, 16 KB), as QEMU's virtio-pci lays it out. BAR 1 holds the
+   MSI-X table and its pending bits, also as QEMU's. */
 #define BAR 4
+#define MSIX_BAR 1
+#define MSIX_CAP 0x98 /* past the notify capability (0x70 to 0x83) and virtio-blk's Apple one (0x88 to 0x95) */
+#define MSIX_PBA 0x800
 #define COMMON 0x0000
 #define ISR 0x1000
 #define DEVICE 0x2000
@@ -41,6 +45,7 @@ static void reset(HvVirtio *v) {
     v->msix_config = NO_VECTOR;
     for (int i = 0; i < v->nq; i++) v->q[i] = (HvVirtq){.size = HV_VIRTQ_MAX_SIZE, .msix_vector = NO_VECTOR};
     hv_pci_set_intx(&v->pci, 0);
+    v->pci.msix_pba = 0; /* a message that waited on a masked vector is not for the next driver */
     if (v->reset) v->reset(v);
 }
 
@@ -151,6 +156,13 @@ static void bar_write(HvPciDev *d, int bar, uint64_t off, uint64_t val, unsigned
     }
 }
 
+/* The OS turned bus mastering off: the device can no longer reach its rings. As QEMU's virtio-pci does,
+   DRIVER_OK goes with it, so nothing is delivered or signalled until a driver starts the device again. */
+static void config_written(HvPciDev *d) {
+    HvVirtio *v = d->opaque;
+    if (!(d->config[0x04] & 0x04)) v->status &= (uint8_t)~4u;
+}
+
 void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_code, int nq, uint64_t features) {
     memset(v, 0, sizeof *v);
     v->m = m;
@@ -160,6 +172,7 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
     v->pci.opaque = v;
     v->pci.bar_read = bar_read;
     v->pci.bar_write = bar_write;
+    v->pci.on_config_write = config_written;
     hv_pci_add_bar(&v->pci, BAR, 0x4000, 1);
     v->pci.config[0x06] |= 0x10;                 /* capability list */
     v->pci.config[0x34] = 0x40;
@@ -167,6 +180,9 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
     add_cap(v, 0x50, 0x60, 3, ISR, 1);
     add_cap(v, 0x60, 0x70, 4, DEVICE, 0x100);
     add_cap(v, 0x70, 0x00, 2, NOTIFY, NOTIFY_MULT * HV_VIRTQ_MAX);
+    v->msix_vectors = (uint16_t)(nq + 1);        /* config changes, then one per queue */
+    hv_pci_add_bar(&v->pci, MSIX_BAR, 0x1000, 0);
+    hv_pci_add_msix(&v->pci, MSIX_CAP, MSIX_BAR, 0, MSIX_PBA, v->msix_vectors);
     reset(v);
 }
 
@@ -174,9 +190,31 @@ void hv_virtio_reset(HvVirtio *v) {
     reset(v);
 }
 
-void hv_virtio_interrupt(HvVirtio *v) {
-    v->isr |= 1;
+/* One interrupt: the vector's message while MSI-X is enabled (none if the driver mapped no vector), else
+   the ISR bits and the INTx line. The ISR register stays clear under MSI-X, so turning MSI-X off later
+   cannot raise the line for interrupts that were already delivered as messages. */
+static void interrupt(HvVirtio *v, uint8_t isr, uint16_t vector) {
+    if (hv_pci_msix_enabled(&v->pci)) {
+        if (vector != NO_VECTOR) hv_pci_msix_notify(&v->pci, vector);
+        return;
+    }
+    v->isr |= isr;
     hv_pci_set_intx(&v->pci, 1);
+}
+
+void hv_virtio_interrupt(HvVirtio *v, int qi) {
+    HvVirtq *q = &v->q[qi];
+    /* No running driver (it was never started, or bus mastering went off under a completion that was still
+       on its way): there is nobody to interrupt. */
+    if (!(v->status & 4)) return;
+    /* The driver sets this flag, takes what is in the used ring, clears the flag and looks once more. Its
+       store of the flag is ordered before its last look; our store of used->idx must likewise be ordered
+       before this load, or each side can miss the other and a buffer waits for an interrupt that never
+       comes. (hv_virtq_push only orders its stores among themselves.) */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    const uint16_t *avail = hv_phys_ptr(v->m, q->avail, 4);
+    if (avail && (__atomic_load_n(&avail[0], __ATOMIC_RELAXED) & 1)) return; /* VRING_AVAIL_F_NO_INTERRUPT */
+    interrupt(v, 1, q->msix_vector);
 }
 
 void hv_virtio_config_changed(HvVirtio *v) {
@@ -184,8 +222,7 @@ void hv_virtio_config_changed(HvVirtio *v) {
     /* Before DRIVER_OK nobody services the line, and INTx is shared: an interrupt nobody reads would keep it asserted. */
     if (!(v->status & 4)) return;
     /* Both bits, as QEMU does: viogpudo's INTx handler only knows 1 (queue) and 3 (config). */
-    v->isr |= 3;
-    hv_pci_set_intx(&v->pci, 1);
+    interrupt(v, 3, v->msix_config);
 }
 
 int hv_virtq_pop(HvVirtio *v, int qi, HvVirtqElem *e) {

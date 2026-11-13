@@ -94,7 +94,7 @@ static void notify(HvVirtio *v, int q) {
         hv_virtq_push(v, q, &e, 0);
         any = 1;
     }
-    if (any) hv_virtio_interrupt(v);
+    if (any) hv_virtio_interrupt(v, q);
 }
 
 void hv_virtio_input_send(HvVirtioInput *d, uint16_t type, uint16_t code, int32_t value) {
@@ -132,7 +132,7 @@ void hv_virtio_input_poll(HvVirtioInput *d) {
         any = 1;
     }
     pthread_mutex_unlock(&d->mu);
-    if (any) hv_virtio_interrupt(v);
+    if (any) hv_virtio_interrupt(v, EVENTQ);
 }
 
 HvVirtioInput *hv_virtio_input_create(HvMachine *m, HvPcie *bus, int kind) {

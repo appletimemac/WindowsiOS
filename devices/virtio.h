@@ -6,8 +6,8 @@
 #include "pcie.h"
 
 /* virtio 1.x over PCI (modern only, as vmapple sets disable-legacy), split
-   virtqueues, INTx interrupts. Requests are handled synchronously when the
-   driver notifies. */
+   virtqueues, MSI-X interrupts with INTx for a driver that does not enable
+   them. Requests are handled synchronously when the driver notifies. */
 #define HV_VIRTQ_MAX 4
 #define HV_VIRTQ_MAX_SIZE 1024
 #define HV_VIRTQ_MAX_SEGS 128
@@ -39,10 +39,12 @@ typedef struct HvVirtio {
     uint32_t dfsel, gfsel;
     uint8_t status, isr, config_gen;
     uint16_t qsel, nq;
-    /* MSI-X table entries the driver may map. There is no MSI-X capability, so interrupts stay on INTx
-       whatever is mapped, but virtio-win's viogpudo maps the config vector even on INTx and fails to
-       start when it reads back NO_VECTOR. QEMU echoes any vector below its table size; devices that
-       need that set this after hv_virtio_init. 0 keeps every mapping at NO_VECTOR. */
+    /* The MSI-X table's size (one vector for config changes and one per queue, as QEMU's virtio-pci) and
+       the vector the driver mapped config changes to. A mapping below the table size reads back as
+       written, anything else as NO_VECTOR; each queue's own mapping is in HvVirtq. While MSI-X is enabled
+       an interrupt is the mapped vector's message and neither the ISR register nor the INTx line is
+       used: a message cannot stay asserted, where a level line that nobody services (a display driver
+       that is powering down, on a line it shares with the network driver) is taken again for ever. */
     uint16_t msix_vectors, msix_config;
     HvVirtq q[HV_VIRTQ_MAX];
     uint8_t config[256];
@@ -60,7 +62,9 @@ void hv_virtio_init(HvVirtio *v, HvMachine *m, int device_id, uint32_t class_cod
 /* 1 and an element if the driver made one available, 0 if not, -1 if the ring is broken. */
 int hv_virtq_pop(HvVirtio *v, int q, HvVirtqElem *e);
 void hv_virtq_push(HvVirtio *v, int q, const HvVirtqElem *e, uint32_t written);
-void hv_virtio_interrupt(HvVirtio *v);
+/* Used buffers went back on queue q: interrupt the driver, unless it asked for no interrupts on that
+   queue (VRING_AVAIL_F_NO_INTERRUPT, which a driver sets while it drains the used ring). */
+void hv_virtio_interrupt(HvVirtio *v, int q);
 /* Power-on state, as if the driver had written status 0: for a machine reset. Call with the device lock held. */
 void hv_virtio_reset(HvVirtio *v);
 /* The device config changed: bump the generation and, once the driver is running, raise a config-change interrupt.

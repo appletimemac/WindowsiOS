@@ -521,7 +521,7 @@ static void notify(HvVirtio *v, int q) {
         }
         any = 1;
     }
-    if (any) hv_virtio_interrupt(v);
+    if (any) hv_virtio_interrupt(v, q);
 }
 
 /* ---- device ---- */
@@ -597,7 +597,6 @@ HvVirtioGpu *hv_virtio_gpu_create(HvMachine *m, HvPcie *bus, HvFbDisplay *fb) {
     v->notify = notify;
     v->config_write = config_write;
     v->reset = do_reset;
-    v->msix_vectors = 3; /* config plus one per queue, as QEMU's virtio-gpu-pci; see HvVirtio */
     uint32_t scanouts = 1;
     memcpy(v->config + 8, &scanouts, 4); /* events_read, events_clear, num_scanouts, num_capsets = 0 */
     v->config_len = 16;
