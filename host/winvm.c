@@ -169,15 +169,16 @@ int hv_winvm_save_png(const char *path) {
 
 static void kicker_timer_hint(HvMachine *mm, uint64_t due);
 
-static uint32_t pending_width, pending_height;
+/* The last size asked for. A running VM gets it at once and the next one when it starts: the app asks only
+   when its layout changes, so Windows started again in the same window must come up at this size, not at
+   whatever was asked before the first start. */
+static uint32_t wanted_width, wanted_height;
 
 void hv_winvm_request_display_size(uint32_t width, uint32_t height) {
     os_unfair_lock_lock(&display_lock);
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
-    if (!fb) {
-        pending_width = width;
-        pending_height = height;
-    }
+    wanted_width = width;
+    wanted_height = height;
     os_unfair_lock_unlock(&display_lock);
     if (fb) hv_fb_display_request_size(fb, width, height);
 }
@@ -250,7 +251,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     os_unfair_lock_lock(&display_lock);
     if (display_layer_set && board.fb) hv_fb_metal_set_layer(board.fb, (void *)display_layer);
     atomic_store_explicit(&display_fb, board.fb, memory_order_release);
-    uint32_t want_w = pending_width, want_h = pending_height;
+    uint32_t want_w = wanted_width, want_h = wanted_height;
     os_unfair_lock_unlock(&display_lock);
     if (want_w && board.fb) hv_fb_display_request_size(board.fb, want_w, want_h);
 
