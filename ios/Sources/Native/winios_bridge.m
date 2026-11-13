@@ -5,6 +5,7 @@
 #include "share.h"
 #include "winios_jit.h"
 #include "winvm.h"
+#include "cmdfile.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
@@ -12,6 +13,12 @@
 #include <os/lock.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 static WinIOSBridge *s_shared_bridge = nil;
 
@@ -33,6 +40,11 @@ static WinIOSBridge *s_shared_bridge = nil;
     dispatch_source_t _perfTimer;
     HvPerfCsv _perfCsv;
     BOOL _engineStats;
+    NSThread *_cmdThread;
+    uint64_t _vmStartNS;
+    uint64_t _perfLastExceptions, _perfLastUptime;
+    unsigned _exceptionStormRows;
+    BOOL _hangStateWritten;
 
     os_unfair_lock _metricsLock;
     CGSize _screenSizePts;
@@ -44,7 +56,63 @@ static WinIOSBridge *s_shared_bridge = nil;
 - (void)updateUnpackProgress:(double)frac;
 - (void)startDiagTimer;
 - (void)stopDiagTimer;
+- (void)startCommandFile;
+- (void)commandMark:(const char *)label;
+- (void)commandPerfRow;
 @end
+
+static uint64_t command_mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+typedef struct IOSCmdCtx {
+    __unsafe_unretained WinIOSBridge *bridge;
+    const char *docs;
+    FILE *log;
+    int quit;
+} IOSCmdCtx;
+
+static int ios_cmd_path(void *opaque, const char *name, char *path, size_t size) {
+    IOSCmdCtx *ctx = opaque;
+    if (!*name || strchr(name, '/') || !strcmp(name, ".") || !strcmp(name, "..")) return -1;
+    int n = snprintf(path, size, "%s/%s", ctx->docs, name);
+    return n < 0 || (size_t)n >= size ? -1 : 0;
+}
+
+static void ios_cmd_mark(void *opaque, const char *label) {
+    IOSCmdCtx *ctx = opaque;
+    [ctx->bridge commandMark:label];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ms = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    fprintf(ctx->log, "MARK %llu %s\n", (unsigned long long)ms, label);
+}
+
+static void ios_cmd_perf_row(void *opaque) {
+    IOSCmdCtx *ctx = opaque;
+    [ctx->bridge commandPerfRow];
+}
+
+static void ios_cmd_quit(void *opaque) {
+    ((IOSCmdCtx *)opaque)->quit = 1;
+}
+
+static int ios_cmd_stopped(void *opaque) {
+    return ((IOSCmdCtx *)opaque)->quit || NSThread.currentThread.cancelled;
+}
+
+static uint64_t ios_cmd_seq(const char *text) {
+    if (!text || *text < '0' || *text > '9') return 0;
+    char *end;
+    errno = 0;
+    uint64_t seq = strtoull(text, &end, 10);
+    if (errno) return 0;
+    if (*end == '\r') end++;
+    if (*end == '\n') end++;
+    return *end ? 0 : seq;
+}
 
 static void vm_exit_trampoline(int reason) {
     NSString *r = [NSString stringWithUTF8String:hv_winvm_reason_name(reason)];
@@ -462,6 +530,7 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 
     _vmRunning = YES;
     _bootStartTime = CFAbsoluteTimeGetCurrent();
+    _vmStartNS = command_mono_ns();
     _diagTickCount = 0;
     _lastMachTicks = mach_absolute_time();
     _lastWfiTicks = 0;
@@ -473,8 +542,81 @@ static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
 
     [self startDiagTimer];
     [self startPerfLog];
+    [self startCommandFile];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
     [self notifyChanged];
+}
+
+- (void)startCommandFile {
+    const char *enabled = getenv("WINIOS_CMD");
+    if (!enabled || strcmp(enabled, "1")) return;
+    [_cmdThread cancel];
+    NSString *docs = [self documentsPath];
+    uint64_t startNS = _vmStartNS;
+    _cmdThread = [[NSThread alloc] initWithBlock:^{
+        @autoreleasepool {
+            NSString *input = [docs stringByAppendingPathComponent:@"winvm_cmds.txt"];
+            NSString *done = [docs stringByAppendingPathComponent:@"winvm_cmds.done"];
+            NSString *logPath = [docs stringByAppendingPathComponent:@"winvm_cmds.log"];
+            FILE *log = fopen(logPath.fileSystemRepresentation, "a");
+            if (!log) return;
+            IOSCmdCtx ctx = {.bridge = self, .docs = docs.fileSystemRepresentation, .log = log};
+            HvCmdFile cmd = {.opaque = &ctx, .out = log, .err = log, .path = ios_cmd_path,
+                             .mark = ios_cmd_mark, .perf_row = ios_cmd_perf_row,
+                             .quit = ios_cmd_quit, .stopped = ios_cmd_stopped};
+            NSString *savedSeq = [NSString stringWithContentsOfFile:done encoding:NSUTF8StringEncoding error:nil];
+            uint64_t lastSeq = ios_cmd_seq(savedSeq.UTF8String);
+            NSString *previous = nil;
+            while (!ios_cmd_stopped(&ctx)) {
+                @autoreleasepool {
+                    /* Reopen each time: devicectl can replace the inode. Require a stable, complete copy. */
+                    NSString *text = [NSString stringWithContentsOfFile:input encoding:NSUTF8StringEncoding error:nil];
+                    if ([text hasSuffix:@"\n"] && [text isEqualToString:previous]) {
+                        NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+                        const char *header = lines[0].UTF8String;
+                        uint64_t seq = !strncmp(header, "#seq ", 5) ? ios_cmd_seq(header + 5) : 0;
+                        if (seq > lastSeq) {
+                            for (NSUInteger i = 1; i < lines.count && !ios_cmd_stopped(&ctx); i++) {
+                                NSString *line = lines[i];
+                                if ([line hasSuffix:@"\r"]) line = [line substringToIndex:line.length - 1];
+                                if (!line.length) continue;
+                                uint64_t ms = (command_mono_ns() - startNS) / 1000000;
+                                fprintf(log, "[%llu] %s\n", (unsigned long long)ms, line.UTF8String);
+                                hv_cmdfile_exec(&cmd, line.UTF8String);
+                                fflush(log);
+                            }
+                            lastSeq = seq;
+                            if (!NSThread.currentThread.cancelled) {
+                                NSString *ack = [NSString stringWithFormat:@"%llu\n", (unsigned long long)seq];
+                                [ack writeToFile:done atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                            }
+                        }
+                    }
+                    previous = text;
+                }
+                if (!ios_cmd_stopped(&ctx)) usleep(200000);
+            }
+            fclose(log);
+        }
+    }];
+    _cmdThread.name = @"winvm.cmdfile";
+    [_cmdThread start];
+}
+
+- (void)commandMark:(const char *)label {
+    uint64_t t = (uint64_t)(NSDate.date.timeIntervalSince1970 * 1000.0);
+    dispatch_sync(_diagQueue, ^{ hv_perf_csv_mark(&self->_perfCsv, t, label); });
+}
+
+- (void)commandPerfRow {
+    dispatch_sync(_diagQueue, ^{
+        HvPerfSnap s;
+        hv_winvm_perf_snapshot(&s);
+        s.avail_mem_mb_now = [self availableMemoryMB];
+        s.thermal_now = (uint64_t)NSProcessInfo.processInfo.thermalState;
+        s.low_power_now = NSProcessInfo.processInfo.lowPowerModeEnabled ? 1 : 0;
+        hv_perf_csv_row(&self->_perfCsv, &s);
+    });
 }
 
 - (void)startDiagTimer {
@@ -522,6 +664,11 @@ static int sysctl_int(const char *name) {
         qos ? qos : "default"];
     dispatch_sync(_diagQueue, ^{
         hv_perf_csv_open(&self->_perfCsv, path.fileSystemRepresentation, 8l << 20, comment.UTF8String);
+        HvPerfSnap initial;
+        hv_winvm_perf_snapshot(&initial);
+        self->_perfLastExceptions = initial.exceptions;
+        self->_perfLastUptime = initial.uptime_ms;
+        self->_exceptionStormRows = 0;
     });
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _diagQueue);
     dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
@@ -536,6 +683,22 @@ static int sysctl_int(const char *name) {
         s.thermal_now = (uint64_t)NSProcessInfo.processInfo.thermalState;
         s.low_power_now = NSProcessInfo.processInfo.lowPowerModeEnabled ? 1 : 0;
         hv_perf_csv_row(&strongSelf->_perfCsv, &s);
+        uint64_t elapsed = s.uptime_ms - strongSelf->_perfLastUptime;
+        uint64_t before = strongSelf->_perfLastExceptions;
+        BOOL storm = s.uptime_ms > strongSelf->_perfLastUptime && s.exceptions >= before &&
+                     (double)(s.exceptions - before) * 1000.0 / (double)elapsed > 500000.0;
+        strongSelf->_perfLastExceptions = s.exceptions;
+        strongSelf->_perfLastUptime = s.uptime_ms;
+        strongSelf->_exceptionStormRows = storm ? strongSelf->_exceptionStormRows + 1 : 0;
+        if (!strongSelf->_hangStateWritten && strongSelf->_exceptionStormRows >= 3) {
+            strongSelf->_hangStateWritten = YES;
+            NSString *state = [[strongSelf documentsPath] stringByAppendingPathComponent:@"hang_state.txt"];
+            int rc = hv_cmdfile_state(state.fileSystemRepresentation);
+            const char *label = rc == 0 ? "exception storm: wrote Documents/hang_state.txt" :
+                                         "exception storm: failed to write Documents/hang_state.txt";
+            hv_perf_csv_mark(&strongSelf->_perfCsv, s.t_ms, label);
+            fprintf(stderr, "winvm: %s (rc=%d)\n", label, rc);
+        }
     });
     _perfTimer = timer;
     dispatch_resume(timer);
@@ -667,6 +830,7 @@ static int sysctl_int(const char *name) {
 
 - (void)handleVMExitWithReason:(NSString *)reason {
     _vmRunning = NO;
+    [_cmdThread cancel];
     [self stopDiagTimer];
     [self stopPerfLog];
     [[UIApplication sharedApplication] setIdleTimerDisabled:NO];

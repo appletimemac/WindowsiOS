@@ -16,7 +16,7 @@ DEV = $(B)/acpi.o $(B)/fb_display.o $(B)/fb_metal.o $(B)/fdt.o $(B)/fw_cfg.o $(B
       $(B)/virtio.o $(B)/virtio_blk.o $(B)/virtio_gpu.o $(B)/virtio_input.o $(B)/virtio_net.o $(B)/virtio_snd.o \
       $(B)/winvirt.o $(B)/xhci.o
 
-VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o $(B)/perf.o
+VM_HOST = $(B)/winvm.o $(B)/net_slirp.o $(B)/share.o $(B)/audio_mac.o $(B)/hvsparse.o $(B)/perf.o $(B)/cmdfile.o
 
 MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -framework Metal \
                  -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers \
@@ -88,7 +88,7 @@ IB = build/ios
 
 IOS_C_SRC = $(wildcard core/*.c) \
             host/jit_region.c host/disk.c host/winvm.c host/net_slirp.c host/share.c \
-            host/audio_mac.c host/hvsparse.c host/prof_ios.c host/perf.c \
+            host/audio_mac.c host/hvsparse.c host/prof_ios.c host/perf.c host/cmdfile.c \
             $(wildcard devices/*.c)
 IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_C_SRC)) $(IB)/host/enter.o $(IB)/devices/fb_metal.o
 

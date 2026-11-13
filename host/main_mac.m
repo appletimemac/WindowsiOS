@@ -19,8 +19,7 @@
 #include <unistd.h>
 
 #include "winvm.h"
-#include "mmu.h"
-#include "share.h"
+#include "cmdfile.h"
 
 /* macOS virtual key codes (kVK_*) -> Linux EV_KEY codes (mapped to USB HID by hv_winvm_key_linux) */
 static const uint16_t kMacToLinuxKey[128] = {
@@ -57,6 +56,11 @@ static uint64_t mono_ms(void) {
     return (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_mono_zero) / 1000000ull;
 }
 
+/* Wall-clock ms, the same clock as the t_ms column of the CSV rows, so a mark lines up with them. */
+static uint64_t wall_ms(void) {
+    return clock_gettime_nsec_np(CLOCK_REALTIME) / 1000000ull;
+}
+
 static HvPerfCsv g_perf;
 static pthread_mutex_t g_perf_mu = PTHREAD_MUTEX_INITIALIZER; /* guards g_perf and g_perf_prev */
 static pthread_t g_perf_tid;
@@ -89,6 +93,16 @@ static void perf_row(void) {
         g_perf_prev = s;
     }
     pthread_mutex_unlock(&g_perf_mu);
+}
+
+/* Prints MARK <t_ms> <label> and, when the CSV is open, writes the same moment into it. */
+static void perf_mark(const char *label) {
+    uint64_t t = wall_ms();
+    pthread_mutex_lock(&g_perf_mu);
+    if (g_perf.f) hv_perf_csv_mark(&g_perf, t, label);
+    pthread_mutex_unlock(&g_perf_mu);
+    printf("MARK %llu %s\n", (unsigned long long)t, label);
+    fflush(stdout);
 }
 
 static void *perf_thread(void *arg) {
@@ -144,66 +158,32 @@ static int perf_start(const char *path, const HvWinVmConfig *cfg) {
     return 0;
 }
 
-/* Simple ASCII typer using USB HID Keyboard usages */
-static void type_ascii_char(char ch) {
-    uint8_t usage = 0;
-    int shift = 0;
-    if (ch >= 'a' && ch <= 'z') { usage = (uint8_t)(0x04 + (ch - 'a')); }
-    else if (ch >= 'A' && ch <= 'Z') { usage = (uint8_t)(0x04 + (ch - 'A')); shift = 1; }
-    else if (ch >= '1' && ch <= '9') { usage = (uint8_t)(0x1e + (ch - '1')); }
-    else if (ch == '0') { usage = 0x27; }
-    else {
-        switch (ch) {
-        case ' ': usage = 0x2c; break;
-        case '\n': case '\r': usage = 0x28; break;
-        case '\t': usage = 0x2b; break;
-        case '-': usage = 0x2d; break;
-        case '_': usage = 0x2d; shift = 1; break;
-        case '=': usage = 0x2e; break;
-        case '+': usage = 0x2e; shift = 1; break;
-        case '[': usage = 0x2f; break;
-        case '{': usage = 0x2f; shift = 1; break;
-        case ']': usage = 0x30; break;
-        case '}': usage = 0x30; shift = 1; break;
-        case '\\': usage = 0x31; break;
-        case '|': usage = 0x31; shift = 1; break;
-        case ';': usage = 0x33; break;
-        case ':': usage = 0x33; shift = 1; break;
-        case '\'': usage = 0x34; break;
-        case '"': usage = 0x34; shift = 1; break;
-        case '`': usage = 0x35; break;
-        case '~': usage = 0x35; shift = 1; break;
-        case ',': usage = 0x36; break;
-        case '<': usage = 0x36; shift = 1; break;
-        case '.': usage = 0x37; break;
-        case '>': usage = 0x37; shift = 1; break;
-        case '/': usage = 0x38; break;
-        case '?': usage = 0x38; shift = 1; break;
-        case '!': usage = 0x1e; shift = 1; break;
-        case '@': usage = 0x1f; shift = 1; break;
-        case '#': usage = 0x20; shift = 1; break;
-        case '$': usage = 0x21; shift = 1; break;
-        case '%': usage = 0x22; shift = 1; break;
-        case '^': usage = 0x23; shift = 1; break;
-        case '&': usage = 0x24; shift = 1; break;
-        case '*': usage = 0x25; shift = 1; break;
-        case '(': usage = 0x26; shift = 1; break;
-        case ')': usage = 0x27; shift = 1; break;
-        default: return;
-        }
-    }
-    if (shift) { hv_winvm_key_hid(0xe1, 1); usleep(20000); }
-    hv_winvm_key_hid(usage, 1);
-    usleep(35000);
-    hv_winvm_key_hid(usage, 0);
-    if (shift) { usleep(20000); hv_winvm_key_hid(0xe1, 0); }
-    usleep(35000);
+static void cmd_mark(void *opaque, const char *label) {
+    (void)opaque;
+    perf_mark(label);
+}
+
+static void cmd_perf_row(void *opaque) {
+    (void)opaque;
+    perf_row();
+}
+
+static void cmd_quit(void *opaque) {
+    (void)opaque;
+    hv_winvm_stop();
+}
+
+static int cmd_stopped(void *opaque) {
+    (void)opaque;
+    return g_sig_stop;
 }
 
 static void *cmd_file_thread(void *arg) {
     const char *path = (const char *)arg;
     FILE *f = fopen(path, "a+");
     if (!f) return NULL;
+    HvCmdFile cmd = {.out = stdout, .err = stderr, .mark = cmd_mark,
+                     .perf_row = cmd_perf_row, .quit = cmd_quit, .stopped = cmd_stopped};
     long pos = 0;
     while (!g_sig_stop) {
         char line[512];
@@ -217,127 +197,9 @@ static void *cmd_file_thread(void *arg) {
         line[strcspn(line, "\r\n")] = 0;
         if (!line[0] || line[0] == '#') continue;
 
-        double xn = 0, yn = 0;
-        int code = 0, yi = 0;
-        if (sscanf(line, "click %lf %lf", &xn, &yn) == 2) {
-            hv_winvm_tablet(xn, yn, 0, 0);
-            usleep(40000);
-            hv_winvm_tablet(xn, yn, 1, 0);
-            usleep(80000);
-            hv_winvm_tablet(xn, yn, 0, 0);
-        } else if (sscanf(line, "rclick %lf %lf", &xn, &yn) == 2) {
-            hv_winvm_tablet(xn, yn, 0, 0);
-            usleep(40000);
-            hv_winvm_tablet(xn, yn, 2, 0);
-            usleep(80000);
-            hv_winvm_tablet(xn, yn, 0, 0);
-        } else if (sscanf(line, "move %lf %lf", &xn, &yn) == 2) {
-            hv_winvm_tablet(xn, yn, 0, 0);
-        } else if (sscanf(line, "hidkey %i", &code) == 1) {
-            hv_winvm_key_hid((uint8_t)code, 1);
-            usleep(50000);
-            hv_winvm_key_hid((uint8_t)code, 0);
-        } else if (!strcmp(line, "win")) {
-            hv_winvm_key_hid(0xe3, 1);
-            usleep(60000);
-            hv_winvm_key_hid(0xe3, 0);
-        } else if (!strcmp(line, "winr")) {
-            hv_winvm_key_hid(0xe3, 1);
-            usleep(30000);
-            hv_winvm_key_hid(0x15, 1); /* 'r' */
-            usleep(50000);
-            hv_winvm_key_hid(0x15, 0);
-            usleep(30000);
-            hv_winvm_key_hid(0xe3, 0);
-        } else if (!strcmp(line, "enter")) {
-            hv_winvm_key_hid(0x28, 1);
-            usleep(50000);
-            hv_winvm_key_hid(0x28, 0);
-        } else if (sscanf(line, "tap %lf %lf", &xn, &yn) == 2) {
-            HvTouchContact c = {.id = 0, .tip = 1, .x = (uint16_t)(xn * 32767.0), .y = (uint16_t)(yn * 32767.0)};
-            hv_winvm_touch(&c, 1);
-            usleep(90000);
-            c.tip = 0;
-            hv_winvm_touch(&c, 1);
-        } else if (!strcmp(line, "posture laptop") || !strcmp(line, "posture tablet")) {
-            hv_winvm_set_posture(line[8] == 'l');
-        } else if ((sscanf(line, "press %lf %lf %d", &xn, &yn, &code) == 3 ||
-                    sscanf(line, "pressrepeat %lf %lf %d", &xn, &yn, &code) == 3) && code > 0) {
-            /* Touch and hold for code ms; "pressrepeat" re-sends the held frame every 20 ms. */
-            HvTouchContact c = {.id = 0, .tip = 1, .x = (uint16_t)(xn * 32767.0), .y = (uint16_t)(yn * 32767.0)};
-            int repeat = !strncmp(line, "pressrepeat", 11);
-            hv_winvm_touch(&c, 1);
-            for (int t = 0; t < code; t += 20) {
-                usleep(20000);
-                if (repeat) hv_winvm_touch(&c, 1);
-            }
-            c.tip = 0;
-            hv_winvm_touch(&c, 1);
-        } else if (!strcmp(line, "touchready")) {
-            fprintf(stderr, "TOUCH_READY %d\n", hv_winvm_touch_ready());
-        } else if (sscanf(line, "combo %i %i", &code, &yi) == 2) {
-            hv_winvm_key_hid((uint8_t)code, 1);
-            usleep(30000);
-            hv_winvm_key_hid((uint8_t)yi, 1);
-            usleep(50000);
-            hv_winvm_key_hid((uint8_t)yi, 0);
-            usleep(30000);
-            hv_winvm_key_hid((uint8_t)code, 0);
-        } else if (sscanf(line, "size %d %d", &code, &yi) == 2 && code > 0 && yi > 0) {
-            hv_winvm_request_display_size((uint32_t)code, (uint32_t)yi);
-        } else if (!strcmp(line, "cad")) {
-            hv_winvm_send_ctrl_alt_del();
-        } else if (!strcmp(line, "power")) {
-            hv_winvm_power_button();
-        } else if (!strncmp(line, "type ", 5)) {
-            for (const char *p = line + 5; *p; p++) type_ascii_char(*p);
-        } else if (!strncmp(line, "screenshot ", 11)) {
-            int rc = hv_winvm_save_png(line + 11);
-            fprintf(stderr, "winvm: screenshot -> %s (rc=%d)\n", line + 11, rc);
-        } else if (!strcmp(line, "cpus")) {
-            HvMachine *m = hv_winvm_machine();
-            for (int i = 0; i < m->ncpus; i++)
-                if (m->cpus[i]) __atomic_store_n(&m->cpus[i]->exit_req, 1, __ATOMIC_SEQ_CST);
-            usleep(4000);
-            for (int i = 0; i < m->ncpus; i++) {
-                HvCpu *c = m->cpus[i];
-                if (!c) continue;
-                uint64_t pc = c->pc;
-                fprintf(stderr, "CPU%d: pc=%llx el=%u exit=%u x0=%llx x1=%llx x2=%llx x3=%llx x8=%llx x16=%llx lr=%llx\n",
-                        i, (unsigned long long)pc, c->el, c->exit_reason,
-                        (unsigned long long)c->x[0], (unsigned long long)c->x[1],
-                        (unsigned long long)c->x[2], (unsigned long long)c->x[3],
-                        (unsigned long long)c->x[8], (unsigned long long)c->x[16],
-                        (unsigned long long)c->x[30]);
-                if (pc >= 0x1000) {
-                    fprintf(stderr, "  insns:");
-                    for (int off = -32; off <= 32; off += 4) {
-                        uint64_t va = (pc & ~3ull) + (int64_t)off;
-                        HvWalk w = {0};
-                        hv_mmu_walk(c, va, HV_ACC_READ, c->el, &w);
-                        uint32_t word = 0;
-                        if (w.fsc == 0) hv_phys_read(m, w.pa, &word, 4);
-                        fprintf(stderr, " %s%08x", off == 0 ? "*" : "", word);
-                    }
-                    fprintf(stderr, "\n");
-                }
-            }
-            fflush(stderr);
-        } else if (sscanf(line, "oauthmode %d", &code) == 1) {
-            hv_share_set_url_handler_enabled(code);
-            fprintf(stderr, "winvm: oauthmode=%d\n", code);
-        } else if (!strcmp(line, "oauthstatus")) {
-            char *u = hv_share_take_open_url();
-            int done = hv_share_take_oauth_done();
-            fprintf(stderr, "OAUTH_STATUS url=%s done=%d\n", u ? u : "(none)", done);
-            free(u);
-        } else if (sscanf(line, "wait %d", &code) == 1 && code > 0) {
-            usleep((useconds_t)code * 1000u);
-        } else if (!strcmp(line, "quit")) {
-            hv_winvm_stop();
-            break;
-        }
-        fprintf(stderr, "winvm: cmd: %s\n", line);
+        uint64_t t_cmd = mono_ms();
+        if (hv_cmdfile_exec(&cmd, line)) break;
+        fprintf(stderr, "[%llu] winvm: cmd: %s\n", (unsigned long long)t_cmd, line);
     }
     fclose(f);
     return NULL;
@@ -646,13 +508,37 @@ static void usage(const char *prog) {
             "  --screenshot <png>        Save guest framebuffer PNG\n"
             "  --screenshot-after <sec>  Save screenshot after N seconds\n"
             "  --timeout <sec>           Auto-stop VM after N seconds\n"
-            "  --cmd-file <path>         Tail input commands from file\n"
+            "  --cmd-file <path>         Tail input commands from file (verbs below)\n"
             "  --perf-csv <path>         Append a row of performance counters to path (host/perf.h)\n"
             "  --perf-ms <n>             Milliseconds between perf rows (default: 1000); one more row when the VM stops\n"
             "  --no-net                  Disable SLIRP networking\n"
             "  --sound                   Enable VirtIO sound output\n"
             "  --stats <sec>             Print JIT statistics every N seconds\n"
-            "  --log <level>             Log level (default: 0)\n",
+            "  --log <level>             Log level (default: 0)\n"
+            "\n"
+            "cmd-file verbs, one per line ('#' starts a comment); each is echoed to stderr as\n"
+            "'[<ms since start>] winvm: cmd: <line>', the time being when it began:\n"
+            "  click|rclick|move <x> <y>       Pointer at x,y in 0..1 (click and right-click press once)\n"
+            "  tap <x> <y>                     Touch tap\n"
+            "  press|pressrepeat <x> <y> <ms>  Touch and hold (pressrepeat re-sends the held frame)\n"
+            "  type <text>                     Type ASCII text\n"
+            "  hidkey <usage>                  Press a USB HID key; combo <usage> <usage>: chord\n"
+            "  win | winr | enter              Windows key, Win+R, Enter\n"
+            "  size <w> <h>                    Ask the guest display for w x h pixels\n"
+            "  posture laptop|tablet           Tablet mode follows this posture\n"
+            "  cad | power | hibernate         Ctrl+Alt+Del, ACPI power button, hibernate\n"
+            "  screenshot <png>                Save the guest framebuffer\n"
+            "  state <path>                    Save every vCPU's registers and recent exceptions\n"
+            "  cpus | touchready | oauthmode <0|1> | oauthstatus   Debug dumps\n"
+            "  wait <ms>                       Pause the script\n"
+            "  quit                            Stop the VM\n"
+            "  mark <label>                    Write '#mark <t_ms> <label>' to the perf CSV (if open) and\n"
+            "                                  print 'MARK <t_ms> <label>' to stdout (t_ms: wall-clock ms,\n"
+            "                                  the t_ms column of the CSV rows)\n"
+            "  settle <quiet_ms> <max_ms>      Wait until the virtio-gpu flush count has not changed for\n"
+            "                                  quiet_ms, or max_ms have passed; print 'SETTLE <elapsed_ms>\n"
+            "                                  <quiet|timeout>' to stdout and mark it\n"
+            "  perfrow                         Write a perf row now\n",
             prog);
     exit(2);
 }

@@ -19,6 +19,7 @@
 
 #include "audio_mac.h"
 #include "dispatch.h"
+#include "mmu.h"
 #include "net_slirp.h"
 #include "share.h"
 
@@ -43,6 +44,24 @@ static void (*exit_cb)(int reason);
 int hv_winvm_share_up(void) { return share_on; }
 HvMachine *hv_winvm_machine(void) { return &m; }
 HvWinVirt *hv_winvm_board(void) { return &board; }
+
+uint64_t hv_winvm_display_flushes(void) {
+    return board.gpu ? __atomic_load_n(&board.gpu->flushes, __ATOMIC_RELAXED) : 0;
+}
+
+void hv_winvm_cpu_insns(HvCpu *cpu, uint64_t pc, uint32_t words[17]) {
+    for (int j = 0; j < 17; j++) {
+        uint64_t va = (pc & ~3ull) + (int64_t)(j * 4 - 32);
+        HvWalk w = {0};
+        hv_mmu_walk(cpu, va, HV_ACC_READ, cpu->el, &w);
+        words[j] = 0;
+        if (w.fsc == 0) hv_phys_read(cpu->m, w.pa, &words[j], 4);
+    }
+}
+
+void hv_winvm_set_oauth_mode(int enabled) { hv_share_set_url_handler_enabled(enabled); }
+char *hv_winvm_take_open_url(void) { return hv_share_take_open_url(); }
+int hv_winvm_take_oauth_done(void) { return hv_share_take_oauth_done(); }
 
 const char *hv_winvm_reason_name(int r) {
     switch (r) {

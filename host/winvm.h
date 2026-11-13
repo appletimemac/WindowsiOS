@@ -68,6 +68,11 @@ void hv_winvm_engine_stats(uint64_t *jit_used_bytes, uint64_t *jit_cap_bytes,
 /* One row of perf.csv (host/perf.h). Any thread; the caller fills the host fields (memory, thermal, power). */
 void hv_winvm_perf_snapshot(HvPerfSnap *out);
 int hv_winvm_share_up(void);
+uint64_t hv_winvm_display_flushes(void);
+void hv_winvm_cpu_insns(HvCpu *cpu, uint64_t pc, uint32_t words[17]);
+void hv_winvm_set_oauth_mode(int enabled);
+char *hv_winvm_take_open_url(void);
+int hv_winvm_take_oauth_done(void);
 
 HvMachine *hv_winvm_machine(void);
 HvWinVirt *hv_winvm_board(void);
