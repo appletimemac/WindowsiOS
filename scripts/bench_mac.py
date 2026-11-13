@@ -582,8 +582,9 @@ def main():
     ap.add_argument('--summarize', metavar='DIR', help='only rebuild summary.txt and summary.csv of DIR')
     ap.add_argument('--dry-run', action='store_true', help='print the run plan and stop')
     ap.add_argument('--quick', action='store_true', help='short guest bench (1 round, 3 s idle): a smoke test')
-    ap.add_argument('--image', default=os.path.join(WORK, 'vg_new6.img'))
-    ap.add_argument('--vars', default=os.path.join(WORK, 'vg_new6_vars.fd'))
+    ap.add_argument('--image', default=os.path.join(WORK, 'windows11_lite.img'),
+                    help='guest disk with the WindowsiOS Tools installed (default work/windows11_lite.img)')
+    ap.add_argument('--vars', default=os.path.join(WORK, 'vars.fd'), help='its UEFI variables (default work/vars.fd)')
     ap.add_argument('--code', default=os.path.join(WORK, 'code.fd'))
     ap.add_argument('--tools-img', default=os.path.join(WORK, 'tools.img'), help='copied, never written')
     ap.add_argument('--runner', type=parse_runners, default=[('base', os.path.join(ROOT, 'build', 'winvm'))],
