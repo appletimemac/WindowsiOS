@@ -9,6 +9,9 @@ if [ -z "$UDID" ]; then
     exit 2
 fi
 BUNDLE_ID="${2:-com.RRGSyndicate.WindowsiOS}"
+# Arguments for the app, as words in $WINIOS_LAUNCH_ARGS: "-winios.displayDensity retina" sets a default for this
+# launch only (the argument domain is not saved). They go after "--" so devicectl does not take them for its own.
+read -r -a APP_ARGS <<< "${WINIOS_LAUNCH_ARGS:-}"
 LAUNCH_JSON="$ROOT/work/duo_launch.json"
 
 mkdir -p "$ROOT/work"
@@ -21,14 +24,14 @@ for attempt in 1 2 3 4 5; do
         --terminate-existing \
         --device "$UDID" \
         --json-output "$LAUNCH_JSON" \
-        "$BUNDLE_ID" || \
+        "$BUNDLE_ID" ${APP_ARGS[@]+-- "${APP_ARGS[@]}"} || \
        xcrun devicectl device process launch \
         --no-activate \
         --start-stopped \
         --terminate-existing \
         --device "$UDID" \
         --json-output "$LAUNCH_JSON" \
-        "$BUNDLE_ID"; then
+        "$BUNDLE_ID" ${APP_ARGS[@]+-- "${APP_ARGS[@]}"}; then
         break
     fi
     echo "[duo] Attempt $attempt failed; retrying in 2s..."
