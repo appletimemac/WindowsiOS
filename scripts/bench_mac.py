@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Benchmark matrix on the Mac runner (build/winvm --headless).
 
-Every run boots a fresh APFS clone of the guest image, waits for the desktop to go quiet, starts
-scripts/bench/winios_bench.ps1 from a private copy of the tools disk and collects the guest's result
-file (PUT to the share) and the runner's perf CSV. Runs of different configurations are interleaved
+Every run boots a fresh APFS clone of the guest image, waits for the desktop to go quiet, has the guest
+fetch scripts/bench/winios_bench.ps1 from the run's share folder and run it, and collects the guest's
+result file (PUT to the share) and the runner's perf CSV. Runs of different configurations are interleaved
 (A B A B), never all A then all B.
 
   scripts/bench_mac.py --jit 384,768 --rounds 3 --label jit
@@ -18,7 +18,7 @@ Axes (comma lists; the matrix is their product): --jit MiB, --size WxH, --cpus N
 per run (cmds, winvm.log, perf.csv, bench.txt, run.json), summary.txt and summary.csv.
 
 The guest image, its vars and the tools disk are never written: the runs use clones, and the tools disk
-is a private copy of work/tools.img with the bench script added. Only files this script created are
+is a private copy of work/tools.img. Nothing is mounted on the Mac. Only files this script created are
 deleted, and a VM it started is stopped when it exits for any reason.
 """
 import argparse
@@ -41,6 +41,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORK = os.path.join(os.path.expanduser('~'), 'build', 'windowsios', 'work')
 BENCH_PS1 = os.path.join(ROOT, 'scripts', 'bench', 'winios_bench.ps1')
+BENCH_NAME = os.path.basename(BENCH_PS1)
 RESULT_NAME = 'winios_bench_result.txt'
 RUNNER_OWN_ENV = ('HV_QOS',)  # set from --qos
 
@@ -179,36 +180,11 @@ def parse_runners(text):
 
 # ---- tools disk ----
 
-def build_tools_disk(src):
-    """A private copy of the tools disk with the bench script on it: src itself is never written."""
+def copy_tools_disk(src):
+    """A private copy of the tools disk, so the guest cannot write to src."""
     dst = '/tmp/wb_tools_%d.img' % os.getpid()
-    mnt = '/tmp/wb_mnt_%d' % os.getpid()
     shutil.copyfile(src, dst)
     created_files.append(dst)
-    os.makedirs(mnt)
-    created_dirs.append(mnt)
-    r = subprocess.run(['hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nobrowse', '-noverify',
-                        '-mountpoint', mnt, dst], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError('hdiutil attach %s: %s' % (dst, r.stderr.strip()))
-    dev = r.stdout.split()[0]
-    try:
-        shutil.copyfile(BENCH_PS1, os.path.join(mnt, 'winios_bench.ps1'))
-        for name in os.listdir(mnt):  # what macOS leaves on a FAT volume
-            p = os.path.join(mnt, name)
-            if name.startswith('._') or name in ('.fseventsd', '.Spotlight-V100', '.Trashes', '.DS_Store'):
-                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
-        subprocess.run(['sync'])
-    finally:
-        for attempt in range(4):
-            d = subprocess.run(['hdiutil', 'detach', '-quiet'] + (['-force'] if attempt >= 2 else []) + [dev],
-                               capture_output=True)
-            if d.returncode == 0:
-                break
-            time.sleep(1)
-        else:
-            raise RuntimeError('could not detach %s' % dev)
-    forget(mnt)
     return dst
 
 
@@ -232,9 +208,11 @@ def append_cmds(path, lines):
 
 
 def guest_cmd_lines(cfg, args):
-    ps = '& ((Get-Volume -FileSystemLabel WINIOSTOOLS).DriveLetter + \':\\winios_bench.ps1\')'
+    # The guest fetches the script from the run's share folder: nothing has to be put on a disk image first.
+    run = ('cmd /c curl.exe -s -f -o %%TEMP%%\\%s http://10.0.2.4/%s && powershell -ep bypass -File %%TEMP%%\\%s'
+           % (BENCH_NAME, BENCH_NAME, BENCH_NAME))
     if args.quick:
-        ps += ' -Quick'
+        run += ' -Quick'
     w, h = cfg['size']
     return [
         'size %d %d' % (w, h),
@@ -246,7 +224,7 @@ def guest_cmd_lines(cfg, args):
         'mark bench_launch',
         'winr',
         'wait 3000',
-        'type powershell -ep bypass -c "%s"' % ps,
+        'type ' + run,
         'enter',
         'mark bench_typed',
     ]
@@ -287,6 +265,7 @@ def run_one(cfg, n, total, rnd, args, outdir, tools_img, configs):
     vars_ = clone(args.vars, n)
     share = tempfile.mkdtemp(prefix='wb_', dir='/tmp')
     created_dirs.append(share)
+    shutil.copyfile(BENCH_PS1, os.path.join(share, BENCH_NAME))
     cmds = os.path.join(rdir, 'cmds')
     perf = os.path.join(rdir, 'perf.csv')
     logf = os.path.join(rdir, 'winvm.log')
@@ -675,7 +654,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     log('results: %s' % outdir)
-    tools_img = build_tools_disk(args.tools_img)
+    tools_img = copy_tools_disk(args.tools_img)
 
     results = []
     for i, (rnd, cfg) in enumerate(plan, 1):
