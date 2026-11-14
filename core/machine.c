@@ -13,6 +13,7 @@ extern void hv_exit(void);
 extern void hv_helper_entry(void);
 extern void hv_helper_thunk(void);
 extern void hv_chain_thunk(void);
+extern void hv_mem_thunk(void);
 extern void hv_ijc_thunk(void);
 extern void hv_xjump_thunk(void);
 
@@ -77,7 +78,10 @@ static int init_rest(HvMachine *m) {
     m->slot_xa = calloc(m->max_slots, sizeof *m->slot_xa);
     m->slot_xpa = calloc(m->max_slots, sizeof *m->slot_xpa);
     m->slot_xnext = calloc(m->max_slots, sizeof *m->slot_xnext);
-    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->slot_xnext) return -1;
+    m->slot_target = calloc(m->max_slots, sizeof *m->slot_target);
+    m->max_mem_sites = m->max_slots; /* about one and a half a block: pages nobody touches cost nothing */
+    m->mem_sites = calloc(m->max_mem_sites, sizeof *m->mem_sites);
+    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->slot_xnext || !m->slot_target || !m->mem_sites) return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -294,6 +298,8 @@ void hv_machine_free(HvMachine *m) {
     free(m->slot_xa);
     free(m->slot_xpa);
     free(m->slot_xnext);
+    free(m->slot_target);
+    free(m->mem_sites);
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
@@ -757,6 +763,11 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->helper_routine = (uint64_t)hv_helper_entry;
     cpu->helper_thunk = (uint64_t)hv_helper_thunk;
     cpu->chain_thunk = (uint64_t)hv_chain_thunk;
+    cpu->slots = (uint64_t)(uintptr_t)m->slots;
+    cpu->slot_targets = (uint64_t)(uintptr_t)m->slot_target;
+    cpu->mem_thunk = (uint64_t)hv_mem_thunk;
+    cpu->mem_sites = (uint64_t)(uintptr_t)m->mem_sites;
+    cpu->jit_base = (uint64_t)(uintptr_t)m->jit.base;
     cpu->ijc_thunk = (uint64_t)hv_ijc_thunk;
     cpu->xjump_thunk = (uint64_t)hv_xjump_thunk;
     cpu->el = 1;

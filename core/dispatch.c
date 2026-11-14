@@ -34,6 +34,7 @@ void hv_flush_blocks(HvMachine *m) {
     memset(m->hash, 0, sizeof m->hash);
     m->nblocks = 0;
     m->nslots = 0;
+    m->nmem_sites = 0;
     m->nxchained = 0;
     /* No translations remain. A new one protects its page before reading code. */
     for (int i = 0; i < m->nram; i++) {

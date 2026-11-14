@@ -41,6 +41,13 @@ static int inval_run(HvCpu *cpu, uint64_t from, uint64_t to, uint64_t value) {
     return bad + inval_check("new code executed", cpu->x[0], value);
 }
 
+/* A device whose write asks the CPU to leave, as a timer tick or another CPU's request does. */
+static int kick_armed;
+static void kick_write(void *opaque, uint64_t off, uint64_t val, unsigned size) {
+    (void)off, (void)val, (void)size;
+    if (kick_armed) __atomic_store_n(&((HvMachine *)opaque)->cpus[0]->exit_req, 1, __ATOMIC_SEQ_CST);
+}
+
 static uint32_t inval_slot(HvMachine *m, uint64_t pa) {
     HvRam *r = hv_ram_lookup(m, pa);
     for (uint32_t s = r->chain_in[(pa - r->pa) >> HV_TLB_PAGE_BITS]; s; s = m->slot_xnext[s - 1])
@@ -76,6 +83,40 @@ static int test_invalidation(void) {
         bad += inval_run(&cpu[0], base + source * PAGE, base + target * PAGE, i + 1);
         slots[i] = inval_slot(&m, base + target * PAGE);
         bad += inval_check("cross-page chain installed", slots[i] != ~0u, 1);
+    }
+    if (bad) goto done;
+    {
+        /* A chain too far for the stub's B leaves that B where it is, and the thunk follows the filled slot: no trip
+           through the dispatcher (icount counts those) between the two blocks. Put the B back to the stub to see. */
+        uint32_t idx = slots[0], *site = m.slot_site[idx];
+        uint32_t chained = *site, to_stub = 0x14000000u | ((m.slot_stub[idx] - site) & 0x3ffffff);
+        hv_jit_write(&m.jit, site, &to_stub, 4);
+        hv_jit_finish(&m.jit, site, 1);
+        uint64_t n0 = cpu[0].icount;
+        bad += inval_run(&cpu[0], base + 5 * PAGE, base + targets[0] * PAGE, 1);
+        uint64_t from_stub = cpu[0].icount - n0;
+        hv_jit_write(&m.jit, site, &chained, 4);
+        hv_jit_finish(&m.jit, site, 1);
+        n0 = cpu[0].icount;
+        bad += inval_run(&cpu[0], base + 5 * PAGE, base + targets[0] * PAGE, 1);
+        bad += inval_check("a filled slot is followed from its stub", from_stub, cpu[0].icount - n0);
+        /* But not when the CPU was asked to leave: a block that stores to the device above and then takes the same
+           chained exit goes through the dispatcher (the stub's thunk sees exit_req before it follows the slot). */
+        const uint64_t dev = 0x20000000;
+        hv_machine_add_mmio(&m, dev, 0x1000, &m, NULL, kick_write, "kick");
+        code[9 * PAGE / 4] = 0xb9000041; /* str w1, [x2] */
+        code[9 * PAGE / 4 + 1] = 0x14000000u | ((uint32_t)(-(5 * (int)PAGE + 4) / 4) & 0x3ffffff); /* b the fourth target (the page that no DMA below touches) */
+        cpu[0].x[1] = 0, cpu[0].x[2] = dev;
+        for (int twice = 0; twice < 2; twice++) bad += inval_run(&cpu[0], base + 9 * PAGE, base + 4 * PAGE, 4);
+        n0 = cpu[0].icount;
+        bad += inval_run(&cpu[0], base + 9 * PAGE, base + 4 * PAGE, 4);
+        uint64_t calm = cpu[0].icount - n0;
+        kick_armed = 1;
+        n0 = cpu[0].icount;
+        bad += inval_run(&cpu[0], base + 9 * PAGE, base + 4 * PAGE, 4);
+        uint64_t kicked = cpu[0].icount - n0;
+        kick_armed = 0;
+        bad += inval_check("a kick makes a chained exit leave", kicked > calm, 1);
     }
     if (bad) goto done;
     HvRam *ram = &m.ram[0];

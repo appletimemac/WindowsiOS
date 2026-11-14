@@ -243,5 +243,24 @@ PROGRAM p_smc_nomaint
 5:
 END p_smc_nomaint
 
+// A byte store: the instruction's low byte (mov x0, #1 to mov x0, #2). A store's slow path has to look at the
+// write tag whatever its size, or this one passes for a load and the translated code stays.
+PROGRAM p_smc_byte
+    mov x1, #0
+    mov x4, #0
+1:  bl 3f
+    add x1, x1, x0
+    adr x2, 3f
+    mov w3, #0x40
+    strb w3, [x2]
+    add x4, x4, #1
+    cmp x4, #2
+    b.lt 1b
+    b 5f
+3:  mov x0, #1
+    ret
+5:
+END p_smc_byte
+
     .p2align 14
 _exc_programs_finish:

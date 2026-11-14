@@ -13,6 +13,7 @@ DECLARE_PROGRAM(p_fptrap);
 DECLARE_PROGRAM(p_psci);
 DECLARE_PROGRAM(p_smc);
 DECLARE_PROGRAM(p_smc_nomaint);
+DECLARE_PROGRAM(p_smc_byte);
 extern const char exc_programs_begin[], exc_programs_finish[];
 
 #define ACK_PA 0x20000000ull
@@ -156,13 +157,14 @@ int main(void) {
     }
 
     /* Self-modifying code runs from a writable copy. */
-    const TestProgram *smc_progs[2];
-    static const TestProgram smc1 = TEST_PROGRAM(p_smc), smc2 = TEST_PROGRAM(p_smc_nomaint);
+    const TestProgram *smc_progs[3];
+    static const TestProgram smc1 = TEST_PROGRAM(p_smc), smc2 = TEST_PROGRAM(p_smc_nomaint), smc3 = TEST_PROGRAM(p_smc_byte);
     smc_progs[0] = &smc1;
     smc_progs[1] = &smc2;
+    smc_progs[2] = &smc3;
     uint8_t *code = aligned_alloc(16384, 16384);
     hv_machine_add_ram(&m, ADDR(code), 16384, code, 0);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         const TestProgram *p = smc_progs[i];
         size_t len = (const char *)p->end - (const char *)p->start + 4;
         memcpy(code, p->start, len);

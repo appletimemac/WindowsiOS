@@ -28,6 +28,13 @@
 #define CPU_EXIT 0x110
 #define CPU_EXIT_REQ 0x3c0
 #define CPU_LAST_STUB 0x3c8
+#define CPU_SLOTS 0x4e8
+#define CPU_SLOT_TARGETS 0x4f0
+#define CPU_MEM_SITES 0x540
+#define CPU_JIT_BASE 0x548
+#define CPU_TLB 0x580
+#define TLB_ADJ 15
+#define TLB_PAGE_BITS 12
 #define CPU_REFILL_RET 0x438
 #define CPU_IJC_SALT 0x3d8
 #define CPU_IJC_TAB 0x440
@@ -41,6 +48,7 @@
     .globl _hv_helper_entry
     .globl _hv_helper_thunk
     .globl _hv_chain_thunk
+    .globl _hv_mem_thunk
     .globl _hv_ijc_thunk
     .globl _hv_xjump_thunk
     .globl _hv_fp_enter
@@ -270,22 +278,110 @@ _hv_helper_thunk:
     mov x0, x6
     b _hv_helper_entry
 
+// hv_mem_thunk: a load or store whose TLB check failed, from a five-word site
+// (translate.c, put_mem_site): `str x30, [x28, #x30]`, the address in x6, `blr`,
+// and at x30 the number of its HvMemSite (machine.h), which is an HvHelperInfo
+// followed by where the access's translation starts and ends, in words from the
+// start of the JIT region. x7 is still what the check indexed the TLB with (the
+// entry is CPU_TLB past it). In order: the exact check, when the fast one may
+// have refused an access only for being in its page's last bytes (on with the
+// word after the check, x6 and x7 as they were); the light TLB refill (the
+// access again from its start); the helper (on after the access). Each goes
+// back by RET, which takes the call's entry off the CPU's stack of return
+// addresses as hv_helper_thunk's ways back do.
+_hv_mem_thunk:
+    ldr w15, [x30]
+    ldr x30, [x28, #CPU_MEM_SITES]
+    add x30, x30, x15, lsl #4
+    add x30, x30, x15, lsl #3     // the HvMemSite: 24 bytes each
+    ldr w15, [x30, #12]           // op
+    tbz w15, #19, 2f
+    stp x0, x1, [x28]
+    ubfx x0, x15, #20, #1         // a store: the write tag
+    add x1, x7, #CPU_TLB
+    ldr x1, [x1, x0, lsl #3]
+    sub x1, x6, x1
+    ubfx x0, x15, #21, #4         // bytes - 1
+    add x1, x1, x0
+    sub x1, x1, #TLB_ADJ
+    lsr x1, x1, #TLB_PAGE_BITS
+    cbnz x1, 1f
+    ldr w0, [x30, #16]
+    add x0, x0, x15, lsr #25      // the word after the check
+    ldr x1, [x28, #CPU_JIT_BASE]
+    add x15, x1, x0, lsl #2
+    ldp x0, x1, [x28]
+    ldr x30, [x28, #240]
+    ret x15
+1:  ldp x0, x1, [x28]
+2:  ubfx w15, w15, #8, #11        // hv_tlb_refill's flags
+    cbz w15, 4f
+    str x30, [x28, #CPU_REFILL_RET]
+    stp x0, x1, [x28, #0]
+    stp x2, x3, [x28, #16]
+    stp x4, x5, [x28, #32]
+    stp x8, x9, [x28, #64]
+    stp x10, x11, [x28, #80]
+    stp x12, x13, [x28, #96]
+    str x14, [x28, #112]
+    stp x16, x17, [x28, #128]
+    mov w2, w15
+    mrs x15, nzcv
+    str x15, [x28, #CPU_NZCV]
+    mov x15, sp
+    str x15, [x28, #CPU_SP]
+    ldr x15, [x28, #CPU_HOST_SP]
+    mov sp, x15
+    mov x0, x28
+    mov x1, x6
+    bl _hv_tlb_refill
+    mov x7, x0
+    ldr x0, [x28, #CPU_SP]
+    mov sp, x0
+    ldr x0, [x28, #CPU_NZCV]
+    msr nzcv, x0
+    ldp x0, x1, [x28, #0]
+    ldp x2, x3, [x28, #16]
+    ldp x4, x5, [x28, #32]
+    ldp x8, x9, [x28, #64]
+    ldp x10, x11, [x28, #80]
+    ldp x12, x13, [x28, #96]
+    ldr x14, [x28, #112]
+    ldp x16, x17, [x28, #128]
+    ldr x30, [x28, #CPU_REFILL_RET]
+    cbnz x7, 4f
+    // Filled: the access again from its start.
+    ldr w15, [x30, #16]
+    ldr x6, [x28, #CPU_JIT_BASE]
+    add x15, x6, x15, lsl #2
+    ldr x30, [x28, #240]
+    ret x15
+4:  stp x0, x1, [x28]
+    mov x0, x30                   // the site, as the helper's HvHelperInfo
+    ldr w15, [x30, #20]
+    ldr x30, [x28, #CPU_JIT_BASE]
+    add x30, x30, x15, lsl #2     // it comes back after the access
+    b _hv_helper_entry
+
 // hv_chain_thunk: a chainable exit's slow side. The site did `str x30, [x28, #x30]`
-// and `blr`; x30 points at {slot address, target VA}. Follows the slot when
-// chained beyond the stub's B (out of range), else leaves for the dispatcher,
-// naming the slot (last_stub) unless an exit was asked for.
+// and `blr`; x30 points at the exit's slot number (one word: the slot and the
+// target VA are found through the HvCpu, so a stub is four words). Follows the
+// slot when chained beyond the stub's B (out of range), else leaves for the
+// dispatcher, naming the slot (last_stub) unless an exit was asked for.
 _hv_chain_thunk:
-    mov x7, x30
+    ldr w7, [x30]
     ldr x30, [x28, #240]
     ldr w15, [x28, #CPU_EXIT_REQ]
     cbnz w15, 1f
-    ldr x6, [x7]
-    ldr x15, [x6]
+    ldr x6, [x28, #CPU_SLOTS]
+    ldr x15, [x6, x7, lsl #3]
     cbz x15, 2f
     ret x15
-2:  str x6, [x28, #CPU_LAST_STUB]
+2:  add x6, x6, x7, lsl #3
+    str x6, [x28, #CPU_LAST_STUB]
 1:  stp x0, x1, [x28]
-    ldr x0, [x7, #8]
+    ldr x0, [x28, #CPU_SLOT_TARGETS]
+    ldr x0, [x0, x7, lsl #3]
     str x0, [x28, #CPU_PC]
     ldr x1, [x28, #CPU_EXIT]
     br x1

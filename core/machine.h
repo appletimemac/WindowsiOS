@@ -241,6 +241,22 @@ typedef struct HvPerCpu {
 #define HV_REQ_TLB_ALL 1u   /* drop the whole TLB and branch cache */
 #define HV_REQ_IJC_RESET 2u /* drop the branch cache (code changed) */
 
+/* A load or store's slow path. First what a helper call needs, laid out as its HvHelperInfo (translate.h): the
+   guest PC, the instruction, and op: bits 7..0 HV_OP_MEM, 18..8 hv_tlb_refill's flags (0: no refill), 19 the exact
+   check applies (the fast one refuses an access in its page's last bytes), 20 a store, 24..21 bytes - 1, 31..25 the
+   words from the start of the access's translation to the word after its fast check. Then where that translation
+   starts, to run again after a refill, and where it ends, for the helper to come back to: in words from the start
+   of the JIT region. */
+typedef struct HvMemSite {
+    uint64_t pc;
+    uint32_t insn, op;
+    uint32_t retry, join;
+} HvMemSite;
+/* hv_mem_thunk (host/enter.S) has the record's size and offsets and the TLB check's constants as numbers. */
+_Static_assert(sizeof(HvMemSite) == 24 && offsetof(HvMemSite, op) == 12 && offsetof(HvMemSite, retry) == 16 &&
+               offsetof(HvMemSite, join) == 20, "HvMemSite layout");
+_Static_assert(HV_TLB_ADJ == 15 && HV_TLB_PAGE_BITS == 12, "TLB constants");
+
 typedef struct HvMachine {
     HvRam ram[HV_MAX_RAM];
     int nram;
@@ -288,6 +304,11 @@ typedef struct HvMachine {
     uint32_t **slot_site;    /* the B in each exit's stub that chaining rewrites to jump to the target */
     uint32_t **slot_stub;    /* what that B goes to while it isn't chained */
     uint32_t **slot_cond;    /* a conditional branch in a block's hot part that chaining may send straight to the target too */
+    uint64_t *slot_target;   /* the guest address the exit goes to: what hv_chain_thunk leaves for the dispatcher with */
+    /* What a load or store's out-of-line site (five words: translate.c, put_mem_site) leaves to hv_mem_thunk:
+       numbered like the slots, and started over with them at a flush. */
+    struct HvMemSite *mem_sites;
+    uint32_t nmem_sites, max_mem_sites;
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
