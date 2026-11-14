@@ -646,6 +646,8 @@ void hv_winvm_perf_snapshot(HvPerfSnap *s) {
     s->nblocks_now = m.nblocks;
     s->jit_used_kb_now = (uint64_t)m.jit.used * 4ull / 1024ull;
     s->jit_cap_kb_now = (uint64_t)m.jit.capacity * 4ull / 1024ull;
+    s->slots_now = m.nslots;
+    s->mem_sites_now = m.nmem_sites;
     s->inval_dev = st->inval_dev;
     s->inval_scanned = st->inval_scanned;
     s->code_writes = st->code_writes, s->code_write_hits = st->code_write_hits;
