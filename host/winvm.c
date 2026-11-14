@@ -257,12 +257,18 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     hv_net_detach();
     net_on = 0;
 
-    struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
-    ill.sa_sigaction = on_ill;
-    sigaction(SIGILL, &ill, &prior_ill);
-    sigaction(SIGBUS, &ill, &prior_bus);
-    sigaction(SIGSEGV, &ill, &prior_segv);
-    signal(SIGPIPE, SIG_IGN);
+    /* Once: a second sigaction would save on_ill itself as the handler a fault is handed on to, and a real fault
+       in a VM started again would then go round in on_ill for ever instead of reaching the crash reporter. */
+    static int handlers_set;
+    if (!handlers_set) {
+        struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
+        ill.sa_sigaction = on_ill;
+        sigaction(SIGILL, &ill, &prior_ill);
+        sigaction(SIGBUS, &ill, &prior_bus);
+        sigaction(SIGSEGV, &ill, &prior_segv);
+        signal(SIGPIPE, SIG_IGN);
+        handlers_set = 1;
+    }
 
     HvDisk *d0_ptr = NULL, *d1_ptr = NULL;
     if (c->disk0 && *c->disk0) {
