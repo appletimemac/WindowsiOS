@@ -507,6 +507,7 @@ static void *cpu0_thread(void *unused) {
     int r = hv_winvm_run_cpu0();
     atomic_store(&stop_requested, 1);
     join_secondaries();
+    hv_winvm_flush_disks(); /* again: the other CPUs could still write after CPU 0's sync, until they were joined */
     if (exit_cb) exit_cb(r);
     return NULL;
 }
