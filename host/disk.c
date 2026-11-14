@@ -87,6 +87,7 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
     struct stat st;
     if (fstat(d->fd, &st) != 0 || (uint64_t)st.st_size < offset) {
         close(d->fd);
+        d->fd = -1; /* not the number of a closed descriptor, which hv_disk_close would close again as someone else's */
         return -1;
     }
     d->offset = offset;
