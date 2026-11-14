@@ -252,6 +252,10 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
         return fail(err, errlen, "UEFI firmware (code.fd) and NVRAM (vars.fd) are required.");
 
     atomic_store(&stop_requested, 0);
+    /* A VM started before in this process left its network running, and that network's thread wakes the machine
+       that is set up again below: end it first. */
+    hv_net_detach();
+    net_on = 0;
 
     struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
     ill.sa_sigaction = on_ill;
