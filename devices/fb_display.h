@@ -116,6 +116,9 @@ void hv_fb_metal_set_layer(HvFbDisplay *fb, void *ca_metal_layer);
    nothing around it is left black. Width or height 0: the whole layer, letterboxed in black (the default). */
 void hv_fb_metal_set_content(HvFbDisplay *fb, double x, double y, double w, double h);
 uint64_t hv_fb_metal_frames(HvFbDisplay *fb);
+/* Ends what draws this display: its link to the layer, its thread and its textures. Returns when no draw from it
+   is in flight any more. The display itself stays, and a later set_layer or set_content starts a new presenter. */
+void hv_fb_metal_release(HvFbDisplay *fb);
 int hv_fb_save_png(HvFbDisplay *fb, const char *path);
 
 #endif

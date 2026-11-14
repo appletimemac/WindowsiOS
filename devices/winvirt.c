@@ -120,6 +120,17 @@ static void uart_stdout_cb(void *opaque, uint8_t c) {
     if (c == '\n') fflush(stderr);
 }
 
+void hv_winvirt_release(HvWinVirt *b) {
+    if (b->gpu) hv_virtio_gpu_reset(b->gpu); /* frees its copies of the surfaces and takes the scanout off the display */
+    if (b->fb) b->fb->active = 0;
+    hv_pflash_close(b->flash0);
+    hv_pflash_close(b->flash1);
+    if (b->prefault_started) pthread_join(b->prefault_tid, NULL); /* it reads the RAM that goes next */
+    if (b->ram_owned && b->ram) munmap(b->ram, b->ram_size);
+    free(b->dtb);
+    memset(b, 0, sizeof *b);
+}
+
 int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_t ram_size,
                       void *prealloc_ram, const char *code_fd_path, const char *vars_fd_path,
                       HvDisk *disk0, HvDisk *disk1, const uint8_t mac[6], int enable_sound) {
@@ -149,15 +160,18 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
             if (a) {
                 a->ram = b->ram;
                 a->size = ram_size;
-                pthread_t t;
-                if (pthread_create(&t, NULL, prefault_thread, a) == 0) pthread_detach(t);
+                if (pthread_create(&b->prefault_tid, NULL, prefault_thread, a) == 0) b->prefault_started = 1;
                 else free(a);
             }
         }
     }
     if (b->ram == MAP_FAILED)
         b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (b->ram == MAP_FAILED) return -1;
+    if (b->ram == MAP_FAILED) {
+        b->ram = NULL;
+        return -1;
+    }
+    b->ram_owned = !prealloc_ram;
 
     /* 2. Build Flattened Device Tree (placed at 0x40000000 on every reset) */
     b->dtb = hv_fdt_build_virt(b->ncpus, WINVIRT_RAM_PA, ram_size, &b->dtb_size);

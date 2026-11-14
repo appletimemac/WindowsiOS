@@ -274,6 +274,7 @@ void hv_machine_free(HvMachine *m) {
         free(m->ram[i].code_pages);
         free(m->ram[i].chain_in);
         free(m->ram[i].page_gen);
+        free(m->ram[i].whint);
         free(m->ram[i].code_grains);
         free(m->ram[i].code_miss);
         free(m->ram[i].code_hot);
@@ -300,6 +301,7 @@ void hv_machine_free(HvMachine *m) {
     free(m->slot_xnext);
     free(m->slot_target);
     free(m->mem_sites);
+    memset(m, 0, sizeof *m); /* nothing of it is left to follow: a machine that is not set up again stays empty */
 }
 
 int hv_machine_add_ram(HvMachine *m, uint64_t pa, uint64_t size, void *host, int readonly) {
