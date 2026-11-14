@@ -99,6 +99,7 @@ static uint64_t tick_locked(HvMachine *m, HvCpu *cpu) {
     b->tick0_last = now;
     hv_pl031_tick(b->rtc);
     if (b->poll) b->poll();
+    if (b->gpu) hv_virtio_gpu_tick(b->gpu, now);
     hv_xhci_poll(b->usb);
     if (b->hda) hv_hda_poll(b->hda);
     if (b->snd) hv_virtio_snd_poll(b->snd);

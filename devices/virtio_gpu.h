@@ -49,6 +49,8 @@ typedef struct HvVirtioGpu {
     HvVirtio vio;
     HvFbDisplay *fb;
     uint32_t width, height;            /* the size the guest is told to use */
+    uint64_t told_at;                  /* host ticks when it was last told while showing another size; 0: not waiting */
+    uint32_t told_again;               /* times it was told this size again (hv_virtio_gpu_tick) */
     uint8_t edid[128];
     HvVgpuRes res[HV_VGPU_MAX_RESOURCES];
     uint64_t host_bytes;               /* pixel memory held by the resources */
@@ -69,6 +71,13 @@ HvVirtioGpu *hv_virtio_gpu_create(HvMachine *m, HvPcie *bus, HvFbDisplay *fb);
 /* Any thread (takes the device lock): the guest should render at this size (clamped to even values in
    640x480..3840x2160). Unchanged sizes do nothing. */
 void hv_virtio_gpu_set_size(HvVirtioGpu *g, uint32_t width, uint32_t height);
+/* The board's tick, device lock held, now in host ticks (mach_absolute_time): a guest that still shows another size
+   three seconds after it was told one is told again, up to HV_VGPU_TOLD_AGAIN_MAX times for one size. Windows lets
+   the announcement go by when it comes while a session is starting (the part of its driver that changes the mode
+   is not up yet), and would otherwise keep the old size until the next change. */
+#define HV_VGPU_TOLD_AGAIN_TICKS (3ull * 24000000ull)
+#define HV_VGPU_TOLD_AGAIN_MAX 10u
+void hv_virtio_gpu_tick(HvVirtioGpu *g, uint64_t now);
 /* Any thread (takes the device lock): drop every resource, the scanout and the cursor, clear pending events (the driver
    reset the device, or the guest rebooted). */
 void hv_virtio_gpu_reset(HvVirtioGpu *g);

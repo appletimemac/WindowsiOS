@@ -534,6 +534,8 @@ static void do_reset(HvVirtio *v) {
     HvVirtioGpu *g = v->dev;
     if (!g) return;
     if (logging()) fprintf(stderr, "virtio-gpu: reset (%u resources, scanout %u)\n", (unsigned)(g->host_bytes != 0), g->scanout_res);
+    g->told_at = 0; /* a driver starting over reads the size for itself, and is told again if it then shows another */
+    g->told_again = 0;
     scanout_disable(g);
     for (int i = 0; i < HV_VGPU_MAX_RESOURCES; i++)
         if (g->res[i].id) res_free(g, &g->res[i]);
@@ -568,12 +570,34 @@ void hv_virtio_gpu_set_size(HvVirtioGpu *g, uint32_t w, uint32_t h) {
     if (w != g->width || h != g->height) {
         g->width = w;
         g->height = h;
+        g->told_at = 0;
+        g->told_again = 0;
         hv_virtio_gpu_build_edid(g->edid, w, h);
         set_events(g, rd32(g->vio.config) | EVENT_DISPLAY);
         hv_virtio_config_changed(&g->vio);
         if (logging()) fprintf(stderr, "virtio-gpu: display size now %ux%u\n", w, h);
     }
     hv_dev_unlock(g->vio.m);
+}
+
+void hv_virtio_gpu_tick(HvVirtioGpu *g, uint64_t now) {
+    if (!g) return;
+    if (!g->scanout_res || (g->scanout_w == g->width && g->scanout_h == g->height)) {
+        g->told_at = 0; /* nothing shown yet, or the size it was told: no wait is running */
+        return;
+    }
+    if (!g->told_at) { /* the wait starts with the first tick that sees the other size */
+        g->told_at = now ? now : 1;
+        return;
+    }
+    if (g->told_again >= HV_VGPU_TOLD_AGAIN_MAX || now - g->told_at < HV_VGPU_TOLD_AGAIN_TICKS) return;
+    g->told_at = now ? now : 1;
+    g->told_again++;
+    set_events(g, rd32(g->vio.config) | EVENT_DISPLAY);
+    hv_virtio_config_changed(&g->vio);
+    if (logging())
+        fprintf(stderr, "virtio-gpu: guest still at %ux%u, told %ux%u again (%u)\n", g->scanout_w, g->scanout_h, g->width,
+                g->height, g->told_again);
 }
 
 static void on_resize(void *opaque, uint32_t w, uint32_t h) {
