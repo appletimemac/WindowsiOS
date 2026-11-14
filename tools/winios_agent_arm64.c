@@ -16,6 +16,15 @@
  * It also asks `GET http://10.0.2.4/.henge/power` each round; "hibernate" (the app's Hibernate action, answered
  * once) runs shutdown /h, so Windows saves its session and powers off, and the next boot resumes it.
  *
+ * The posture reply may end in " scale=NNN", the scale the app wants Windows at, in percent. Windows takes its scale
+ * at sign-in, so the agent writes it down for the next one as the system-wide custom scale (LogPixels with
+ * Win8DpiScaling 1 under HKCU\Control Panel\Desktop, and under HKU\.DEFAULT for the sign-in screen), and with every
+ * poll it tells the app the scale this session runs at ("?scale=NNN"), which is what the app sizes the picture for.
+ * The display's own scale (Settings, Display, Scale) would change at once, but Windows only offers a display the
+ * scales that leave 600 units on its shorter side (Windows 11, read through DisplayConfigGetDeviceInfo: 1378x954
+ * goes up to 150 percent, 1378x899 to 125, 673x867 and 1378x480 only 100). That holds the small pictures, a folded
+ * phone's outer display and the half above the keyboard, at 100 percent. The custom scale has no such limit.
+ *
  * A second thread tells the app when to raise the iOS keyboard. It long-polls `GET /.henge/focus-wait`, which the
  * host answers when the user tapped the picture (with the tap's pixel) or typed Enter. It then asks UI Automation
  * (IUIAutomation::GetFocusedElement) whether the focused element takes text and whether the tap was inside it, and
@@ -25,6 +34,8 @@
  */
 #include <stdint.h>
 #include <stddef.h>
+
+#include "winios_agent_scale.h"
 
 typedef void *HANDLE;
 typedef void *HKEY;
@@ -51,8 +62,11 @@ typedef uintptr_t SOCKET;
 #define FILE_SHARE_READ      0x0001U
 #define FILE_SHARE_WRITE     0x0002U
 #define ERROR_ALREADY_EXISTS 183U
+#define HKEY_CURRENT_USER    ((HKEY)(uintptr_t)0x80000001ULL)
 #define HKEY_LOCAL_MACHINE   ((HKEY)(uintptr_t)0x80000002ULL)
+#define HKEY_USERS           ((HKEY)(uintptr_t)0x80000003ULL)
 #define KEY_QUERY_VALUE      0x0001U
+#define KEY_SET_VALUE        0x0002U
 #define REG_DWORD            4U
 #define DIGCF_PRESENT        0x00000002U
 #define DIGCF_DEVICEINTERFACE 0x00000010U
@@ -70,6 +84,8 @@ typedef uintptr_t SOCKET;
 #define BACKOFF_FAILED_MS    3000U
 #define BACKOFF_NOEFFECT_MS  10000U
 #define LOG_LINES_MAX        200
+#define SCALE_CHECK_ROUNDS   4      /* posture rounds between looks at the scale in the registry (about 2 s) */
+#define SCALE_LOGS_MAX       20
 #define FOCUS_WAIT_RECV_MS   12000U /* longer than the host's 8 s long poll */
 /* After a tap the agent looks at 200, 600 and 1400 ms until it finds text under the tap: a field that has to
    open first (the taskbar's search box) takes the focus late. The last look stays well inside the host's 2 s
@@ -154,6 +170,8 @@ __declspec(dllimport) LONG RegOpenKeyExW(HKEY hKey, const WCHAR *lpSubKey, DWORD
                                          DWORD samDesired, HKEY *phkResult);
 __declspec(dllimport) LONG RegQueryValueExW(HKEY hKey, const WCHAR *lpValueName, DWORD *lpReserved,
                                             DWORD *lpType, void *lpData, DWORD *lpcbData);
+__declspec(dllimport) LONG RegSetValueExW(HKEY hKey, const WCHAR *lpValueName, DWORD Reserved, DWORD dwType,
+                                          const void *lpData, DWORD cbData);
 __declspec(dllimport) LONG RegCloseKey(HKEY hKey);
 
 /* setupapi.dll */
@@ -180,6 +198,7 @@ __declspec(dllimport) int    closesocket(SOCKET s);
 
 /* user32.dll */
 __declspec(dllimport) BOOL SetProcessDpiAwarenessContext(HANDLE value);
+__declspec(dllimport) uint32_t GetDpiForSystem(void);
 
 /* ole32.dll */
 __declspec(dllimport) int32_t CoInitializeEx(void *pvReserved, DWORD dwCoInit);
@@ -243,6 +262,28 @@ static void u32_to_dec(uint32_t v, char *out) {
     } while (v > 0 && n < 15);
     for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
     out[n] = 0;
+}
+
+static size_t append_str(char *out, size_t at, size_t cap, const char *s) {
+    while (*s && at + 1 < cap) out[at++] = *s++;
+    out[at] = 0;
+    return at;
+}
+
+static size_t append_u64(char *out, size_t at, size_t cap, uint64_t v) {
+    char num[24];
+    int n = 0;
+    do {
+        num[n++] = (char)('0' + (v % 10U));
+        v /= 10U;
+    } while (v > 0 && n < 23);
+    num[n] = 0;
+    for (int i = 0; i < n / 2; i++) {
+        char t = num[i];
+        num[i] = num[n - 1 - i];
+        num[n - 1 - i] = t;
+    }
+    return append_str(out, at, cap, num);
 }
 
 /* Logs state changes only, and stops after LOG_LINES_MAX lines so a stuck loop can't fill the disk. */
@@ -336,14 +377,23 @@ static int starts_with(const char *s, int len, const char *word) {
     return 1;
 }
 
-/* 1 laptop, 0 tablet, -1 if the share can't be reached yet or answers anything else. */
-static int fetch_posture(void) {
-    static const char req[] = "GET /.henge/posture HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n";
+/* 1 laptop, 0 tablet, -1 if the share can't be reached yet or answers anything else. The request says what scale
+   this session runs at (Windows fixed it at sign-in, before the agent started; 96 dots per inch is 100 percent).
+   The reply is the posture word, then " scale=NNN" when the app wants a scale: *wanted_scale gets it, or 0. */
+static int fetch_posture(int *wanted_scale) {
+    static char req[112];
+    static size_t req_len;
+    if (!req_len) {
+        req_len = append_str(req, 0, sizeof(req), "GET /.henge/posture?scale=");
+        req_len = append_u64(req, req_len, sizeof(req), agent_scale_percent(GetDpiForSystem()));
+        req_len = append_str(req, req_len, sizeof(req), " HTTP/1.1\r\nHost: 10.0.2.4\r\nConnection: close\r\n\r\n");
+    }
     char body[64];
-    int n = share_get(req, (int)sizeof(req) - 1, body, (int)sizeof(body), 1500);
-    if (starts_with(body, n, "laptop")) return 1;
-    if (starts_with(body, n, "tablet")) return 0;
-    return -1;
+    int n = share_get(req, (int)req_len, body, (int)sizeof(body), 1500);
+    int laptop = starts_with(body, n, "laptop");
+    if (!laptop && !starts_with(body, n, "tablet")) return -1;
+    *wanted_scale = agent_scale_parse(body + 6, n - 6); /* both words are six letters */
+    return laptop;
 }
 
 /* 1 when the app asked Windows to hibernate (the host answers that once), else 0. */
@@ -610,28 +660,6 @@ static void evaluate_focus(void *uia, int x, int y, int *editable, int *inside) 
     com_release(el);
 }
 
-static size_t append_str(char *out, size_t at, size_t cap, const char *s) {
-    while (*s && at + 1 < cap) out[at++] = *s++;
-    out[at] = 0;
-    return at;
-}
-
-static size_t append_u64(char *out, size_t at, size_t cap, uint64_t v) {
-    char num[24];
-    int n = 0;
-    do {
-        num[n++] = (char)('0' + (v % 10U));
-        v /= 10U;
-    } while (v > 0 && n < 23);
-    num[n] = 0;
-    for (int i = 0; i < n / 2; i++) {
-        char t = num[i];
-        num[i] = num[n - 1 - i];
-        num[n - 1 - i] = t;
-    }
-    return append_str(out, at, cap, num);
-}
-
 /* "<seq> <kind> <x> <y>" as focus-wait answers. Returns 0 and fills the outputs, or -1. kind: 0 none, 1 tap, 2 look. */
 static int parse_focus_event(const char *s, uint64_t *seq, int *kind, int *x, int *y) {
     uint64_t v = 0;
@@ -741,6 +769,53 @@ static DWORD focus_thread(void *arg) {
     }
 }
 
+/* ---- display scale ---- */
+
+/* Makes percent the custom scale under one Control Panel\Desktop key: 1 if it wrote it, 0 if it was there already,
+   -1 if it could not. */
+static int scale_write(HKEY root, const WCHAR *subkey, int percent) {
+    HKEY hk = NULL;
+    if (RegOpenKeyExW(root, subkey, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &hk) != 0 || !hk) return -1;
+    const DWORD dpi = agent_scale_dpi(percent), on = 1;
+    DWORD type = 0, data = 0, size = sizeof(data);
+    int there = RegQueryValueExW(hk, u"LogPixels", NULL, &type, &data, &size) == 0 && type == REG_DWORD && data == dpi;
+    type = 0, data = 0, size = sizeof(data);
+    there = there && RegQueryValueExW(hk, u"Win8DpiScaling", NULL, &type, &data, &size) == 0 && type == REG_DWORD &&
+            data == on;
+    int result = 0;
+    if (!there) {
+        LONG a = RegSetValueExW(hk, u"LogPixels", 0, REG_DWORD, &dpi, sizeof(dpi));
+        LONG b = RegSetValueExW(hk, u"Win8DpiScaling", 0, REG_DWORD, &on, sizeof(on));
+        result = a == 0 && b == 0 ? 1 : -1;
+    }
+    RegCloseKey(hk);
+    return result;
+}
+
+/* One posture round's share of the scale: writes down what the app wants when it first says or changes it, then
+   looks again every SCALE_CHECK_ROUNDS rounds and puts it back if something else changed it (the Tools installer
+   writes 150 percent). With nothing from the app, an app from before the setting, Windows' scale is left alone. */
+static void scale_round(int wanted) {
+    static int checked_for, rounds, writes_logged, failure_logged;
+    if (!wanted) return;
+    if (wanted == checked_for && ++rounds < SCALE_CHECK_ROUNDS) return;
+    rounds = 0;
+    checked_for = wanted;
+
+    int wrote = scale_write(HKEY_CURRENT_USER, u"Control Panel\\Desktop", wanted);
+    /* The sign-in screen's copy; nothing depends on it. */
+    scale_write(HKEY_USERS, u".DEFAULT\\Control Panel\\Desktop", wanted);
+    if (wrote > 0 && writes_logged < SCALE_LOGS_MAX) {
+        char num[16];
+        u32_to_dec((uint32_t)wanted, num);
+        log_line("scale_written ", num);
+        writes_logged++;
+    } else if (wrote < 0 && !failure_logged) {
+        log_line("scale_write_failed", "");
+        failure_logged = 1;
+    }
+}
+
 void WinMainCRTStartup(void) {
     /* Before any window or COM use: UI Automation then reports physical pixels. */
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -762,7 +837,8 @@ void WinMainCRTStartup(void) {
     DWORD last_failure_err = 0;
 
     for (;;) {
-        int want = fetch_posture();
+        int scale = 0;
+        int want = fetch_posture(&scale);
         if (want < 0) {
             if (share_up) log_line("share_unreachable", "");
             share_up = 0;
@@ -798,6 +874,7 @@ void WinMainCRTStartup(void) {
                     next_toggle_at = landed ? 0 : GetTickCount64() + BACKOFF_NOEFFECT_MS;
                 }
             }
+            scale_round(scale);
         }
         Sleep(POLL_MS);
     }

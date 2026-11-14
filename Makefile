@@ -24,7 +24,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
 
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
              $(B)/test_mmu $(B)/test_exc $(B)/test_virtio_gpu $(B)/test_xhci_touch $(B)/test_its $(B)/test_nvme $(B)/test_disk_grow \
-             $(B)/test_share_focus
+             $(B)/test_share $(B)/test_net_restart
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -70,8 +70,11 @@ $(B)/test_nvme: tests/test_nvme.c $(ENGINE) $(B)/nvme.o $(B)/pcie.o $(B)/gicv3.o
 $(B)/test_disk_grow: tests/test_disk_grow.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_disk_grow.c $(ENGINE) -o $@
 
-$(B)/test_share_focus: tests/test_share_focus.c $(B)/share.o
-	$(CC) $(CFLAGS) tests/test_share_focus.c $(B)/share.o -o $@
+$(B)/test_share: tests/test_share.c tools/winios_agent_scale.h $(B)/share.o
+	$(CC) $(CFLAGS) tests/test_share.c $(B)/share.o -o $@
+
+$(B)/test_net_restart: tests/test_net_restart.c $(B)/net_slirp.o
+	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_restart.c $(B)/net_slirp.o $(SLIRP_LIBS) -o $@
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@
@@ -136,7 +139,7 @@ SETUPAPI_IMPORTS = SetupDiDestroyDeviceInfoList SetupDiEnumDeviceInterfaces Setu
                    SetupDiGetDeviceInterfaceDetailW
 OLE32_IMPORTS = CoCreateInstance CoInitializeEx
 OLEAUT32_IMPORTS = SafeArrayAccessData SafeArrayUnaccessData VariantClear
-USER32_IMPORTS = SetProcessDpiAwarenessContext
+USER32_IMPORTS = GetDpiForSystem SetProcessDpiAwarenessContext
 
 empty :=
 space := $(empty) $(empty)
@@ -161,7 +164,7 @@ $(B)/opt_hive_arm64.exe: tools/opt_hive_arm64.c $(WL)/kernel32.lib $(WL)/advapi3
 	$(WIN_CC) -Wl,/entry:mainCRTStartup -Wl,/subsystem:console $< $(WL)/kernel32.lib $(WL)/advapi32.lib -o $@
 $(B)/winios_browser_arm64.exe: tools/winios_browser_arm64.c $(WL)/kernel32.lib $(WL)/ws2_32.lib
 	$(WIN_CC) -Wl,/entry:WinMainCRTStartup -Wl,/subsystem:windows $< $(WL)/kernel32.lib $(WL)/ws2_32.lib -o $@
-$(B)/winios_agent_arm64.exe: tools/winios_agent_arm64.c $(WL)/kernel32.lib $(WL)/advapi32.lib $(WL)/ws2_32.lib $(WL)/setupapi.lib \
+$(B)/winios_agent_arm64.exe: tools/winios_agent_arm64.c tools/winios_agent_scale.h $(WL)/kernel32.lib $(WL)/advapi32.lib $(WL)/ws2_32.lib $(WL)/setupapi.lib \
     $(WL)/ole32.lib $(WL)/oleaut32.lib $(WL)/user32.lib
 	$(WIN_CC) -Wl,/entry:WinMainCRTStartup -Wl,/subsystem:windows $< $(WL)/kernel32.lib $(WL)/advapi32.lib \
 	    $(WL)/ws2_32.lib $(WL)/setupapi.lib $(WL)/ole32.lib $(WL)/oleaut32.lib $(WL)/user32.lib -o $@

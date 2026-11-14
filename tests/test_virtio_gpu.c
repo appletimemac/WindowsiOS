@@ -837,6 +837,86 @@ static void test_reset(void) {
     driver_init(); /* as the next OS's driver would */
 }
 
+/* A guest that goes on showing another size than it was told is told again: Windows lets an announcement go by
+   while a session is starting, and the same size is never announced twice otherwise. */
+static void tick_at(uint64_t t) {
+    hv_dev_lock(&m);
+    hv_virtio_gpu_tick(gpu, t);
+    hv_dev_unlock(&m);
+}
+static uint32_t event_and_clear(void) {
+    uint32_t ev = (uint32_t)bar_read(0x2000, 4);
+    bar_read(ISR, 1);
+    bar_write(0x2000 + 4, 1, 4);
+    return ev;
+}
+static void test_told_again(void) {
+    const uint64_t S = HV_VGPU_TOLD_AGAIN_TICKS / 3, T = 1000 * S; /* a second of host ticks; some time after boot */
+    hv_fb_display_request_size(fb, 800, 600);
+    event_and_clear();
+    check("create 800x600", create_2d(30, 2, 800, 600), 0x1100);
+    check("scanout 800x600", set_scanout(0, 30, 0, 0, 800, 600), 0x1100);
+    tick_at(T);
+    check("showing the size it was told: nothing to say", event_and_clear(), 0);
+
+    hv_fb_display_request_size(fb, 1000, 700);
+    check("a new size is announced", event_and_clear(), 1);
+    tick_at(T + S); /* the wait starts with this tick */
+    tick_at(T + 3 * S);
+    check("not again before three seconds", event_and_clear(), 0);
+    check("nor counted", gpu->told_again, 0);
+    tick_at(T + 4 * S);
+    check("told again after three seconds at the old size", bar_read(0x2000, 4), 1);
+    check("with an interrupt", gpu->vio.pci.intx, 1);
+    check("which reads as a config change", bar_read(ISR, 1), 3);
+    event_and_clear();
+    check("counted", gpu->told_again, 1);
+    tick_at(T + 6 * S);
+    check("the next wait is three seconds too", event_and_clear(), 0);
+    tick_at(T + 7 * S);
+    check("told a second time", event_and_clear(), 1);
+
+    check("create 1000x700", create_2d(31, 2, 1000, 700), 0x1100);
+    check("the guest follows", set_scanout(0, 31, 0, 0, 1000, 700), 0x1100);
+    tick_at(T + 20 * S);
+    check("nothing more once it shows the size", event_and_clear(), 0);
+    check("and no wait is left running", gpu->told_at, 0);
+
+    check("create 1000x600", create_2d(32, 2, 1000, 600), 0x1100);
+    check("the guest goes to another height on its own", set_scanout(0, 32, 0, 0, 1000, 600), 0x1100);
+    tick_at(T + 30 * S);
+    check("which starts a new wait, not an announcement", event_and_clear(), 0);
+    tick_at(T + 33 * S);
+    check("then it is told again", event_and_clear(), 1);
+    uint32_t told = 0;
+    for (uint64_t t = T + 36 * S; t < T + 200 * S; t += 3 * S) {
+        tick_at(t);
+        told += event_and_clear();
+    }
+    check("but not for ever", gpu->told_again, HV_VGPU_TOLD_AGAIN_MAX);
+    check("each of those was announced", told, HV_VGPU_TOLD_AGAIN_MAX - 3);
+
+    hv_fb_display_request_size(fb, 1002, 702);
+    check("another size is announced", event_and_clear(), 1);
+    check("and starts the count over", gpu->told_again, 0);
+    tick_at(T + 300 * S);
+    tick_at(T + 303 * S);
+    check("told again for the new size", event_and_clear(), 1);
+
+    check("no scanout", set_scanout(0, 0, 0, 0, 0, 0), 0x1100);
+    tick_at(T + 400 * S);
+    tick_at(T + 403 * S);
+    check("a guest showing nothing is not told again", event_and_clear(), 0);
+
+    check("scanout 800x600 once more", set_scanout(0, 30, 0, 0, 800, 600), 0x1100);
+    tick_at(T + 500 * S);
+    bar_write(COMMON + 0x14, 0, 1); /* the driver resets the device */
+    check("a driver starting over starts the count over", gpu->told_again + gpu->told_at, 0);
+    driver_init();
+    hv_fb_display_request_size(fb, 1280, 900);
+    event_and_clear();
+}
+
 /* Host threads: a presenter taking frames and a window resizing, against the guest drawing. */
 static _Atomic int stop;
 
@@ -972,6 +1052,7 @@ int main(void) {
     test_fit();
     test_interrupts();
     test_reset();
+    test_told_again();
     test_threads();
 
     printf("%d checks, %d failures\n", checks, failures);

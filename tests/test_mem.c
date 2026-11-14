@@ -15,6 +15,7 @@ DECLARE_PROGRAM(loops);
 DECLARE_PROGRAM(epilogue);
 DECLARE_PROGRAM(dczva);
 DECLARE_PROGRAM(pageend);
+DECLARE_PROGRAM(edges);
 DECLARE_PROGRAM(groups);
 DECLARE_PROGRAM(mmio);
 extern const char mem_programs_begin[], mem_programs_finish[];
@@ -22,8 +23,18 @@ extern const char mem_programs_begin[], mem_programs_finish[];
 static const TestProgram programs[] = {
     TEST_PROGRAM(single), TEST_PROGRAM(stolen_mem), TEST_PROGRAM(pairs),   TEST_PROGRAM(simd_mem),
     TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
-    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
+    TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups), TEST_PROGRAM(edges),
 };
+
+/* How many accesses may reach the helper when the fast path is on. A refill, an exact recheck and the thunk that
+   runs them keep the rest in translated code, so a count above this means a slow path gave up (and below, that a
+   page-crossing access was done without the helper). */
+static const struct { const char *name; uint64_t calls; } helper_calls[] = {{"edges", 4}};
+
+/* Slot and site numbers start here in the "high numbers" mode: past 16 bits, as a long run's are. */
+#define HIGH_NUMBER 70000u
+#define FEW_SITES 3u
+#define FEW_SLOTS 2u
 
 #define DATA_SIZE 65536
 #define STACK_SIZE 65536
@@ -160,13 +171,31 @@ int main(void) {
     build_page_tables();
     m.trace = getenv("HV_TRACE") != NULL;
 
-    static const char *mode_names[] = {"C slow path", "fast path", "fast path, MMU on"};
+    static const char *mode_names[] = {"C slow path", "fast path", "fast path, MMU on", "fast, high numbers", "fast, few numbers"};
+    enum { MODES = 5 };
     size_t count = sizeof programs / sizeof programs[0];
     int failed = 0;
     static uint8_t native_data[DATA_SIZE];
-    for (int mode = 0; mode < 3; mode++) {
+    const uint32_t max_sites = m.max_mem_sites, max_slots = m.max_slots;
+    for (int mode = 0; mode < MODES; mode++) {
         m.slow_mem = mode == 0;
         hv_flush_blocks(&m);
+        if (mode && (m.nslots || m.nmem_sites)) { /* a flush starts the exits' slots and the sites over */
+            printf("  after a flush: %u slots and %u sites in use, expected none\n", m.nslots, m.nmem_sites);
+            failed++;
+        }
+        if (mode == 3) {
+            if (m.max_slots < HIGH_NUMBER + 4096 || m.max_mem_sites < HIGH_NUMBER + 4096) {
+                printf("  the tables are too small for the high numbers mode\n");
+                failed++;
+            }
+            m.nslots = m.nmem_sites = HIGH_NUMBER;
+        }
+        if (mode == 4) { /* the rest of the accesses take the long form, the rest of the exits do not chain */
+            m.max_mem_sites = FEW_SITES;
+            m.max_slots = FEW_SLOTS;
+            memset(&m.mem_sites[FEW_SITES], 0, sizeof m.mem_sites[0]); /* earlier modes used it */
+        }
         for (size_t i = 0; i < count; i++) {
             const TestProgram *p = &programs[i];
             static HvCpu init, native, jit;
@@ -180,6 +209,12 @@ int main(void) {
             m.stat_slow_mem = 0;
             int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : NULL);
             if (!bad) bad = compare_cpus(p->name, &native, &jit);
+            for (size_t k = 0; k < sizeof helper_calls / sizeof helper_calls[0] && !bad && mode && hv_knob[HV_K_RECHECK]; k++)
+                if (!strcmp(p->name, helper_calls[k].name) && m.stat_slow_mem != helper_calls[k].calls) {
+                    printf("  %s: %llu helper calls, expected %llu\n", p->name, (unsigned long long)m.stat_slow_mem,
+                           (unsigned long long)helper_calls[k].calls);
+                    bad = 1;
+                }
             for (size_t off = 0; off < DATA_SIZE && !bad; off += 8)
                 if (memcmp(native_data + off, data + off, 8) != 0) {
                     uint64_t a, b;
@@ -193,11 +228,24 @@ int main(void) {
                    (unsigned long long)m.stat_slow_mem);
             failed += bad != 0;
         }
+        if (mode == 4) { /* none past the limit: a site's record is written only when it has a number below it */
+            if (m.mem_sites[FEW_SITES].pc || m.mem_sites[FEW_SITES].op) {
+                printf("  a site was numbered past the limit\n");
+                failed++;
+            }
+            /* The counters stop there too: one that counted on would come round to numbers still in use. */
+            if (m.nmem_sites != FEW_SITES || m.nslots != FEW_SLOTS) {
+                printf("  %u sites and %u slots taken, expected the limits (%u and %u)\n", m.nmem_sites, m.nslots, FEW_SITES, FEW_SLOTS);
+                failed++;
+            }
+            m.max_mem_sites = max_sites;
+            m.max_slots = max_slots;
+        }
     }
     hv_machine_add_mmio(&m, 0x20000000, 0x1000, NULL, dev_read, dev_write, "test device");
     m.slow_mem = 0;
     failed += test_mmio(&m);
-    printf("%zu programs x 3 modes + mmio, %d failures, %llu chained exits\n", count, failed,
+    printf("%zu programs x %d modes + mmio, %d failures, %llu chained exits\n", count, (int)MODES, failed,
            (unsigned long long)m.stats.chained);
     return failed != 0;
 }

@@ -187,6 +187,103 @@ struct GuestSize: Hashable {
     var height: Int
 }
 
+/// How many Windows pixels the picture gets per point. Fewer is less work for Windows, more is sharper;
+/// Windows' own scale follows it (WindowsScale), so nothing on screen changes size. Windows takes a
+/// scale at sign-in, so a new density shows once Windows has restarted.
+enum DisplayDensity: String, CaseIterable {
+    case fast, standard, retina
+
+    var pixelsPerPoint: CGFloat {
+        switch self {
+        case .fast: return 1
+        case .standard: return 1.5
+        case .retina: return 2
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .fast: return "Fast"
+        case .standard: return "Standard"
+        case .retina: return "Retina"
+        }
+    }
+}
+
+/// How large Windows draws its text and controls. Standard is one Windows unit (a pixel at 100
+/// percent) to the point.
+enum DisplayUISize: String, CaseIterable {
+    case smaller, standard, larger
+
+    var factor: CGFloat {
+        switch self {
+        case .smaller: return 5.0 / 6
+        case .standard: return 1
+        case .larger: return 7.0 / 6
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .smaller: return "Smaller"
+        case .standard: return "Standard"
+        case .larger: return "Larger"
+        }
+    }
+}
+
+enum WindowsScale {
+    /// The scales the app asks Windows for, in percent. The agent in Windows takes none above these
+    /// (tools/winios_agent_scale.h).
+    static let steps = [100, 125, 150, 175, 200, 225, 250]
+
+    /// The scale that keeps Windows' units at `uiSize.factor` points each when the picture has
+    /// `pixelsPerPoint` guest pixels to the point: the nearest step, the lower one on a tie.
+    static func percent(pixelsPerPoint: CGFloat, uiSize: DisplayUISize) -> Int {
+        let wanted = Double(pixelsPerPoint * uiSize.factor) * 100
+        return steps.min { abs(Double($0) - wanted) < abs(Double($1) - wanted) } ?? 100
+    }
+
+    /// Guest pixels per point for the picture. Once Windows runs at the scale asked for, that is the
+    /// density setting exactly. Until it does (it takes a scale at sign-in, and `runningPercent` is
+    /// what its agent says it has now), the picture is sized for the scale Windows has, so its units
+    /// are already the size they will be. With no word from Windows yet (0): the setting, when its
+    /// Tools have reported a scale before (`toolsReport`: it is starting, at the scale they wrote
+    /// down); otherwise the density every Windows without such Tools was set up for.
+    static func pixelsPerPoint(density: DisplayDensity, uiSize: DisplayUISize, runningPercent: Int, toolsReport: Bool) -> CGFloat {
+        guard runningPercent > 0 else { return toolsReport ? density.pixelsPerPoint : GuestPicture.density }
+        let wanted = percent(pixelsPerPoint: density.pixelsPerPoint, uiSize: uiSize)
+        return density.pixelsPerPoint * CGFloat(runningPercent) / CGFloat(wanted)
+    }
+
+    /// What Settings says under the two display settings. `framebuffer` is what Windows draws now
+    /// and `drawnPixelsPerPoint` what the picture on screen really got, when there is one.
+    static func note(density: DisplayDensity, uiSize: DisplayUISize, toolsReport: Bool, windowsRunning: Bool,
+                     runningPercent: Int, framebuffer: GuestSize?, drawnPixelsPerPoint: CGFloat?) -> String {
+        var text = "Fast gives Windows fewer pixels to draw, so it runs lighter. Retina is the sharpest and the heaviest. Windows takes a change the next time it restarts."
+        guard toolsReport else {
+            return text + " These settings need the current WindowsiOS Tools installed in Windows."
+        }
+        if density == .fast, uiSize == .smaller {
+            // 100 percent is as low as Windows goes, and Fast is already there.
+            text += " At Fast, Smaller is the same as Standard."
+        }
+        guard windowsRunning, runningPercent > 0 else { return text }
+        let wanted = percent(pixelsPerPoint: density.pixelsPerPoint, uiSize: uiSize)
+        if runningPercent != wanted {
+            text += " It is at \(runningPercent) percent now and will be at \(wanted)."
+        } else if let framebuffer, framebuffer.width > 0 {
+            text += " It is at \(framebuffer.width) by \(framebuffer.height) pixels and \(runningPercent) percent."
+        }
+        let asked = pixelsPerPoint(density: density, uiSize: uiSize, runningPercent: runningPercent, toolsReport: toolsReport)
+        if let drawnPixelsPerPoint, drawnPixelsPerPoint > asked * 1.02 {
+            // Windows needs GuestPicture.minimum pixels whatever the display's size in points.
+            text += " This display is too small for so few pixels, so Windows looks smaller on it."
+        }
+        return text
+    }
+}
+
 /// The Windows picture sized from guest pixels: an even pixel count per axis, a canvas that holds
 /// exactly that many guest pixels, and a request to the guest for the same count, so the aspect-fit
 /// draw maps one to one once Windows has switched mode.
@@ -199,6 +296,12 @@ struct GuestPicture: Equatable {
     static let density: CGFloat = 1.5
     static let minimum = GuestSize(width: 640, height: 480)
     static let maximum = GuestSize(width: 3840, height: 2160)
+
+    /// Guest pixels per point as drawn: the density asked for, unless the guest's limits moved it
+    /// (a display narrower than the minimum needs gets more).
+    var pixelsPerPoint: CGFloat {
+        frame.width > 0 ? CGFloat(size.width) / frame.width : GuestPicture.density
+    }
 
     /// The largest even W by H with W/P and H/P inside `available`. The density P is the one asked
     /// for, moved only as far as the guest's limits need, and moved for both axes together so the

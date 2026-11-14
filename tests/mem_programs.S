@@ -368,6 +368,42 @@ PROGRAM pageend
     ldr x13, [x1, #64]
 END pageend
 
+// A page the TLB has not seen: a plain access refills it and runs again, with no helper, also when the address is
+// in the base register itself (the site passes that register on). Then accesses in the page's last bytes, which the
+// fast check refuses and the exact one has to accept: no helper either. Only the four that run into the next page
+// take it (test_mem.c counts them).
+PROGRAM edges
+    ldr x14, [x0, #0x1000]
+    str x14, [x0, #0x5008]
+    add x1, x0, #2, lsl #12
+    add x1, x1, #0x100
+    str x14, [x1]
+    ldr x2, [x1]
+    add x1, x1, #0xef8
+    ldr x2, [x1]
+    str x2, [x1]
+    add x3, x1, #4
+    ldr w4, [x3]
+    str w4, [x3]
+    add x5, x1, #7
+    ldrb w9, [x5]
+    strb w9, [x5]
+    add x10, x1, #6
+    ldrh w4, [x10]
+    strh w4, [x10]
+    sub x11, x1, #8
+    ldp x12, x13, [x11]
+    stp x13, x12, [x11]
+    ldr q16, [x11]
+    str q16, [x11]
+    ldr x2, [x11, #8]
+    str x2, [x11, #8]
+    ldur x14, [x1, #4]
+    stur x2, [x1, #5]
+    ldp x12, x13, [x1]
+    sturh w4, [x1, #7]
+END edges
+
 PROGRAM groups
     // Accesses grouped on one base (one TLB check for all): SP with writeback,
     // negative and unscaled offsets, sign-extending, pairs of q registers.

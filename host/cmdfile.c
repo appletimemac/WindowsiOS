@@ -262,6 +262,10 @@ int hv_cmdfile_exec(const HvCmdFile *cmd, const char *line) {
         hv_share_note_tap(code, yi);
     } else if (!strcmp(line, "notelook")) {
         hv_share_note_look();
+    } else if (sscanf(line, "scale %d", &code) == 1) {
+        hv_share_set_display_scale(code);
+    } else if (!strcmp(line, "agentscale")) {
+        fprintf(cmd->err, "AGENT_SCALE %d\n", hv_share_agent_display_scale());
     } else if (!strcmp(line, "touchready")) {
         fprintf(cmd->err, "TOUCH_READY %d\n", hv_winvm_touch_ready());
     } else if (sscanf(line, "combo %i %i", &code, &yi) == 2) {

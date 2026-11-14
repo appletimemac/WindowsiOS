@@ -531,6 +531,8 @@ static void usage(const char *prog) {
             "  win | winr | enter              Windows key, Win+R, Enter\n"
             "  size <w> <h>                    Ask the guest display for w x h pixels\n"
             "  posture laptop|tablet           Tablet mode follows this posture\n"
+            "  scale <percent>                 The scale Windows should take at its next sign-in, 100..500 (0: not set)\n"
+            "  agentscale                      Print the scale the agent says Windows runs at (AGENT_SCALE n, 0: none)\n"
             "  cad | power | hibernate         Ctrl+Alt+Del, ACPI power button, hibernate\n"
             "  screenshot <png>                Save the guest framebuffer\n"
             "  state <path>                    Save every vCPU's registers and recent exceptions\n"

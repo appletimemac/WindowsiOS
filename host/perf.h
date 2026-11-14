@@ -14,7 +14,7 @@
 #define HV_PERF_FIELDS(X)                                                                                  \
     X(t_ms) X(uptime_ms)                                                                                   \
     X(translations) X(blocks) X(block_flushes) X(flush_full) X(flush_smc) X(flush_ic) X(code_protects)   \
-    X(chained) X(chain_far) X(xchained_now) X(nblocks_now) X(jit_used_kb_now) X(jit_cap_kb_now)           \
+    X(chained) X(chain_far) X(xchained_now) X(nblocks_now) X(jit_used_kb_now) X(jit_cap_kb_now) X(slots_now) X(mem_sites_now)           \
     X(inval_dev) X(inval_scanned) X(inval_ns) X(stw_count) X(stw_ns) X(stw_max_us)                       \
     X(code_writes) X(code_write_hits) X(code_write_forced) X(code_retranslates) X(code_block_kills)        \
     X(diag_word) X(diag_same) X(diag_zero) X(diag_el1) X(diag_dev) X(diag_big) X(diag_g8) X(diag_g16)       \

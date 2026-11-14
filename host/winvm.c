@@ -252,6 +252,10 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
         return fail(err, errlen, "UEFI firmware (code.fd) and NVRAM (vars.fd) are required.");
 
     atomic_store(&stop_requested, 0);
+    /* A VM started before in this process left its network running, and that network's thread wakes the machine
+       that is set up again below: end it first. */
+    hv_net_detach();
+    net_on = 0;
 
     struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
     ill.sa_sigaction = on_ill;
@@ -298,6 +302,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     hv_winvirt_reset_cpu(&board);
 
     share_on = 0;
+    hv_share_clear_agent_display_scale(); /* whatever the last VM's Windows ran at, also when this one has no share */
     if (c->share_dir && *c->share_dir && c->share_sock && *c->share_sock) {
         hv_share_clear_hibernate();
 #if !TARGET_OS_IPHONE
@@ -641,6 +646,8 @@ void hv_winvm_perf_snapshot(HvPerfSnap *s) {
     s->nblocks_now = m.nblocks;
     s->jit_used_kb_now = (uint64_t)m.jit.used * 4ull / 1024ull;
     s->jit_cap_kb_now = (uint64_t)m.jit.capacity * 4ull / 1024ull;
+    s->slots_now = m.nslots;
+    s->mem_sites_now = m.nmem_sites;
     s->inval_dev = st->inval_dev;
     s->inval_scanned = st->inval_scanned;
     s->code_writes = st->code_writes, s->code_write_hits = st->code_write_hits;

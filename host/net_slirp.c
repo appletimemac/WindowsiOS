@@ -6,7 +6,11 @@
    timers. Frames the guest sends are queued to it (and the thread woken through
    a pipe); frames for the guest are queued the other way and handed to the
    virtio-net device on the CPU thread (hv_net_poll), which may only take them
-   when the guest has posted receive buffers. */
+   when the guest has posted receive buffers.
+
+   There is one network at a time: hv_net_detach ends it, and attaching ends the
+   one before first, so a VM started again in the same process does not leave the
+   last one's thread running on the new one's state. */
 #include "net_slirp.h"
 #include "share.h"
 
@@ -48,6 +52,10 @@ typedef struct Timer {
 } Timer;
 
 static Slirp *slirp;
+static pthread_t net_tid;
+static int net_started; /* net_tid is a thread that has to be joined */
+static int net_quit;    /* atomic: asks that thread to end */
+static int queues_made; /* the two queues' mutexes exist */
 static HvVirtioNet *net;
 static HvMachine *machine;
 static Queue to_guest, to_host;
@@ -167,11 +175,11 @@ void hv_net_add_hostfwd(int host_port, int guest_port) {
         if (pending_fwds[i].host_port == host_port) dup = 1;
     if (!dup && npending_fwds < 32)
         pending_fwds[npending_fwds++] = (FwdReq){host_port, guest_port};
-    pthread_mutex_unlock(&fwd_mu);
-    if (wake_pipe[1] > 0) {
+    if (wake_pipe[1] > 0) { /* under the lock: hv_net_detach closes the pipe under it */
         char c = 0;
         (void)!write(wake_pipe[1], &c, 1);
     }
+    pthread_mutex_unlock(&fwd_mu);
 }
 
 void hv_net_set_share_socket(const char *path) {
@@ -313,7 +321,7 @@ static const SlirpCb callbacks = {
 
 static void *net_thread(void *unused) {
     (void)unused;
-    for (;;) {
+    while (!__atomic_load_n(&net_quit, __ATOMIC_ACQUIRE)) {
         uint32_t timeout = 1000;
         int64_t now = now_ms();
         for (int i = 0; i < MAX_TIMERS; i++)
@@ -333,7 +341,8 @@ static void *net_thread(void *unused) {
         for (;;) {
             FwdReq req = {0, 0};
             pthread_mutex_lock(&fwd_mu);
-            if (npending_fwds > 0) req = pending_fwds[--npending_fwds];
+            /* Not once it is asked to end (the flag is set under this lock): that forward is the next network's. */
+            if (!__atomic_load_n(&net_quit, __ATOMIC_ACQUIRE) && npending_fwds > 0) req = pending_fwds[--npending_fwds];
             pthread_mutex_unlock(&fwd_mu);
             if (!req.host_port) break;
             int exists = 0;
@@ -399,11 +408,62 @@ void hv_net_poll(void) {
     }
 }
 
+static void queue_empty(Queue *q) {
+    for (; q->head != q->tail; q->head++) free(q->f[q->head % QUEUE].data);
+    q->head = q->tail = 0;
+    pthread_mutex_destroy(&q->mu);
+}
+
+/* Ends the network, or what a failed attach got as far as making: its thread, its libslirp with every socket and
+   timer it had, and what was queued either way. The VM's CPU threads have stopped (the caller sees to it), so
+   nothing else is using any of it. Without this each start added a thread, and from the second start on two of
+   them ran one libslirp (a double free in if_start within half a minute on a phone). The thread looks at net_quit
+   at least once a second, its longest poll. */
+void hv_net_detach(void) {
+    if (net_started) {
+        pthread_mutex_lock(&fwd_mu);
+        __atomic_store_n(&net_quit, 1, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&fwd_mu);
+        char c = 0;
+        (void)!write(wake_pipe[1], &c, 1);
+        pthread_join(net_tid, NULL);
+        net_started = 0;
+        __atomic_store_n(&net_quit, 0, __ATOMIC_RELEASE);
+    }
+    if (net) net->transmit = NULL; /* the device stays with its VM: nothing of this network may be called through it */
+    net = NULL;
+    if (slirp) slirp_cleanup(slirp);
+    slirp = NULL;
+    memset(timers, 0, sizeof timers);
+    if (queues_made) {
+        queue_empty(&to_guest);
+        queue_empty(&to_host);
+        queues_made = 0;
+    }
+    pthread_mutex_lock(&fwd_mu);
+    if (wake_pipe[1] > 0) { /* a pipe's writing end is never descriptor 0 */
+        close(wake_pipe[0]);
+        close(wake_pipe[1]);
+    }
+    wake_pipe[0] = wake_pipe[1] = 0;
+    nactive_fwds = 0; /* they were the old libslirp's: a port asked for again is forwarded again */
+    pthread_mutex_unlock(&fwd_mu);
+}
+
 int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
+    hv_net_detach();
     machine = m;
     pthread_mutex_init(&to_guest.mu, NULL);
     pthread_mutex_init(&to_host.mu, NULL);
-    if (pipe(wake_pipe) != 0) return -1;
+    queues_made = 1;
+    int ends[2];
+    if (pipe(ends) != 0) {
+        hv_net_detach();
+        return -1;
+    }
+    pthread_mutex_lock(&fwd_mu);
+    wake_pipe[0] = ends[0], wake_pipe[1] = ends[1];
+    pthread_mutex_unlock(&fwd_mu);
     fcntl(wake_pipe[0], F_SETFL, O_NONBLOCK);
     fcntl(wake_pipe[1], F_SETFL, O_NONBLOCK);
     SlirpConfig cfg;
@@ -419,7 +479,10 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     cfg.if_mtu = 1500;
     cfg.if_mru = 1500;
     slirp = slirp_new(&cfg, &callbacks, NULL);
-    if (!slirp) return -1;
+    if (!slirp) {
+        hv_net_detach();
+        return -1;
+    }
     if (getenv("HV_NET_FWD")) { /* debugging: "hostport:guestport", from this Mac's loopback into the guest */
         int hp, gp;
         struct in_addr h, g;
@@ -434,9 +497,12 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
         inet_pton(AF_INET, HV_SHARE_ADDR, &addr);
         if (slirp_add_unix(slirp, share_socket, &addr, 80) != 0) fprintf(stderr, "hengevm: net: no route to the shared folder\n");
     }
+    if (pthread_create(&net_tid, NULL, net_thread, NULL) != 0) {
+        hv_net_detach();
+        return -1;
+    }
+    net_started = 1;
     net = n;
-    n->transmit = transmit;
-    pthread_t t;
-    pthread_create(&t, NULL, net_thread, NULL);
+    n->transmit = transmit; /* last: the guest can only send into a network that is all there */
     return 0;
 }

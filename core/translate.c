@@ -85,6 +85,12 @@ typedef struct {
     LitFix fix[MAX_LITS];
     uint32_t nfix;
     Ool ool[MAX_OOL];
+    /* Compact slow-path sites (put_mem_site): their HvMemSite is written when the block has its place. */
+    struct {
+        uint32_t idx, retry, join, insn, op;
+        uint64_t pc;
+    } msite[MAX_OOL];
+    uint32_t nmsite;
     uint32_t nool;
     struct { uint32_t slot, at, flags, stub, cond_at; uint64_t target; uint8_t cold, stub_cold, has_cond, entry; } site[MAX_OOL]; /* chainable exits: their slot, the B chaining patches, its stub, where to; the hot part's conditional branch to it if chaining may patch that too */
     int site_direct;    /* the exit just written needs nothing done before its B: no check, no restores */
@@ -362,6 +368,17 @@ static uint64_t cross_addend(Emit *e, uint64_t target) {
     return (uint64_t)(uintptr_t)(ram->host + (page_pa - ram->pa)) - (target & ~((1ull << HV_TLB_PAGE_BITS) - 1));
 }
 
+/* The next number of a table that starts over at a flush (an exit's slot, a load or store's site), or ~0u when the
+   table is full. Translations run in parallel, and ones that are thrown away keep their numbers, so the counter
+   stops at the limit: left to count on, it would come round to numbers that blocks still use. */
+static uint32_t take_number(uint32_t *next, uint32_t limit) {
+    uint32_t n = __atomic_load_n(next, __ATOMIC_RELAXED);
+    do {
+        if (n >= limit) return ~0u;
+    } while (!__atomic_compare_exchange_n(next, &n, n + 1, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return n;
+}
+
 static int use_xjump(void) {
     static int v = -1; /* HV_INLINE_XJUMP: each direct branch to another page has its own cache lookup */
     if (v < 0) v = getenv("HV_INLINE_XJUMP") == NULL;
@@ -376,8 +393,7 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     int same_page = (target & ~((1ull << HV_TLB_PAGE_BITS) - 1)) == e->page;
     uint64_t xa = same_page ? 0 : cross_addend(e, target);
     if (same_page || xa) {
-        slot_index = __atomic_fetch_add(&e->m->nslots, 1, __ATOMIC_RELAXED); /* translations run in parallel */
-        if (slot_index >= e->m->max_slots) slot_index = ~0u; /* out of slots until the next flush: no chaining */
+        slot_index = take_number(&e->m->nslots, e->m->max_slots); /* none left until the next flush: no chaining */
     }
     if (slot_index == ~0u) {
         /* Another page may be remapped under us, so look it up by VA instead of chaining. */
@@ -388,8 +404,8 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
         }
         return;
     }
-    uint64_t *slot = &e->m->slots[slot_index];
-    *slot = 0;
+    e->m->slots[slot_index] = 0;
+    e->m->slot_target[slot_index] = target;
     e->m->slot_site[slot_index] = NULL; /* until placed: what it held is a dropped block's */
     e->m->slot_cond[slot_index] = NULL;
     e->m->slot_xa[slot_index] = xa;
@@ -436,12 +452,8 @@ static void put_branch_exit(Emit *e, uint64_t target, int plain) {
     if (check) link_here(e, to_exit, p0);
     put(e, STR_X(30, 28, HV_CPU_X(30)));
     put(e, LDR_X(15, 28, HV_CPU_CHAIN_THUNK));
-    if ((e->n & 1) == 0) put(e, 0xd503201f);                         /* nop: the data starts 8-byte aligned */
     put(e, BLR_X(15));
-    put(e, (uint32_t)(uintptr_t)slot);
-    put(e, (uint32_t)((uintptr_t)slot >> 32));
-    put(e, (uint32_t)target);
-    put(e, (uint32_t)(target >> 32));
+    put(e, slot_index); /* the thunk's data: which slot, and through it where the exit goes */
     if (xa) {
         link_here(e, to_miss, p0);
         if (use_xjump()) put_xjump(e, target, 0); /* exit_req was checked above if it had to be */
@@ -1156,8 +1168,9 @@ static void translate_mem_impl(Emit *e, uint32_t insn, uint64_t pc, int from_exc
     uint32_t rflags = can_refill ? 1u << 9 | (uint32_t)(host_align ? 1u << 10 : 0) |
                                    (uint32_t)(op.store ? 1 : 0) | (uint32_t)el_idx << 1 | (op.bytes - 1) << 3 : 0;
     put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .nrestore = 3, .restore = {A, T, U},
-                     /* The exact recheck for a page's last 15 bytes costs 6 words in every access's slow path; without it
-                        (HV_RECHECK=0, the default) such an access takes the refill, which sends it to the helper. */
+                     /* The exact recheck for a page's last 15 bytes, on unless HV_RECHECK=0: without it such an access
+                        takes the refill, which sends it to the helper. A compact site (put_mem_site) leaves the check
+                        to its thunk; the long form spends 6 words on it. */
                      .recheck = hv_knob[HV_K_RECHECK] && !host_align && op.bytes <= HV_TLB_ADJ + 1, .addr = (uint8_t)addr,
                      .t = (uint8_t)T, .u = (uint8_t)U, .bytes = (uint8_t)op.bytes,
                      .tag_off = tlb + (op.store ? 8 : 0), .retry = retry, .rflags = rflags});
@@ -1868,9 +1881,39 @@ static uint32_t link_site(Emit *e, uint32_t at) {
 }
 
 /* Written in the cold part; everything it branches back to is in the hot one. */
+/* A load or store's slow path in five words: save x30, the address into x6, a call of hv_mem_thunk, and the number
+   of the site's HvMemSite, which tells the thunk the rest (the exact check for a page's last bytes, the refill, the
+   helper: fourteen words and a pool entry when each site carries its own). The thunk counts on what every access
+   has by default: the address register's value in x6 (or copied there), the TLB slot of put_tlb_slot's table-major
+   layout in x7, x15 free, nothing spilled. 0: not this one (the long form follows). */
+static int put_mem_site(Emit *e, const Ool *o) {
+    uint8_t spilled[4];
+    if (e->flat || !hv_tlb_tmajor || o->nrestore != 3 || o->restore[0] != 6 || o->t != 7 || o->u != 15 ||
+        need_spill(o->restore, o->nrestore, spilled) || e->nmsite >= MAX_OOL)
+        return 0;
+    uint32_t cont = o->at + 1 - o->retry; /* from the start of the access to the word after its check */
+    int recheck = o->recheck && cont < 128 && o->bytes >= 1 && o->bytes <= 16;
+    if (o->recheck && !recheck) return 0;
+    uint32_t idx = take_number(&e->m->nmem_sites, e->m->max_mem_sites);
+    if (idx == ~0u) return 0; /* none left until the next flush */
+    link_site(e, o->at);
+    put(e, STR_X(30, 28, HV_CPU_X(30)));
+    if (o->addr != 6) put(e, MOV_X(6, o->addr));
+    put(e, LDR_X(15, 28, HV_CPU_MEM_THUNK));
+    put(e, BLR_X(15));
+    put(e, idx);
+    uint32_t op = HV_OP_MEM | o->rflags << 8;
+    if (recheck) op |= 1u << 19 | (uint32_t)(o->tag_off != HV_CPU_TLB) << 20 | (uint32_t)(o->bytes - 1) << 21 | cont << 25;
+    e->msite[e->nmsite].idx = idx, e->msite[e->nmsite].retry = o->retry, e->msite[e->nmsite].join = o->join;
+    e->msite[e->nmsite].insn = o->insn, e->msite[e->nmsite].op = op, e->msite[e->nmsite].pc = o->pc;
+    e->nmsite++;
+    return 1;
+}
+
 static void emit_ool(Emit *e) {
     for (uint32_t i = 0; i < e->nool; i++) {
         Ool *o = &e->ool[i];
+        if (o->kind == OOL_SLOW && put_mem_site(e, o)) continue;
         int refill = o->kind == OOL_SLOW && o->rflags;
         uint32_t retry = o->retry;
         if (refill && !e->flat) { /* the refill's way back counts words, so a word near it to go on from */
@@ -2058,7 +2101,7 @@ int hv_translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t a
 
 static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32_t avail, int nogroup) {
     Emit *e = &E;
-    e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = 0;
+    e->n = e->other_n = e->npool = e->nfix = e->nool = e->nsite = e->nrel = e->nmsite = 0;
     e->w = e->hot;
     e->in_cold = 0;
     e->flat = hv_knob[HV_K_TEST2];
@@ -2079,10 +2122,10 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
     int want_fwd = b->fwd != 0;
     b->fwd = 0;
     if (want_fwd && !e->flat) {
-        uint32_t slot_index = __atomic_fetch_add(&m->nslots, 1, __ATOMIC_RELAXED);
-        if (slot_index < m->max_slots) { /* else out of slots until the next flush: it goes with its page */
-            uint64_t *slot = &m->slots[slot_index];
-            *slot = 0;
+        uint32_t slot_index = take_number(&m->nslots, m->max_slots);
+        if (slot_index != ~0u) { /* else out of slots until the next flush: it goes with its page */
+            m->slots[slot_index] = 0;
+            m->slot_target[slot_index] = b->va;
             m->slot_site[slot_index] = NULL;
             m->slot_cond[slot_index] = NULL;
             m->slot_xa[slot_index] = 0;
@@ -2101,12 +2144,8 @@ static int translate_emit(HvMachine *m, HvBlock *b, const uint32_t *code, uint32
             e->site[e->nsite++].entry = 1;
             put(e, STR_X(30, 28, HV_CPU_X(30)));
             put(e, LDR_X(15, 28, HV_CPU_CHAIN_THUNK));
-            if ((e->n & 1) == 0) put(e, 0xd503201f); /* nop: the data starts 8-byte aligned */
             put(e, BLR_X(15));
-            put(e, (uint32_t)(uintptr_t)slot);
-            put(e, (uint32_t)((uintptr_t)slot >> 32));
-            put(e, (uint32_t)b->va);
-            put(e, (uint32_t)(b->va >> 32));
+            put(e, slot_index);
             cold_off(e);
             b->fwd = slot_index + 1;
         }
@@ -2212,6 +2251,12 @@ int hv_translate_place(HvMachine *m, HvBlock *b) {
     uint32_t pad = hv_knob[HV_K_TEST1] & ~1u; /* HV_K1: words of nothing after each block's hot part, to see what density is worth */
     uint32_t *dst, *cold;
     if (chunk_take(m, e->nhot + pad, e->ncold, &dst, &cold) != 0) return -1;
+    for (uint32_t k = 0; k < e->nmsite; k++) { /* before anything can run the block */
+        HvMemSite *s = &m->mem_sites[e->msite[k].idx];
+        s->pc = e->msite[k].pc, s->insn = e->msite[k].insn, s->op = e->msite[k].op;
+        s->retry = (uint32_t)(dst + e->msite[k].retry - m->jit.base);
+        s->join = (uint32_t)(dst + e->msite[k].join - m->jit.base);
+    }
     for (uint32_t k = 0; k < e->nrel; k++) {
         uint32_t at = e->rel[k].at, target = e->rel[k].target;
         if (e->rel[k].from_cold) patch_branch(&e->cold[at], (dst + target) - (cold + at));

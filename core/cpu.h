@@ -86,6 +86,9 @@ typedef struct HvCpu {
     uint64_t ijc_tab[16];    /* 0x440: each flags value's branch-cache table (ijc + flags * table size) */
     uint64_t gaddend[4];     /* 0x4c0: host addends of the pages groups of accesses on one base register were checked in (translate_mem) */
     uint64_t xjump_thunk;    /* 0x4e0: hv_xjump_thunk */
+    uint64_t slots;          /* 0x4e8: HvMachine.slots: an exit's stub names its slot by number (hv_chain_thunk) */
+    uint64_t slot_targets;   /* 0x4f0: HvMachine.slot_target: the guest address each exit goes to */
+    uint64_t mem_thunk;      /* 0x4f8: hv_mem_thunk */
     /* 0x500: what tags in the return tables (ret_tab) are xored with, [0] user, [1] kernel.
        Bits 63..48, as ijc_salt; a new value empties that half of the tables. */
     uint64_t ret_salt[2] __attribute__((aligned(128)));
@@ -95,6 +98,8 @@ typedef struct HvCpu {
     uint64_t vbar_el1;         /* 0x528 */
     uint64_t contextidr_el1;   /* 0x530 */
     uint64_t mdscr_el1;        /* 0x538 */
+    uint64_t mem_sites;        /* 0x540: HvMachine.mem_sites: a load or store's slow path names its HvMemSite by number */
+    uint64_t jit_base;         /* 0x548: the JIT region's start, which an HvMemSite counts words from */
     /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
@@ -215,6 +220,11 @@ typedef struct HvCpu {
 #define HV_CPU_MDSCR_EL1   0x538
 #define HV_CPU_GADDEND     0x4c0
 #define HV_CPU_XJUMP_THUNK 0x4e0
+#define HV_CPU_SLOTS       0x4e8
+#define HV_CPU_SLOT_TARGETS 0x4f0
+#define HV_CPU_MEM_THUNK   0x4f8
+#define HV_CPU_MEM_SITES   0x540
+#define HV_CPU_JIT_BASE    0x548
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -244,6 +254,11 @@ _Static_assert(offsetof(HvCpu, mdscr_el1) == HV_CPU_MDSCR_EL1, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, ret_tab) == HV_CPU_RET_TAB, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, gaddend) == HV_CPU_GADDEND, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, xjump_thunk) == HV_CPU_XJUMP_THUNK, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, slots) == HV_CPU_SLOTS, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, slot_targets) == HV_CPU_SLOT_TARGETS, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, mem_thunk) == HV_CPU_MEM_THUNK, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, mem_sites) == HV_CPU_MEM_SITES, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, jit_base) == HV_CPU_JIT_BASE, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tpidr_el0) == HV_CPU_TPIDR_EL0, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, daif) == HV_CPU_DAIF, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, far_el1) == HV_CPU_FAR_EL1, "HvCpu layout");

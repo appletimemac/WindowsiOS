@@ -79,6 +79,24 @@ final class VMViewModel: ObservableObject {
             if !autoKeyboard { keyboardFollowsFocus = false }
         }
     }
+    /// Settings: how many Windows pixels to the point, and how large Windows draws on them.
+    @Published var displayDensity = DisplayDensity(rawValue: UserDefaults.standard.string(forKey: VMViewModel.densityKey) ?? "") ?? .standard {
+        didSet {
+            UserDefaults.standard.set(displayDensity.rawValue, forKey: Self.densityKey)
+            sendWindowsScale()
+        }
+    }
+    @Published var displayUISize = DisplayUISize(rawValue: UserDefaults.standard.string(forKey: VMViewModel.uiSizeKey) ?? "") ?? .standard {
+        didSet {
+            UserDefaults.standard.set(displayUISize.rawValue, forKey: Self.uiSizeKey)
+            sendWindowsScale()
+        }
+    }
+    /// The scale Windows is running at, in percent, as WindowsiOS Tools reports it; 0 until it has.
+    @Published private(set) var windowsRunningScale = 0
+    /// The Tools in this Windows have reported a scale at some time, so they also follow the display
+    /// settings; ones from before the settings do neither.
+    @Published private(set) var toolsReportScale = UserDefaults.standard.bool(forKey: VMViewModel.toolsReportScaleKey)
     /// WindowsiOS Tools in this Windows reports text focus (an older agent does not).
     @Published var textFocusAgentPresent: Bool = false
     /// The deck is the keyboard while it shows, so text focus is not followed there.
@@ -92,6 +110,9 @@ final class VMViewModel: ObservableObject {
     private var keyboardSetByHandAt: TimeInterval = 0
     private var focusEventNotedAt: TimeInterval = 0
     private static let autoKeyboardKey = "winios.autoKeyboard"
+    private static let densityKey = "winios.displayDensity"
+    private static let uiSizeKey = "winios.displayUISize"
+    private static let toolsReportScaleKey = "winios.toolsReportScale"
     @Published var activeSafariURL: IdentifiableURL? = nil
     @Published var useSafariForOAuth: Bool = WinIOSBridge.shared.useSafariForGuestLinks
 
@@ -121,6 +142,7 @@ final class VMViewModel: ObservableObject {
             }
         }
         syncFromBridge()
+        sendWindowsScale()
         startOAuthPoller()
         // The app is only reported active from here on; the hand-off to StikDebug needs that.
         activeObserver = NotificationCenter.default.addObserver(
@@ -203,6 +225,23 @@ final class VMViewModel: ObservableObject {
         }
     }
 
+    /// The scale the settings ask Windows for, in percent.
+    var windowsWantedScale: Int {
+        WindowsScale.percent(pixelsPerPoint: displayDensity.pixelsPerPoint, uiSize: displayUISize)
+    }
+
+    /// Guest pixels per point for the picture: the density setting once Windows runs at its scale.
+    var pictureDensity: CGFloat {
+        WindowsScale.pixelsPerPoint(density: displayDensity, uiSize: displayUISize, runningPercent: windowsRunningScale,
+                                    toolsReport: toolsReportScale)
+    }
+
+    /// The agent in Windows picks the scale up with its next posture poll and writes it down for
+    /// Windows' next sign-in.
+    private func sendWindowsScale() {
+        WinIOSBridge.shared.setWindowsScalePercent(windowsWantedScale)
+    }
+
     // MARK: - Keyboard
 
     func toggleSystemKeyboard() {
@@ -257,6 +296,11 @@ final class VMViewModel: ObservableObject {
         vmStatusText = b.vmStatusText
         fbWidth = b.framebufferWidth
         fbHeight = b.framebufferHeight
+        windowsRunningScale = b.windowsRunningScalePercent
+        if windowsRunningScale > 0, !toolsReportScale {
+            toolsReportScale = true
+            UserDefaults.standard.set(true, forKey: Self.toolsReportScaleKey)
+        }
         presentedFrames = b.presentedFrames
         availableMemoryMB = b.availableMemoryMB
         guestRAMMB = b.guestRAMMB
