@@ -27,6 +27,12 @@ typedef struct HvWinVmConfig {
     int stats_interval;
 } HvWinVmConfig;
 
+/* Between these the VM is neither ended nor set up: hv_winvm_create waits for the unhold. For a thread other than
+   the one that starts VMs that reads the machine, the board or the guest's memory (a verb of the command file),
+   so that none of it is released under it. */
+void hv_winvm_hold(void);
+void hv_winvm_unhold(void);
+
 int hv_winvm_create(const HvWinVmConfig *cfg, char *err, size_t errlen);
 void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason));
 int hv_winvm_run_cpu0(void);

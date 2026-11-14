@@ -31,6 +31,10 @@ static HvWinVirt board;
 static HvDisk disk0 = {.fd = -1};
 static HvDisk disk1 = {.fd = -1};
 static int net_on;
+static int machine_made; /* m is a machine that hv_machine_free has to release before the next one is set up */
+static pthread_t kicker_tid;
+static int kicker_started; /* kicker_tid is the last start's kicker, to be joined before the next VM is set up */
+static void kicker_end(void);
 static int share_on;
 static _Atomic int stop_requested;
 
@@ -247,22 +251,69 @@ static void log_text_focus(unsigned long seq, int editable, int inside, void *ct
 }
 #endif
 
+/* The VM this process ran before has stopped: its CPU threads ended before its exit was reported. Everything else
+   of it is still there, and all of it ends here before the next one is set up, each part before what it uses.
+   Whatever is left costs the next start: the kicker and the network thread wake a machine that is being rebuilt,
+   the sound units go on reading the old sound device while the new one stays silent, the old display goes on
+   drawing into the layer from its own thread, and the flash banks, the machine's tables (hundreds of megabytes
+   after a full code cache) and the RAM are simply lost. The disks go too: the tools disk with what was written
+   over it. */
+static void previous_vm_end(void) {
+    kicker_end();
+    hv_net_detach();
+    net_on = 0;
+    hv_audio_shutdown();
+    os_unfair_lock_lock(&display_lock);
+    HvFbDisplay *fb = atomic_exchange_explicit(&display_fb, NULL, memory_order_acq_rel);
+    os_unfair_lock_unlock(&display_lock);
+    hv_fb_metal_release(fb);
+    hv_disk_close(&disk0);
+    hv_disk_close(&disk1);
+    hv_winvirt_release(&board);
+    if (machine_made) {
+        hv_machine_free(&m);
+        machine_made = 0;
+    }
+}
+
+static pthread_mutex_t life_mu = PTHREAD_MUTEX_INITIALIZER; /* held while a VM is ended and the next one set up */
+
+void hv_winvm_hold(void) {
+    pthread_mutex_lock(&life_mu);
+}
+
+void hv_winvm_unhold(void) {
+    pthread_mutex_unlock(&life_mu);
+}
+
+static int create_held(const HvWinVmConfig *c, char *err, size_t errlen);
+
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
+    hv_winvm_hold();
+    int r = create_held(c, err, errlen);
+    hv_winvm_unhold();
+    return r;
+}
+
+static int create_held(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)
         return fail(err, errlen, "UEFI firmware (code.fd) and NVRAM (vars.fd) are required.");
 
+    previous_vm_end();
     atomic_store(&stop_requested, 0);
-    /* A VM started before in this process left its network running, and that network's thread wakes the machine
-       that is set up again below: end it first. */
-    hv_net_detach();
-    net_on = 0;
 
-    struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
-    ill.sa_sigaction = on_ill;
-    sigaction(SIGILL, &ill, &prior_ill);
-    sigaction(SIGBUS, &ill, &prior_bus);
-    sigaction(SIGSEGV, &ill, &prior_segv);
-    signal(SIGPIPE, SIG_IGN);
+    /* Once: a second sigaction would save on_ill itself as the handler a fault is handed on to, and a real fault
+       in a VM started again would then go round in on_ill for ever instead of reaching the crash reporter. */
+    static int handlers_set;
+    if (!handlers_set) {
+        struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
+        ill.sa_sigaction = on_ill;
+        sigaction(SIGILL, &ill, &prior_ill);
+        sigaction(SIGBUS, &ill, &prior_bus);
+        sigaction(SIGSEGV, &ill, &prior_segv);
+        signal(SIGPIPE, SIG_IGN);
+        handlers_set = 1;
+    }
 
     HvDisk *d0_ptr = NULL, *d1_ptr = NULL;
     if (c->disk0 && *c->disk0) {
@@ -278,7 +329,11 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
 
     size_t jit = c->jit_bytes ? c->jit_bytes : ((size_t)768 << 20);
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
-    if (r != 0) return fail(err, errlen, "Cannot initialize ARM64 JIT region (is JIT active?).");
+    if (r != 0) {
+        hv_machine_free(&m); /* whatever it got as far as allocating */
+        return fail(err, errlen, "Cannot initialize ARM64 JIT region (is JIT active?).");
+    }
+    machine_made = 1;
 
 #if TARGET_OS_IPHONE
     /* Defer synchronous guest NVMe FLUSH fsyncs on iOS APFS NAND; explicit host checkpoints call hv_disk_sync(). */
@@ -501,16 +556,27 @@ static void *cpu0_thread(void *unused) {
     int r = hv_winvm_run_cpu0();
     atomic_store(&stop_requested, 1);
     join_secondaries();
+    hv_winvm_flush_disks(); /* again: the other CPUs could still write after CPU 0's sync, until they were joined */
     if (exit_cb) exit_cb(r);
     return NULL;
+}
+
+/* The kicker ends by itself within a kick period of the VM's stop; this waits for that, so that it is gone, not
+   only going, when the machine is released. */
+static void kicker_end(void) {
+    if (!kicker_started) return;
+    atomic_store(&stop_requested, 1);
+    pthread_mutex_lock(&kick_mu);
+    pthread_cond_signal(&kick_cv);
+    pthread_mutex_unlock(&kick_mu);
+    pthread_join(kicker_tid, NULL);
+    kicker_started = 0;
 }
 
 void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason)) {
     exit_cb = on_exit;
     spawn_secondaries();
-    pthread_t kt;
-    pthread_create(&kt, NULL, kicker_thread, NULL);
-    pthread_detach(kt);
+    kicker_started = pthread_create(&kicker_tid, NULL, kicker_thread, NULL) == 0;
     if (spawn_cpu0) {
         pthread_attr_t attr;
         pthread_attr_init(&attr);

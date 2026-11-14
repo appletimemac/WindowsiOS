@@ -60,6 +60,7 @@ typedef struct {
     CAMetalLayer *layer;
     CAMetalDisplayLink *link;
     NSThread *renderThread;
+    BOOL ended; /* render thread only: its loop stops */
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLRenderPipelineState> pipeLinear, pipeNearest, pipeCursor;
@@ -134,11 +135,22 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
     NSRunLoop *rl = [NSRunLoop currentRunLoop];
     /* A port keeps the run loop alive between display links. */
     [rl addPort:[NSMachPort port] forMode:NSDefaultRunLoopMode];
-    while (true) {
+    while (!ended) {
         @autoreleasepool {
             [rl runMode:NSDefaultRunLoopMode beforeDate:[NSDate distantFuture]];
         }
     }
+}
+
+/* Runs on the render thread, so no tick is in flight: the link goes and the thread's loop ends. */
+- (void)endOnRenderThread {
+    [link invalidate];
+    link = nil;
+    ended = YES;
+}
+
+- (void)dealloc {
+    free(shadow);
 }
 
 - (void)setTargetLayer:(CAMetalLayer *)newLayer {
@@ -389,9 +401,22 @@ void hv_fb_metal_set_content(HvFbDisplay *fb, double x, double y, double w, doub
 }
 
 uint64_t hv_fb_metal_frames(HvFbDisplay *fb) {
-    if (!fb || !fb->metal) return 0;
+    if (!fb) return 0;
+    pthread_mutex_lock(&fb->mu); /* a release takes the presenter out under this */
     HvFbMetalPresenter *p = (__bridge HvFbMetalPresenter *)fb->metal;
-    return atomic_load_explicit(&p->framesPresented, memory_order_relaxed);
+    uint64_t frames = p ? atomic_load_explicit(&p->framesPresented, memory_order_relaxed) : 0;
+    pthread_mutex_unlock(&fb->mu);
+    return frames;
+}
+
+void hv_fb_metal_release(HvFbDisplay *fb) {
+    if (!fb) return;
+    pthread_mutex_lock(&fb->mu);
+    HvFbMetalPresenter *p = (__bridge_transfer HvFbMetalPresenter *)fb->metal;
+    fb->metal = NULL;
+    pthread_mutex_unlock(&fb->mu);
+    if (!p) return;
+    [p performSelector:@selector(endOnRenderThread) onThread:p->renderThread withObject:nil waitUntilDone:YES];
 }
 
 int hv_fb_save_png(HvFbDisplay *fb, const char *path) {

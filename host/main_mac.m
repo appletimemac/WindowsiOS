@@ -42,10 +42,13 @@ static const uint16_t kMacToLinuxKey[128] = {
 };
 
 static volatile sig_atomic_t g_sig_stop = 0;
+/* The stop was asked for from outside the guest (a signal, the timeout, the quit verb): with --starts, no next start. */
+static volatile sig_atomic_t g_stop_asked = 0;
 
 static void on_sig(int sig) {
     (void)sig;
     g_sig_stop = 1;
+    g_stop_asked = 1;
     hv_winvm_stop();
 }
 
@@ -172,12 +175,22 @@ static void cmd_perf_row(void *opaque) {
 
 static void cmd_quit(void *opaque) {
     (void)opaque;
+    g_stop_asked = 1;
     hv_winvm_stop();
 }
 
 static int cmd_stopped(void *opaque) {
     (void)opaque;
     return g_sig_stop;
+}
+
+/* --starts: the VM ended (CPU 0's thread, after the other CPUs' threads). */
+static dispatch_semaphore_t g_headless_exit;
+static int g_headless_reason;
+
+static void on_vm_exit_headless(int reason) {
+    g_headless_reason = reason;
+    dispatch_semaphore_signal(g_headless_exit);
 }
 
 static void *cmd_file_thread(void *arg) {
@@ -237,6 +250,7 @@ static void *timer_thread(void *arg) {
                         ta->screenshot_path, elapsed, fw, fh, rc);
             }
             fprintf(stderr, "winvm: timeout (%ds) reached — stopping VM.\n", ta->timeout_sec);
+            g_stop_asked = 1;
             hv_winvm_stop();
             break;
         }
@@ -513,6 +527,8 @@ static void usage(const char *prog) {
             "  --screenshot <png>        Save guest framebuffer PNG\n"
             "  --screenshot-after <sec>  Save screenshot after N seconds\n"
             "  --timeout <sec>           Auto-stop VM after N seconds\n"
+            "  --starts <N>              Headless: when Windows shuts itself down, start it again in this process,\n"
+            "                            N starts in all, as the app's Start Windows does after a shutdown\n"
             "  --cmd-file <path>         Tail input commands from file (verbs below)\n"
             "  --perf-csv <path>         Append a row of performance counters to path (host/perf.h)\n"
             "  --perf-ms <n>             Milliseconds between perf rows (default: 1000); one more row when the VM stops\n"
@@ -559,6 +575,7 @@ int main(int argc, char **argv) {
     int headless = 0;
     uint64_t disk_gb = 0;
     TimerArgs targs = {NULL, 0, 0};
+    int starts = 1;
     const char *cmd_file = getenv("HV_INPUT_FILE");
     const char *perf_path = NULL;
     g_mono_zero = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
@@ -586,6 +603,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--screenshot"))   targs.screenshot_path = argv[++i];
         else if (!strcmp(argv[i], "--screenshot-after")) targs.screenshot_after = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--timeout"))      targs.timeout_sec = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--starts"))       starts = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cmd-file"))     cmd_file = argv[++i];
         else if (!strcmp(argv[i], "--stats"))        cfg.stats_interval = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--log"))          cfg.log = atoi(argv[++i]);
@@ -634,6 +652,29 @@ int main(int argc, char **argv) {
         pthread_t ct;
         pthread_create(&ct, NULL, cmd_file_thread, (void *)cmd_file);
         pthread_detach(ct);
+    }
+
+    if (headless && starts > 1) {
+        /* The app's way of running the VM (CPU 0 on its own thread, told when it ends), so that a second start goes
+           through what a tap on Start Windows goes through there: hv_winvm_create again, nothing torn down between. */
+        g_headless_exit = dispatch_semaphore_create(0);
+        for (int n = 1;; n++) {
+            fprintf(stderr, "winvm: start %d of %d, headless (%d vCPUs, %llu MB RAM)...\n", n, starts, cfg.ncpus,
+                    (unsigned long long)cfg.ram_mb);
+            hv_winvm_start(1, on_vm_exit_headless);
+            dispatch_semaphore_wait(g_headless_exit, DISPATCH_TIME_FOREVER);
+            fprintf(stderr, "\nwinvm: stopped (%s) after start %d\n",
+                    g_stop_asked ? "asked to" : hv_winvm_reason_name(g_headless_reason), n);
+            hv_winvm_flush_disks();
+            if (n >= starts || g_stop_asked) break;
+            if (hv_winvm_create(&cfg, err, sizeof err) != 0) {
+                fprintf(stderr, "winvm: failed to create VM again: %s\n", err);
+                return 1;
+            }
+            if (g_stop_asked) break; /* asked to stop while it was being set up: hv_winvm_create forgot that */
+        }
+        hv_ktlb_check_dump(stderr);
+        return 0;
     }
 
     if (headless) {

@@ -2,6 +2,7 @@
 #ifndef HV_WINVIRT_H
 #define HV_WINVIRT_H
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -61,6 +62,9 @@ typedef struct HvWinVirt {
 
     uint8_t *ram;
     uint64_t ram_size;
+    int ram_owned;           /* this board mapped the RAM (it was not handed in), and hv_winvirt_release unmaps it */
+    pthread_t prefault_tid;  /* touches every page of a file-backed RAM once */
+    int prefault_started;
     uint8_t *dtb;
     size_t dtb_size;
 
@@ -93,6 +97,12 @@ uint8_t *hv_alloc_no_footprint(uint64_t size);
 int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_t ram_size,
                       void *prealloc_ram, const char *code_fd_path, const char *vars_fd_path,
                       HvDisk *disk0, HvDisk *disk1, const uint8_t mac[6], int enable_sound);
+/* A board that has stopped gives back what the next one would otherwise leave behind: both flash banks (64 MiB
+   each, every page touched) with the NVRAM's descriptor, the GPU's copies of the guest's surfaces, and the guest's
+   RAM when this board mapped it. Nothing may still run on the board: its CPUs, its network and whatever draws its
+   display have ended, and its machine is still there. The devices' own small structures stay allocated (nothing
+   frees those yet). A board that was never created, or only partly, is fine. */
+void hv_winvirt_release(HvWinVirt *b);
 void hv_winvirt_reset_cpu(HvWinVirt *b);
 void hv_winvirt_power_button(HvWinVirt *b);
 

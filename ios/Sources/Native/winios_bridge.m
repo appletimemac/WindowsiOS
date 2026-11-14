@@ -47,6 +47,7 @@ static WinIOSBridge *s_shared_bridge = nil;
     uint64_t _perfLastExceptions, _perfLastUptime;
     unsigned _exceptionStormRows;
     BOOL _hangStateWritten;
+    int _restartsLeft; /* WINIOS_RESTARTS: starts still to make unasked after Windows shuts itself down (a test setting) */
 
     os_unfair_lock _metricsLock;
     CGSize _screenSizePts;
@@ -177,6 +178,8 @@ static void running_scale_changed(void *ctx) {
 - (instancetype)init {
     if ((self = [super init])) {
         apply_launch_env_file([self documentsPath]); /* before anything reads the environment */
+        const char *restarts = getenv("WINIOS_RESTARTS");
+        _restartsLeft = restarts ? atoi(restarts) : 0;
         _vmStatus = @"Idle";
         _metricsLock = OS_UNFAIR_LOCK_INIT;
         _screenSizePts = CGSizeZero;
@@ -908,6 +911,14 @@ static int sysctl_int(const char *name) {
     _vmStatus = [NSString stringWithFormat:@"Stopped (%@)", reason];
     dispatch_async(_diagQueue, ^{ [self writeDiagnosticsSnapshot]; });
     [self notifyChanged];
+    /* Test setting WINIOS_RESTARTS=N: Windows shut itself down, and it is started again as a tap on Start Windows
+       would start it, N times, so that a second start in one process can be checked from the Mac. */
+    if (_restartsLeft > 0 && [reason isEqualToString:@"halt"]) {
+        _restartsLeft--;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self prepareAndStartWithLayer:nil];
+        });
+    }
 }
 
 - (void)sendTouchContacts:(const WinIOSTouchContact *)contacts count:(NSInteger)count {

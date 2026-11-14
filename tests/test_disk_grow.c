@@ -87,6 +87,18 @@ int main(void) {
     check("the page made earlier is unharmed", hv_disk_read(&ro, 0, back, 512) == 0 && !memcmp(back, head, 512), 1);
     hv_disk_close(&ro);
 
+    /* A disk that failed to open holds no descriptor: the number of one it closed would be closed again, as
+       whatever else has it by then, when the VM that owns the disk is set up again. The file is 4096 bytes now. */
+    HvDisk bad = {.fd = -1};
+    check("an offset past the file's end fails", (uint64_t)(int64_t)hv_disk_open(&bad, path, 8192, 0), (uint64_t)(int64_t)-1);
+    check("and leaves no descriptor", (uint64_t)(int64_t)bad.fd, (uint64_t)(int64_t)-1);
+    int next = open(path, O_RDONLY); /* takes the number the failed open gave back */
+    hv_disk_close(&bad);
+    check("so closing that disk closes nobody else's", (uint64_t)(fcntl(next, F_GETFD) != -1), 1);
+    close(next);
+    check("a missing file fails", (uint64_t)(int64_t)hv_disk_open(&bad, "/nonexistent/winios_disk", 0, 0), (uint64_t)(int64_t)-1);
+    check("with no descriptor either", (uint64_t)(int64_t)bad.fd, (uint64_t)(int64_t)-1);
+
     unlink(path);
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

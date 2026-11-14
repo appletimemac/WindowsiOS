@@ -200,8 +200,26 @@ static void cmd_settle(const HvCmdFile *cmd, int quiet_ms, int max_ms) {
     cmd->mark(cmd->opaque, label);
 }
 
+static int exec_held(const HvCmdFile *cmd, const char *line);
+
+/* A verb runs with the VM held: the thread that reads these lines is not the one that starts VMs, and a VM ended
+   and set up again under a verb would take the machine, the board and the guest's memory from it (the state verb
+   reads guest memory through pointers). A wait holds nothing. */
 int hv_cmdfile_exec(const HvCmdFile *cmd, const char *line) {
     if (!line[0] || line[0] == '#') return 0;
+    int ms = 0;
+    if (sscanf(line, "wait %d", &ms) == 1 && ms > 0) {
+        usleep((useconds_t)ms * 1000u);
+        return 0;
+    }
+    hv_winvm_hold();
+    /* Stopped while it waited for a VM to be ended and set up: the verb was for the one that is gone. */
+    int r = cmd_stopped(cmd) ? 0 : exec_held(cmd, line);
+    hv_winvm_unhold();
+    return r;
+}
+
+static int exec_held(const HvCmdFile *cmd, const char *line) {
     double xn = 0, yn = 0;
     int code = 0, yi = 0;
     if (sscanf(line, "click %lf %lf", &xn, &yn) == 2) {
@@ -342,8 +360,6 @@ int hv_cmdfile_exec(const HvCmdFile *cmd, const char *line) {
         cmd_settle(cmd, code, yi);
     } else if (!strcmp(line, "perfrow")) {
         cmd->perf_row(cmd->opaque);
-    } else if (sscanf(line, "wait %d", &code) == 1 && code > 0) {
-        usleep((useconds_t)code * 1000u);
     } else if (!strcmp(line, "quit")) {
         cmd->quit(cmd->opaque);
         return 1;

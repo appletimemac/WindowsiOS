@@ -120,14 +120,24 @@ static void hda_in_callback(void *opaque, AudioQueueRef aq, AudioQueueBufferRef 
     pthread_mutex_unlock(&audio_mu);
 }
 
-static void dispose_in_locked(void) {
-    if (hda_in_queue) {
-        hda_in_running = 0;
-        AudioQueueStop(hda_in_queue, true);
-        AudioQueueDispose(hda_in_queue, true);
-        hda_in_queue = NULL;
-        memset(hda_in_bufs, 0, sizeof hda_in_bufs);
-    }
+/* The microphone queue is stopped and disposed of without audio_mu: its callback takes that lock, and a stop
+   that waits for a callback in flight would wait for ever with it held. in_life_mu, which the callback never takes,
+   keeps the queue's starts, stops and disposal one at a time instead (a CPU thread stops it while another thread
+   shuts audio down). It is taken before audio_mu. */
+static pthread_mutex_t in_life_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static AudioQueueRef take_in_locked(void) {
+    AudioQueueRef q = hda_in_queue;
+    hda_in_queue = NULL;
+    hda_in_running = 0;
+    memset(hda_in_bufs, 0, sizeof hda_in_bufs);
+    return q;
+}
+
+static void end_in(AudioQueueRef q) {
+    if (!q) return;
+    AudioQueueStop(q, true);
+    AudioQueueDispose(q, true);
 }
 
 static int hda_start_in(void *opaque, unsigned channels, unsigned rate_hz) {
@@ -135,10 +145,13 @@ static int hda_start_in(void *opaque, unsigned channels, unsigned rate_hz) {
     if (channels < 1 || channels > 2) channels = 2;
     if (rate_hz < 8000 || rate_hz > 192000) rate_hz = 48000;
 
+    pthread_mutex_lock(&in_life_mu);
     pthread_mutex_lock(&audio_mu);
-    if (hda_in_queue && (channels != hda_in_ch || rate_hz != hda_in_rate))
-        dispose_in_locked();
+    AudioQueueRef other = hda_in_queue && (channels != hda_in_ch || rate_hz != hda_in_rate) ? take_in_locked() : NULL;
+    pthread_mutex_unlock(&audio_mu);
+    end_in(other);
 
+    pthread_mutex_lock(&audio_mu);
     if (!hda_in_queue) {
         AudioStreamBasicDescription f = {0};
         f.mSampleRate = (Float64)rate_hz;
@@ -154,6 +167,7 @@ static int hda_start_in(void *opaque, unsigned channels, unsigned rate_hz) {
             fprintf(stderr, "winvm: audio: microphone input unavailable (OSStatus=%d)\n", (int)st);
             hda_in_queue = NULL;
             pthread_mutex_unlock(&audio_mu);
+            pthread_mutex_unlock(&in_life_mu);
             return -1;
         }
         UInt32 buf_bytes = IN_BUFFER_FRAMES * f.mBytesPerFrame;
@@ -165,32 +179,40 @@ static int hda_start_in(void *opaque, unsigned channels, unsigned rate_hz) {
         hda_in_rate = rate_hz;
     }
 
+    AudioQueueRef refused = NULL;
     if (!hda_in_running) {
         OSStatus st = AudioQueueStart(hda_in_queue, NULL);
         if (st == noErr) {
             hda_in_running = 1;
         } else {
             fprintf(stderr, "winvm: audio: AudioQueueStart(input) returned %d (mic permission pending?)\n", (int)st);
-            dispose_in_locked();
+            refused = take_in_locked();
         }
     }
     int ok = hda_in_running ? 0 : -1;
     pthread_mutex_unlock(&audio_mu);
+    end_in(refused);
+    pthread_mutex_unlock(&in_life_mu);
     return ok;
 }
 
 static void hda_stop_in(void *opaque) {
     (void)opaque;
+    pthread_mutex_lock(&in_life_mu);
     pthread_mutex_lock(&audio_mu);
-    if (hda_in_queue && hda_in_running) {
-        hda_in_running = 0;
-        AudioQueueStop(hda_in_queue, true);
+    AudioQueueRef q = hda_in_queue && hda_in_running ? hda_in_queue : NULL;
+    hda_in_running = 0; /* its callback hands no buffer back from here on */
+    pthread_mutex_unlock(&audio_mu);
+    if (q) {
+        AudioQueueStop(q, true); /* without audio_mu: see in_life_mu */
+        pthread_mutex_lock(&audio_mu);
         /* Re-prime buffers so next start is instant */
         for (int i = 0; i < IN_NUM_BUFFERS; i++) {
-            if (hda_in_bufs[i]) AudioQueueEnqueueBuffer(hda_in_queue, hda_in_bufs[i], 0, NULL);
+            if (hda_in_bufs[i]) AudioQueueEnqueueBuffer(q, hda_in_bufs[i], 0, NULL);
         }
+        pthread_mutex_unlock(&audio_mu);
     }
-    pthread_mutex_unlock(&audio_mu);
+    pthread_mutex_unlock(&in_life_mu);
 }
 
 void hv_audio_attach_hda(HvHda *hda) {
@@ -213,8 +235,13 @@ void hv_audio_shutdown(void) {
         hda_out_unit = NULL;
         hda_out_running = 0;
     }
-    dispose_in_locked();
     pthread_mutex_unlock(&audio_mu);
+    pthread_mutex_lock(&in_life_mu);
+    pthread_mutex_lock(&audio_mu);
+    AudioQueueRef in = take_in_locked();
+    pthread_mutex_unlock(&audio_mu);
+    end_in(in);
+    pthread_mutex_unlock(&in_life_mu);
 }
 
 /* ---- Legacy virtio-snd compatibility ---- */
