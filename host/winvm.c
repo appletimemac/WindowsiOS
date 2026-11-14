@@ -276,7 +276,26 @@ static void previous_vm_end(void) {
     }
 }
 
+static pthread_mutex_t life_mu = PTHREAD_MUTEX_INITIALIZER; /* held while a VM is ended and the next one set up */
+
+void hv_winvm_hold(void) {
+    pthread_mutex_lock(&life_mu);
+}
+
+void hv_winvm_unhold(void) {
+    pthread_mutex_unlock(&life_mu);
+}
+
+static int create_held(const HvWinVmConfig *c, char *err, size_t errlen);
+
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
+    hv_winvm_hold();
+    int r = create_held(c, err, errlen);
+    hv_winvm_unhold();
+    return r;
+}
+
+static int create_held(const HvWinVmConfig *c, char *err, size_t errlen) {
     if (!c || !c->code_fd || !c->vars_fd)
         return fail(err, errlen, "UEFI firmware (code.fd) and NVRAM (vars.fd) are required.");
 
