@@ -140,12 +140,94 @@ void hv_mmu_walk(HvCpu *cpu, uint64_t va, HvAccess acc, int el, HvWalk *out) {
 
 int hv_tlb_tmajor;
 
+/* A full flush empties the TLB and the tables beside the branch cache. Each is emptied by what was noted as
+   written since it was last empty, because the whole of them is 4.3 MiB and firmware flushes in a loop.
+   HV_FLUSH_WHOLE clears them whole as before; HV_FLUSH_CHECK then looks through all of a table, and anything
+   left in it (a store nobody noted) ends the run. */
+static void emptied_check(const char *what, const void *table, size_t bytes, uint64_t empty) {
+    if (!hv_knob[HV_K_FLUSH_CHECK]) return;
+    for (size_t i = 0; i < bytes; i += 8) {
+        uint64_t w;
+        memcpy(&w, (const uint8_t *)table + i, 8); /* the tables are of several types */
+        if (w != empty) {
+            fprintf(stderr, "winvm: flush check: %s is not empty at byte %zu (%016llx)\n", what, i, (unsigned long long)w);
+            abort();
+        }
+    }
+}
+
+static void tlb_empty(HvCpu *cpu) {
+    const size_t piece = sizeof(HvTlbEntry) << HV_TLB_PIECE_BITS;
+    if (!cpu->tlb_noted || hv_knob[HV_K_FLUSH_WHOLE]) {
+        memset(cpu->tlb, 0x80, sizeof cpu->tlb);
+        memset(cpu->tlb_dirty, 0, sizeof cpu->tlb_dirty);
+        cpu->tlb_noted = 1;
+    } else {
+        for (size_t w = 0; w < sizeof cpu->tlb_dirty / 8; w++) {
+            uint64_t bits = cpu->tlb_dirty[w];
+            if (!bits) continue;
+            cpu->tlb_dirty[w] = 0;
+            for (; bits; bits &= bits - 1)
+                memset((uint8_t *)cpu->tlb + (w * 64 + (size_t)__builtin_ctzll(bits)) * piece, 0x80, piece);
+        }
+    }
+    emptied_check("the TLB", cpu->tlb, sizeof cpu->tlb, HV_TLB_INVALID);
+}
+
+static void hint_empty(HvPerCpu *p, int kernel, int whole) {
+    if (whole || hv_knob[HV_K_FLUSH_WHOLE]) {
+        memset(p->ijc_hint[kernel], 0, sizeof p->ijc_hint[kernel]);
+        memset(p->ijc_hint_dirty[kernel], 0, sizeof p->ijc_hint_dirty[kernel]);
+    } else {
+        for (size_t w = 0; w < sizeof p->ijc_hint_dirty[kernel] / 8; w++) {
+            uint64_t bits = p->ijc_hint_dirty[kernel][w];
+            if (!bits) continue;
+            p->ijc_hint_dirty[kernel][w] = 0;
+            for (; bits; bits &= bits - 1)
+                memset(&p->ijc_hint[kernel][w * 64 + (size_t)__builtin_ctzll(bits)], 0, sizeof p->ijc_hint[kernel][0]);
+        }
+    }
+    emptied_check("a branch-cache hint table", p->ijc_hint[kernel], sizeof p->ijc_hint[kernel], 0);
+}
+
+static void pages_empty(HvPerCpu *p, int kernel) {
+    if (hv_knob[HV_K_FLUSH_WHOLE]) {
+        memset(p->ijc_pages[kernel], 0, sizeof p->ijc_pages[kernel]);
+        memset(p->ijc_pages_dirty[kernel], 0, sizeof p->ijc_pages_dirty[kernel]);
+    } else {
+        for (size_t w = 0; w < sizeof p->ijc_pages_dirty[kernel] / 8; w++) {
+            uint64_t bits = p->ijc_pages_dirty[kernel][w];
+            if (!bits) continue;
+            p->ijc_pages_dirty[kernel][w] = 0;
+            for (; bits; bits &= bits - 1) p->ijc_pages[kernel][w * 64 + (size_t)__builtin_ctzll(bits)] = 0;
+        }
+    }
+    emptied_check("a branch-cache page map", p->ijc_pages[kernel], sizeof p->ijc_pages[kernel], 0);
+}
+
+static void asid_empty(HvCpu *cpu, int whole) {
+    if (whole || cpu->nasid_notes > HV_ASID_NOTES || hv_knob[HV_K_FLUSH_WHOLE]) {
+        memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+    } else {
+        for (uint32_t i = 0; i < cpu->nasid_notes; i++) cpu->asid_cid[cpu->asid_notes[i]] = 0;
+    }
+    cpu->nasid_notes = 0;
+    emptied_check("the user ids by ASID", cpu->asid_cid, sizeof cpu->asid_cid, 0);
+}
+
+static void asid_note(HvCpu *cpu, int asid) {
+    /* An ASID dropped and given an id again (a TLBI for it, or ASID 0 on the way through) is listed already. */
+    if (cpu->nasid_notes && cpu->nasid_notes <= HV_ASID_NOTES && cpu->asid_notes[cpu->nasid_notes - 1] == (uint16_t)asid) return;
+    if (cpu->nasid_notes < HV_ASID_NOTES) cpu->asid_notes[cpu->nasid_notes] = (uint16_t)asid;
+    if (cpu->nasid_notes <= HV_ASID_NOTES) cpu->nasid_notes++;
+}
+
 void hv_tlb_flush(HvCpu *cpu) {
     if (cpu->m) cpu->m->stats.tlb_flushes++;
     if (cpu->m) cpu->m->stats.reset_why[0]++;
     hv_ijc_reset(cpu, 0); /* mappings changed: branch targets cached by VA are no longer trusted */
     hv_ijc_reset(cpu, 1);
-    memset(cpu->tlb, 0x80, sizeof cpu->tlb);
+    tlb_empty(cpu);
     cpu->nuser_fills = 0;
     cpu->nkernel_fills = 0;
     cpu->kernel_asid_exec = 0;
@@ -163,7 +245,7 @@ static uint32_t hint_slot(uint64_t key) {
 
 static void ijc_clear(HvCpu *cpu, int kernel) {
     if (!cpu->pc_state) return;
-    memset(cpu->pc_state->ijc_hint[kernel], 0, sizeof cpu->pc_state->ijc_hint[kernel]);
+    hint_empty(cpu->pc_state, kernel, 1);
     for (int t = kernel; t < HV_IJC_TABLES; t += 2)
         memset(cpu->pc_state->ijc + (size_t)t * (HV_IJC_TABLE_BYTES / 8), 0, HV_IJC_TABLE_BYTES);
 }
@@ -200,8 +282,10 @@ static uint32_t ucode_slot(uint64_t key) {
 
 static void ucode_clear(HvPerCpu *m) {
     if (m) m->last_fill[0] = 0;
-    if (m && m->ucode) memset(m->ucode, 0, (sizeof *m->ucode) << HV_UCODE_BITS);
+    /* Only hv_ucode_add stores in it, and counts: nothing counted, nothing to clear (2 MiB otherwise). */
+    if (m && m->ucode && (m->ucode_count || hv_knob[HV_K_FLUSH_WHOLE])) memset(m->ucode, 0, (sizeof *m->ucode) << HV_UCODE_BITS);
     if (m) m->ucode_count = 0;
+    if (m && m->ucode) emptied_check("the set of user code pages", m->ucode, (sizeof *m->ucode) << HV_UCODE_BITS, 0);
 }
 
 static int ucode_has(HvPerCpu *m, uint32_t cid, uint64_t va) {
@@ -238,7 +322,7 @@ static uint16_t fresh_cid(HvCpu *cpu) {
         if (cpu->pc_state) cpu->pc_state->last_fill[0] = cpu->pc_state->last_fill[1] = 0;
         ijc_clear(cpu, 0);
         ucode_clear(cpu->pc_state);
-        memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+        asid_empty(cpu, 1);
         cpu->asid0_used = 0;
         cpu->next_cid = 1;
     }
@@ -280,6 +364,7 @@ void hv_ijc_switch(HvCpu *cpu) {
     }
     if (!cpu->asid_cid[asid]) {
         cpu->asid_cid[asid] = fresh_cid(cpu);
+        asid_note(cpu, asid); /* after fresh_cid, which may have emptied the table and the notes */
         cpu->cid_asid[cpu->asid_cid[asid]] = (uint16_t)asid;
     }
     cpu->ijc_salt[0] = (uint64_t)cpu->asid_cid[asid] << 48;
@@ -296,10 +381,10 @@ void hv_ijc_reset(HvCpu *cpu, int kernel) {
     ret_new(cpu, kernel);
     if (cpu->pc_state) cpu->pc_state->last_fill[0] = cpu->pc_state->last_fill[1] = 0;
     /* Every entry of the half is dead now (new ids or kernel generation): so are their hints. */
-    if (cpu->pc_state) memset(cpu->pc_state->ijc_hint[kernel], 0, sizeof cpu->pc_state->ijc_hint[kernel]);
+    if (cpu->pc_state) hint_empty(cpu->pc_state, kernel, 0);
     if (cpu->m) {
         cpu->m->stats.ijc_resets++;
-        memset(cpu->pc_state->ijc_pages[kernel], 0, sizeof cpu->pc_state->ijc_pages[kernel]);
+        pages_empty(cpu->pc_state, kernel);
     }
     if (kernel) {
         /* Kernel VAs have 0xffff in bits 63..48, so the salt must not make that 0 (the empty tag). */
@@ -321,7 +406,7 @@ void hv_ijc_reset(HvCpu *cpu, int kernel) {
         }
         return;
     }
-    memset(cpu->asid_cid, 0, sizeof cpu->asid_cid);
+    asid_empty(cpu, 0);
     cpu->asid0_used = 0;
     ucode_clear(cpu->pc_state); /* every user id is new now */
     hv_ijc_switch(cpu);
@@ -755,6 +840,7 @@ static void tlb_fill(HvCpu *cpu, uint64_t va, int el, const HvWalk *w) {
         if (cpu->nkernel_fills <= HV_KERNEL_FILLS) cpu->nkernel_fills++;
     }
     if ((page_va >> 55) & 1) kt_note_fill(cpu, hv_tlb_code(slot, table));
+    hv_tlb_note(cpu, hv_tlb_code(slot, table));
     e->addend = (int64_t)((uint64_t)(uintptr_t)(ram->host + (page_pa - ram->pa)) - page_va);
     e->read_tag = w->r ? page_va - HV_TLB_ADJ : HV_TLB_INVALID;
     /* Writes to ROM or to pages we translated from take the slow path. */
@@ -929,7 +1015,9 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
     {   /* the page's hint: which piece has a target now */
         uint64_t key = ((b->va & ~(uint64_t)PAGE_MASK) ^ cpu->ijc_salt[kernel]) | 1;
         uint64_t bit = 1ull << ((b->va >> (HV_TLB_PAGE_BITS - 6)) & 63);
-        __typeof__(pcs->ijc_hint[0][0]) *h = &pcs->ijc_hint[kernel][hint_slot(key)];
+        uint32_t hs = hint_slot(key);
+        __typeof__(pcs->ijc_hint[0][0]) *h = &pcs->ijc_hint[kernel][hs];
+        pcs->ijc_hint_dirty[kernel][hs >> 6] |= 1ull << (hs & 63);
         if (h->key == key) h->bits |= bit;
         else if (!h->key) h->bits = bit, __atomic_store_n(&h->key, key, __ATOMIC_RELEASE);
         else if (h->key != ~0ull) h->bits = ~0ull, __atomic_store_n(&h->key, ~0ull, __ATOMIC_RELEASE);
@@ -942,6 +1030,7 @@ void hv_ijc_fill(HvCpu *cpu, HvBlock *b) {
         hv_ucode_add(cpu, b->va);
         uint32_t h = (uint32_t)(b->va >> HV_TLB_PAGE_BITS) & 0xffff;
         pcs->ijc_pages[0][h >> 6] |= 1ull << (h & 63);
+        pcs->ijc_pages_dirty[0][h >> 12] |= 1ull << (h >> 6 & 63);
         uint32_t ch = (uint32_t)(b->va >> 25) & 255, cid = (uint32_t)(cpu->ijc_salt[0] >> 48); /* the id after any reset in ucode_add */
         pcs->cid_chunks[cid][ch >> 6] |= 1ull << (ch & 63);
     }
@@ -1382,6 +1471,7 @@ void hv_tlb_switch_user(HvCpu *cpu, uint64_t old, uint64_t now) {
             if (!fresh) break;
             for (uint32_t j = 0; j < r->n; j++) {
                 HvTlbEntry *e = &cpu->tlb[0] + r->slot[j];
+                hv_tlb_note(cpu, r->slot[j]);
                 *e = r->ent[j];
                 cpu->user_fills[cpu->nuser_fills++] = r->slot[j];
                 if (e->write_tag != HV_TLB_INVALID) {
