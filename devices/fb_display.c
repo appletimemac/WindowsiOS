@@ -1,5 +1,6 @@
 #include "fb_display.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -264,6 +265,12 @@ HvFbRect hv_fb_fit(double draw_w, double draw_h, uint32_t tex_w, uint32_t tex_h,
     q.x = content.x + (content.w - q.w) / 2.0;
     q.y = content.y + (content.h - q.h) / 2.0;
     return q;
+}
+
+HvFbDraw hv_fb_draw_for(double scale) {
+    double whole = round(scale);
+    if (whole >= 1.0 && fabs(scale - whole) < 0.001) return HV_FB_DRAW_EXACT;
+    return scale > 1.0 ? HV_FB_DRAW_COVER : HV_FB_DRAW_SMOOTH;
 }
 
 void hv_fb_display_request_size(HvFbDisplay *fb, uint32_t width, uint32_t height) {

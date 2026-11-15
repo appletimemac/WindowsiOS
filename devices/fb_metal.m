@@ -41,6 +41,18 @@ static NSString *const kFbShaderSource =
      "    constexpr sampler s(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);\n"
      "    return float4(tex.sample(s, in.uv).rgb, 1.0);\n"
      "}\n"
+     /* An enlargement that is not a whole number: a drawable pixel inside one guest pixel takes it as it is,
+        and one that lies across the edge between two takes each by its share of the pixel. The linear sampler
+        does the mixing: within half a drawable pixel of the edge the sample point moves from one guest pixel's
+        centre to the next one's. */
+     "fragment float4 fb_fs_cover(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
+     "    constexpr sampler s(mag_filter::linear, min_filter::linear, address::clamp_to_edge);\n"
+     "    float2 size = float2(tex.get_width(), tex.get_height());\n"
+     "    float2 p = in.uv * size;\n"
+     "    float2 edge = floor(p + 0.5);\n"
+     "    p = edge + clamp((p - edge) / fwidth(p), -0.5, 0.5);\n"
+     "    return float4(tex.sample(s, p / size).rgb, 1.0);\n"
+     "}\n"
      "fragment float4 fb_fs_cursor(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]]) {\n"
      "    constexpr sampler s(mag_filter::nearest, min_filter::nearest, address::clamp_to_edge);\n"
      "    return tex.sample(s, in.uv);\n"
@@ -63,7 +75,7 @@ typedef struct {
     BOOL ended; /* render thread only: its loop stops */
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
-    id<MTLRenderPipelineState> pipeLinear, pipeNearest, pipeCursor;
+    id<MTLRenderPipelineState> pipeLinear, pipeNearest, pipeCover, pipeCursor;
     id<MTLTexture> texture, cursorTexture;
     uint32_t texW, texH;
     uint8_t *shadow; /* ramfb only: last uploaded pixels, for change detection */
@@ -119,6 +131,7 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
             if (lib) {
                 pipeLinear = make_pipeline(device, lib, @"fb_fs_linear", NO);
                 pipeNearest = make_pipeline(device, lib, @"fb_fs_nearest", NO);
+                pipeCover = make_pipeline(device, lib, @"fb_fs_cover", NO);
                 pipeCursor = make_pipeline(device, lib, @"fb_fs_cursor", YES);
             }
         }
@@ -339,8 +352,12 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
         /* The picture alone, or the whole drawable with the picture at its place in it. */
         FbQuad quad = {{(float)qx, (float)qy}, {(float)qw, (float)qh}, {0, 0}, {1, 1}};
         if (extend) quad = (FbQuad){{0, 0}, {1, 1}, {(float)(-qx / qw), (float)(-qy / qh)}, {(float)(1.0 / qw), (float)(1.0 / qh)}};
-        double pxScale = (qw * dsize.width) / (double)texW;
-        BOOL integerScale = fabs(pxScale - round(pxScale)) < 0.001 && round(pxScale) >= 1.0;
+        id<MTLRenderPipelineState> pipe = pipeLinear;
+        switch (hv_fb_draw_for((qw * dsize.width) / (double)texW)) {
+        case HV_FB_DRAW_EXACT: pipe = pipeNearest; break;
+        case HV_FB_DRAW_COVER: pipe = pipeCover; break;
+        case HV_FB_DRAW_SMOOTH: break;
+        }
 
         id<CAMetalDrawable> drawable = update.drawable;
         if (!drawable) return;
@@ -352,7 +369,7 @@ static id<MTLRenderPipelineState> make_pipeline(id<MTLDevice> dev, id<MTLLibrary
 
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-        [enc setRenderPipelineState:integerScale ? pipeNearest : pipeLinear];
+        [enc setRenderPipelineState:pipe ?: pipeLinear];
         [enc setVertexBytes:&quad length:sizeof quad atIndex:0];
         [enc setFragmentTexture:texture atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -399,6 +416,8 @@ void hv_fb_metal_set_content(HvFbDisplay *fb, double x, double y, double w, doub
     if (!p) return;
     [p setContentX:x y:y width:w height:h];
 }
+
+const char *hv_fb_metal_shader_source(void) { return kFbShaderSource.UTF8String; }
 
 uint64_t hv_fb_metal_frames(HvFbDisplay *fb) {
     if (!fb) return 0;

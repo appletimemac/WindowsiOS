@@ -9,6 +9,7 @@ struct DisplaySettingsTests {
 
     @Test func windowsScaleFollowsTheDensitySoAUnitStaysAPoint() {
         #expect(percent(.fast, .standard) == 100)
+        #expect(percent(.balanced, .standard) == 125)
         #expect(percent(.standard, .standard) == 150)
         #expect(percent(.retina, .standard) == 200)
     }
@@ -19,6 +20,8 @@ struct DisplaySettingsTests {
         #expect(percent(.retina, .smaller) == 175)
         #expect(percent(.retina, .larger) == 225)
         #expect(percent(.fast, .larger) == 125)
+        #expect(percent(.balanced, .smaller) == 100)
+        #expect(percent(.balanced, .larger) == 150)
     }
 
     @Test func windowsNeverGoesUnderOneHundredPercent() {
@@ -79,6 +82,41 @@ struct DisplaySettingsTests {
         for running in WindowsScale.steps {
             #expect(abs(pixels(density, size, running: running) / (CGFloat(running) / 100) - settled) < 1e-9)
         }
+    }
+
+    @Test func theOrderInSettingsGoesFromLightestToSharpest() {
+        #expect(DisplayDensity.allCases == [.fast, .balanced, .standard, .retina])
+        #expect(DisplayDensity.allCases.map(\.pixelsPerPoint) == [1, 1.25, 1.5, 2])
+        #expect(DisplayDensity(rawValue: "balanced") == .balanced)
+    }
+
+    @Test func balancedOnTheDuoHasFiveWindowsPixelsToFourPoints() throws {
+        // The inner display: a picture of 1146 by 794, and Windows at 125 percent, so its units stay a point each.
+        let inner = try #require(GuestPicture(in: CGRect(x: 16.33, y: 16.33, width: 918.33, height: 636.33),
+                                              density: pixels(.balanced, .standard, running: 125), scale: 3))
+        #expect(inner.size == GuestSize(width: 1146, height: 794))
+        #expect(abs(inner.pixelsPerPoint - 1.25) < 0.002)
+        // 2.4 device pixels to the Windows pixel is not a whole number, so the frame cannot be exact: it is the
+        // nearest whole device pixels inside, and both axes are stretched alike to within a part in a thousand.
+        let across = inner.frame.width * 3 / CGFloat(inner.size.width), down = inner.frame.height * 3 / CGFloat(inner.size.height)
+        #expect(abs(across - 2.4) < 0.002 && abs(down - 2.4) < 0.002)
+        #expect(abs(across / down - 1) < 0.001)
+        for edge in [inner.frame.minX, inner.frame.minY, inner.frame.width, inner.frame.height] {
+            #expect(abs(edge * 3 - (edge * 3).rounded()) < 1e-6)
+        }
+        #expect(inner.frame.minX >= 16.33 - 0.001 && inner.frame.maxX <= 16.33 + 918.33 + 0.001)
+        #expect(inner.frame.minY >= 16.33 - 0.001 && inner.frame.maxY <= 16.33 + 636.33 + 0.001)
+        // Between Fast and Standard in pixels: about 0.69 of Standard's.
+        let standard = try #require(GuestPicture(in: CGRect(x: 16.33, y: 16.33, width: 918.33, height: 636.33),
+                                                 density: pixels(.standard, .standard, running: 150), scale: 3))
+        let share = Double(inner.size.width * inner.size.height) / Double(standard.size.width * standard.size.height)
+        #expect(share > 0.68 && share < 0.71)
+        // The outer display under its camera needs 640 pixels across, more than Balanced gives it, as with Fast.
+        let outer = try #require(GuestPicture(in: CGRect(x: 0, y: 82, width: 448.67, height: 578.67),
+                                              density: pixels(.balanced, .standard, running: 125), scale: 3))
+        #expect(outer.size.width == 640)
+        #expect(note(.balanced, running: 125, drawn: outer.pixelsPerPoint).hasSuffix(" This display is too small for so few pixels, so Windows looks smaller on it."))
+        #expect(!note(.balanced, running: 125, drawn: inner.pixelsPerPoint).contains("too small"))
     }
 
     // MARK: What Settings says

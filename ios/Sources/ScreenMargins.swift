@@ -190,12 +190,17 @@ struct GuestSize: Hashable {
 /// How many Windows pixels the picture gets per point. Fewer is less work for Windows, more is sharper;
 /// Windows' own scale follows it (WindowsScale), so nothing on screen changes size. Windows takes a
 /// scale at sign-in, so a new density shows once Windows has restarted.
+///
+/// On a 3x panel Fast and Standard are a whole number of device pixels to the Windows pixel (3 and 2),
+/// which is drawn as it is. Balanced (2.4) and Retina (1.5) are not: there a device pixel that lies across
+/// two Windows pixels takes each by its share (`hv_fb_draw_for`).
 enum DisplayDensity: String, CaseIterable {
-    case fast, standard, retina
+    case fast, balanced, standard, retina
 
     var pixelsPerPoint: CGFloat {
         switch self {
         case .fast: return 1
+        case .balanced: return 1.25
         case .standard: return 1.5
         case .retina: return 2
         }
@@ -204,6 +209,7 @@ enum DisplayDensity: String, CaseIterable {
     var title: String {
         switch self {
         case .fast: return "Fast"
+        case .balanced: return "Balanced"
         case .standard: return "Standard"
         case .retina: return "Retina"
         }
