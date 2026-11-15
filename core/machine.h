@@ -207,6 +207,10 @@ typedef struct HvPerCpu {
        all 4096. A slot two keys wanted is spoiled (key ~0: scan it all); only
        this CPU empties one again, after clearing its page. */
     struct { uint64_t key, bits; } ijc_hint[2][4096];   /* page ^ salt of the last fill in each half: its filter bits are set already */
+    /* What emptying a half has to clear, a bit each: the ijc_hint slots written since it was last emptied, and
+       the words of ijc_pages. A reset then costs what was cached, not 72 KiB a half. */
+    uint64_t ijc_hint_dirty[2][4096 / 64];
+    uint64_t ijc_pages_dirty[2][1024 / 64];
     /* Direct-mapped cache in front of the hash, with the VA beside the block so
        a slot holding another block is passed over without reading it. */
     struct { uint64_t va; struct HvBlock *b; } jc[1 << HV_JC_BITS];
@@ -383,7 +387,7 @@ int hv_ic_ivau_drops(void);
 /* Settings that say how to translate or wait, to compare ways of doing it in one running guest
    ("knob NAME VALUE" in HV_INPUT_FILE; a new way starts from an empty code cache). Each starts
    from the environment variable named in hv_knob_names. */
-enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_COUNT };
+enum { HV_K_NO_RAS, HV_K_SUPERBLOCKS, HV_K_GROUPS, HV_K_WFI_SPIN, HV_K_FLUSH, HV_K_TEST1, HV_K_TEST2, HV_K_TEST3, HV_K_TLBT, HV_K_JITCAP, HV_K_RECHECK, HV_K_FLUSH_WHOLE, HV_K_FLUSH_CHECK, HV_K_COUNT };
 extern int hv_knob[HV_K_COUNT];
 int hv_knob_set(HvMachine *m, const char *name, int value);
 /* Debugging (HV_WATCH): which pages keep losing their translations. */

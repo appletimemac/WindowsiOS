@@ -20,7 +20,9 @@ extern void hv_xjump_thunk(void);
 static int init_rest(HvMachine *m);
 
 int hv_knob[HV_K_COUNT];
-static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK"};
+static const char *const hv_knob_names[HV_K_COUNT] = {"HV_NO_RAS", "HV_SUPERBLOCKS", "HV_GROUPS", "HV_WFI_SPIN", "HV_FLUSH", "HV_K1", "HV_K2", "HV_K3", "HV_TLBT", "HV_JIT_CAP", "HV_RECHECK",
+                                                      "HV_FLUSH_WHOLE", /* a full flush clears every table whole, as it used to */
+                                                      "HV_FLUSH_CHECK"}; /* and looks through what it emptied: anything left ends the run */
 
 static void knobs_init(void) {
     for (int i = 0; i < HV_K_COUNT; i++)
@@ -60,6 +62,9 @@ static int init_rest(HvMachine *m) {
     /* 4 KB pages expose stack accesses in the last 15 bytes of every page (500K+/s on Windows):
        exact OOL recheck avoids trapping to C on every stack push/pop at page top. */
     hv_knob[HV_K_RECHECK] = getenv("HV_RECHECK") ? atoi(getenv("HV_RECHECK")) : 1;
+    /* How a full flush empties its tables (mmu.c), for the Mac tool and the tests too. */
+    hv_knob[HV_K_FLUSH_WHOLE] = getenv("HV_FLUSH_WHOLE") ? atoi(getenv("HV_FLUSH_WHOLE")) : 0;
+    hv_knob[HV_K_FLUSH_CHECK] = getenv("HV_FLUSH_CHECK") ? atoi(getenv("HV_FLUSH_CHECK")) : 0;
     /* As many blocks as the region holds (a block is at least ~160 bytes of
        code), so the region filling, not this table, is what flushes; two
        chainable exits each at most. Untouched entries cost nothing. */
@@ -752,6 +757,8 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     p->ijc_keyed_count = 0;
     memset(p->ijc_pages, 0, sizeof p->ijc_pages);
     memset(p->ijc_hint, 0, sizeof p->ijc_hint);
+    memset(p->ijc_pages_dirty, 0, sizeof p->ijc_pages_dirty);
+    memset(p->ijc_hint_dirty, 0, sizeof p->ijc_hint_dirty);
     memset(p->jc, 0, sizeof p->jc);
     cpu->ijc = (uint64_t)(uintptr_t)p->ijc;
     cpu->lines_ptr = (uint64_t)(uintptr_t)&p->irq_line;

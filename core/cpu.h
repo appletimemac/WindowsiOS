@@ -143,6 +143,19 @@ typedef struct HvCpu {
     uint16_t kernel_fills[HV_KERNEL_FILLS];
     uint32_t nkernel_fills;
     int kernel_asid_exec;    /* EL1 can fetch from one of them (tlb_fill): the kernel's cached branch targets go with the ASID */
+    /* Which 16-entry pieces of the TLB have had a valid tag stored since the last full flush, a bit each
+       (hv_tlb_note), so that a full flush empties those pieces and not all 2 MiB: firmware flushes everything
+       a quarter of a million times in a boot, with a handful of entries filled in between. Whatever stores a
+       valid tag notes the piece; storing HV_TLB_INVALID needs no note. Only the CPU's own thread notes and
+       flushes. tlb_noted is 0 until a flush has emptied the whole table once: this struct starts as zeros,
+       and a zero is not an invalid tag. */
+#define HV_TLB_PIECE_BITS 4
+    uint64_t tlb_dirty[(HV_TLB_SIZE * 4) >> (HV_TLB_PIECE_BITS + 6)];
+    int tlb_noted;
+    /* The ASIDs given a user id since asid_cid was last emptied: emptying it clears those. More than fit: all of it. */
+#define HV_ASID_NOTES 32
+    uint16_t asid_notes[HV_ASID_NOTES];
+    uint32_t nasid_notes;
 #define HV_KTTBR_SLOTS 64
     struct { uint64_t ttbr1; uint16_t kgen; } kttbr_map[HV_KTTBR_SLOTS];
     uint32_t kttbr_next, kttbr_count;
@@ -315,5 +328,9 @@ static inline uint32_t hv_tlb_code(uint32_t slot, int table) {
     return hv_tlb_tmajor ? (uint32_t)table << HV_TLB_BITS | slot : slot << 2 | (uint32_t)table;
 }
 static inline HvTlbEntry *hv_tlb_ent(HvCpu *cpu, uint32_t slot, int table) { return &cpu->tlb[hv_tlb_code(slot, table)]; }
+/* Before a valid tag is stored in entry `code` of cpu->tlb (see tlb_dirty). */
+static inline void hv_tlb_note(HvCpu *cpu, uint32_t code) {
+    cpu->tlb_dirty[code >> (HV_TLB_PIECE_BITS + 6)] |= 1ull << (code >> HV_TLB_PIECE_BITS & 63);
+}
 
 #endif

@@ -89,7 +89,7 @@ $(B)/test_%: tests/test_%.c tests/%_programs.S tests/harness.S tests/harness.h $
 	$(CC) $(CFLAGS) -Itests tests/test_$*.c tests/$*_programs.S tests/harness.S $(ENGINE) -o $@
 
 test-core: $(CORE_TESTS)
-	@ulimit -s 65520; for t in $(CORE_TESTS); do echo "== $$t"; $$t || exit 1; done
+	@ulimit -s 65520; for t in $(CORE_TESTS); do echo "== $$t"; HV_FLUSH_CHECK=1 $$t || exit 1; done
 
 $(B):
 	mkdir -p $(B)

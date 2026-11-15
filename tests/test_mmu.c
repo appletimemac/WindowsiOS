@@ -61,6 +61,7 @@ static uint64_t *map(uint64_t root, int g, int inputsize, uint64_t va, int leaf_
     }
 }
 
+#define SLOT_OF(va, table) hv_tlb_ent(&cpu, (uint32_t)((va) >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table)
 #define AF (1ull << 10)
 #define PAGE 3ull
 #define BLOCK 1ull
@@ -83,6 +84,7 @@ int main(void) {
     static HvMachine m;
     static HvCpu cpu;
     hv_machine_init(&m, 1 << 20);
+    hv_knob[HV_K_FLUSH_CHECK] = 1; /* every full flush below is looked through by the engine: anything left ends the run */
     pt = aligned_alloc(65536, PT_SIZE);
     hv_machine_add_ram(&m, PT_PA, PT_SIZE, pt, 0);
     hv_cpu_reset(&cpu, &m);
@@ -224,6 +226,7 @@ int main(void) {
             for (int k = 0; k < 8; k++) {
                 uint64_t va = bases[b] + ((uint64_t)k << HV_TLB_PAGE_BITS);
                 HvTlbEntry *t = &(*hv_tlb_ent(&cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), table));
+                hv_tlb_note(&cpu, (uint32_t)(t - cpu.tlb));
                 t->read_tag = va - HV_TLB_ADJ;
                 t->addend = 0;
             }
@@ -254,11 +257,13 @@ int main(void) {
             for (int k = 0; k < 6; k++) {
                 uint64_t va = base + ((uint64_t)ks[k] << HV_TLB_PAGE_BITS);
                 HvTlbEntry *t = hv_tlb_ent(&cpu, (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 1);
+                hv_tlb_note(&cpu, (uint32_t)(t - cpu.tlb));
                 t->read_tag = va - HV_TLB_ADJ;
                 t->addend = 0;
             }
             uint64_t uva = 0x100000000ull + ((uint64_t)7000 << HV_TLB_PAGE_BITS); /* a process's page, in a slot outside the range's */
             HvTlbEntry *u = hv_tlb_ent(&cpu, (uva >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 0);
+            hv_tlb_note(&cpu, (uint32_t)(u - cpu.tlb));
             u->read_tag = uva - HV_TLB_ADJ;
             u->addend = 0;
             cpu.el = 1;
@@ -340,6 +345,7 @@ int main(void) {
         uint64_t uva = 0x7ff700001000ull;
         uint32_t sl = (uva >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
         HvTlbEntry *ue = hv_tlb_ent(&cpu, sl, 0);
+        hv_tlb_note(&cpu, (uint32_t)(ue - cpu.tlb));
         ue->read_tag = uva - HV_TLB_ADJ;
         ue->addend = 0x1234000;
         cpu.user_fills[0] = (uint16_t)hv_tlb_code(sl, 0);
@@ -654,6 +660,288 @@ int main(void) {
 #undef SWITCH_TO
 
 #undef SLOT
+#undef MSR_TTBR0
+#undef MSR_TTBR1
+#undef CHECK
+    }
+
+    /* A full flush empties the TLB and the tables beside the branch cache by what was noted as written since
+       they were last empty (4.3 MiB in all, and firmware flushes a quarter of a million times in a boot). So
+       it must leave nothing behind however the entries got there, and must not rewrite what nothing touched. */
+    {
+#define BIG_PA 0xc0000000ull
+#define BIG_SIZE (64u << 20)
+#define CHECK(what, cond)                          \
+    do {                                           \
+        checks++;                                  \
+        if (!(cond)) {                             \
+            printf("  FAIL flush: %s\n", what);    \
+            failures++;                            \
+        }                                          \
+    } while (0)
+#define MSR_TTBR1(v) (cpu.x[0] = (v), hv_sysreg_msr(&cpu, 0xd5182020u, 0))
+#define MSR_TTBR0(v) (cpu.x[0] = (v), hv_sysreg_msr(&cpu, 0xd5182000u, 0))
+#define SWITCH_TO(asid, uroot) (MSR_TTBR1(kr), MSR_TTBR0(uroot), MSR_TTBR1(((uint64_t)(asid) << 48) | kr))
+        const uint64_t NG = 1ull << 11, TCR_A1 = 25 | 25u << 16 | 1u << 22 | 2u << 30 | 5ull << 32 | 1ull << 36;
+        const uint64_t UV = 0x4000000000ull, KG = 0xffffffc000000000ull, KN = 0xffffffc040000000ull;
+        HvPerCpu *p = &m.percpu[0];
+        uint8_t *big = aligned_alloc(65536, BIG_SIZE);
+        hv_machine_add_ram(&m, BIG_PA, BIG_SIZE, big, 0);
+        hv_cpu_reset(&cpu, &m);
+        hv_knob[HV_K_FLUSH_CHECK] = 0; /* this part looks for itself, and plants what the engine's look would end the run on */
+        size_t left;
+#define COUNT(table, bytes, empty)                                   \
+    do {                                                             \
+        left = 0;                                                    \
+        for (size_t i_ = 0; i_ < (bytes) / 8; i_++) left += ((const uint64_t *)(table))[i_] != (empty); \
+    } while (0)
+#define ALL_EMPTY(when)                                                                              \
+    do {                                                                                             \
+        COUNT(cpu.tlb, sizeof cpu.tlb, HV_TLB_INVALID);                                              \
+        CHECK(when ": the TLB is empty", left == 0);                                                 \
+        COUNT(cpu.tlb_dirty, sizeof cpu.tlb_dirty, 0);                                               \
+        CHECK(when ": no piece of it is noted", left == 0);                                          \
+        COUNT(p->ijc_hint, sizeof p->ijc_hint, 0);                                                   \
+        CHECK(when ": the branch-cache hints are empty", left == 0);                                 \
+        COUNT(p->ijc_hint_dirty, sizeof p->ijc_hint_dirty, 0);                                       \
+        CHECK(when ": none of them is noted", left == 0);                                            \
+        COUNT(p->ijc_pages, sizeof p->ijc_pages, 0);                                                 \
+        CHECK(when ": the branch-cache page maps are empty", left == 0);                             \
+        COUNT(p->ijc_pages_dirty, sizeof p->ijc_pages_dirty, 0);                                     \
+        CHECK(when ": none of their words is noted", left == 0);                                     \
+        COUNT(p->ucode, (size_t)8 << HV_UCODE_BITS, 0);                                              \
+        CHECK(when ": the set of user code pages is empty", left == 0 && p->ucode_count == 0);       \
+        COUNT(cpu.asid_cid, sizeof cpu.asid_cid, 0);                                                 \
+        CHECK(when ": only the current ASID has a user id", left <= 1);                              \
+    } while (0)
+        ALL_EMPTY("after a reset (the struct was zeros, which are not invalid tags)");
+
+        cpu.el = 1;
+        pt_next = 1 * 65536;
+        uint64_t ur = alloc_table(), ur2 = alloc_table(), kr = alloc_table();
+        cpu.mair_el1 = 0x00ff;
+        cpu.tcr_el1 = TCR_A1; /* 4K, 39 bits each, the ASID in TTBR1, 16 bits of it */
+        cpu.sctlr_el1 |= 1;
+        map(ur, 12, 39, UV, 1, BIG_PA | BLOCK | AF | AP(1) | NG, 0);  /* a process's 1 GB, on the 64 MiB of RAM */
+        map(ur2, 12, 39, UV, 1, BIG_PA | BLOCK | AF | AP(1) | NG, 0); /* another process's */
+        map(kr, 12, 39, KG, 1, BIG_PA | BLOCK | AF, 0);               /* the kernel's, global */
+        map(kr, 12, 39, KN, 1, BIG_PA | BLOCK | AF | NG, 0);          /* the kernel's, per process */
+        SWITCH_TO(11, ur);
+        uint64_t got;
+        int filled = 0;
+        /* More user pages than the list of user fills holds, more per-process kernel pages than theirs holds,
+           global kernel pages (listed nowhere), every kind of access, and the table for PAN. */
+        for (uint32_t i = 0; i < 3000; i++)
+            filled += hv_mmu_access(&cpu, UV + ((uint64_t)i << 12), i % 3 == 0 ? HV_ACC_WRITE : i % 3 == 1 ? HV_ACC_READ : HV_ACC_EXEC, 0, &got) == 0;
+        for (uint32_t i = 0; i < 5000; i++)
+            filled += hv_mmu_access(&cpu, KG + ((uint64_t)i << 12), i & 1 ? HV_ACC_WRITE : HV_ACC_EXEC, 1, &got) == 0;
+        for (uint32_t i = 0; i < 4200; i++)
+            filled += hv_mmu_access(&cpu, KN + ((uint64_t)(8000 + i) << 12), HV_ACC_READ, 1, &got) == 0;
+        cpu.pstate_extra |= HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 700; i++)
+            filled += hv_mmu_access(&cpu, KG + ((uint64_t)(13000 + i) << 12), HV_ACC_WRITE, 1, &got) == 0;
+        cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
+        CHECK("every access above filled an entry", filled == 3000 + 5000 + 4200 + 700);
+        CHECK("the lists of fills overflowed, as meant", cpu.nuser_fills > HV_USER_FILLS && cpu.nkernel_fills > HV_KERNEL_FILLS);
+        COUNT(cpu.tlb, sizeof cpu.tlb, HV_TLB_INVALID);
+        CHECK("the TLB holds them", left > 12000);
+        left = 0;
+        for (uint32_t sl = 0; sl < HV_TLB_SIZE; sl++) left += hv_tlb_ent(&cpu, sl, 2)->write_tag != HV_TLB_INVALID;
+        CHECK("700 of them in the table for PAN", left == 700);
+        /* Branch targets cached for user and kernel code in many pages, under more ASIDs than are noted singly. */
+        static HvBlock blocks[900];
+        for (int i = 0; i < 40; i++) {
+            SWITCH_TO(100 + i, i & 1 ? ur2 : ur);
+            for (int k = 0; k < 10; k++) {
+                HvBlock *b = &blocks[i * 20 + k];
+                *b = (HvBlock){.va = UV + ((uint64_t)(i * 37 + k * 211) << 12) + 0x40, .flags = 0, .code = (uint32_t *)(uintptr_t)0x1234};
+                hv_ijc_fill(&cpu, b);
+                b = &blocks[i * 20 + 10 + k];
+                *b = (HvBlock){.va = KG + ((uint64_t)(i * 53 + k * 97) << 12) + 0x80, .flags = HV_BLOCK_EL1, .code = (uint32_t *)(uintptr_t)0x1234};
+                hv_ijc_fill(&cpu, b);
+            }
+        }
+        COUNT(p->ijc_hint, sizeof p->ijc_hint, 0);
+        CHECK("hints were written for both halves", left > 400);
+        COUNT(p->ijc_pages, sizeof p->ijc_pages, 0);
+        CHECK("the page map was written", left > 0);
+        CHECK("user code pages were recorded", p->ucode_count > 300);
+        left = 0;
+        for (uint32_t a = 0; a < 65536; a++) left += cpu.asid_cid[a] != 0;
+        CHECK("more ASIDs have user ids than are noted singly", left > HV_ASID_NOTES && cpu.nasid_notes > HV_ASID_NOTES);
+        hv_tlb_flush(&cpu);
+        ALL_EMPTY("after a flush of all that");
+
+        /* Entries that came back from a process's stash are noted like fresh ones. */
+        SWITCH_TO(11, ur);
+        for (uint32_t i = 0; i < 500; i++) hv_mmu_access(&cpu, UV + ((uint64_t)(1000 + i) << 12), HV_ACC_WRITE, 0, &got);
+        SWITCH_TO(22, ur2);
+        COUNT(cpu.tlb, sizeof cpu.tlb, HV_TLB_INVALID);
+        CHECK("the first process's entries left with it", left == 0);
+        /* What notes they had goes too, as a flush with nothing else to do takes them: only the restore's own are left. */
+        memset(cpu.tlb_dirty, 0, sizeof cpu.tlb_dirty);
+        SWITCH_TO(11, ur);
+        COUNT(cpu.tlb, sizeof cpu.tlb, HV_TLB_INVALID);
+        CHECK("and came back from the stash", left >= 500);
+        hv_tlb_flush(&cpu);
+        ALL_EMPTY("after a flush of restored entries");
+
+        /* Few fills, as between two of firmware's flushes: the same result, and what nothing noted is not
+           rewritten. The marks below are in places nothing was written to since the last flush. */
+        SWITCH_TO(11, ur);
+        hv_mmu_access(&cpu, KG + 0x5000, HV_ACC_EXEC, 1, &got);
+        hv_mmu_access(&cpu, UV + 0x9000, HV_ACC_WRITE, 0, &got);
+        blocks[0] = (HvBlock){.va = KG + 0x5040, .flags = HV_BLOCK_EL1, .code = (uint32_t *)(uintptr_t)0x1234};
+        hv_ijc_fill(&cpu, &blocks[0]);
+        HvTlbEntry *far_entry = &cpu.tlb[HV_TLB_SIZE * 3 + 12345]; /* in this layout, in the table nothing uses */
+        far_entry->addend = 0x5a5a;
+        p->ijc_hint[0][77].key = 0x77;
+        p->ijc_pages[1][9] = 0x99;
+        cpu.asid_cid[4000] = 9;
+        uint32_t had = p->ucode_count;
+        p->ucode_count = 0; /* as if nothing had been recorded: the set is then left alone */
+        uint64_t *recorded = NULL;
+        for (size_t i = 0; i < (size_t)1 << HV_UCODE_BITS && !recorded; i++)
+            if (p->ucode[i]) recorded = &p->ucode[i];
+        if (!recorded) recorded = &p->ucode[5], *recorded = 0x55;
+        hv_tlb_flush(&cpu);
+        CHECK("a flush leaves a TLB piece nothing noted as it was", far_entry->addend == 0x5a5a);
+        CHECK("and a hint nothing noted", p->ijc_hint[0][77].key == 0x77);
+        CHECK("and a page-map word nothing noted", p->ijc_pages[1][9] == 0x99);
+        CHECK("and an ASID's user id nothing noted", cpu.asid_cid[4000] == 9);
+        CHECK("and the user code pages when none was counted", *recorded != 0);
+        CHECK("while what was filled is gone", SLOT_OF(KG + 0x5000, 1)->exec_tag == HV_TLB_INVALID && SLOT_OF(UV + 0x9000, 0)->write_tag == HV_TLB_INVALID);
+        (void)had;
+        /* HV_FLUSH_WHOLE clears every table whole, whatever was noted: the marks go. */
+        hv_knob[HV_K_FLUSH_WHOLE] = 1;
+        p->ucode_count = 1;
+        hv_tlb_flush(&cpu);
+        hv_knob[HV_K_FLUSH_WHOLE] = 0;
+        CHECK("with HV_FLUSH_WHOLE the marks are cleared too", far_entry->addend == (int64_t)HV_TLB_INVALID && p->ijc_hint[0][77].key == 0 &&
+                                                              p->ijc_pages[1][9] == 0 && cpu.asid_cid[4000] == 0 && *recorded == 0);
+        ALL_EMPTY("after a whole flush");
+
+        /* Dropping every kernel entry (the first kernel table, or none any more) looks only at noted pieces
+           too: all of them go, listed or global, the processes' stay, and a piece nothing noted is not read. */
+        SWITCH_TO(11, ur);
+        for (uint32_t i = 0; i < 600; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(2000 + i * 7) << 12), i & 1 ? HV_ACC_WRITE : HV_ACC_EXEC, 1, &got);
+        for (uint32_t i = 0; i < 4200; i++) hv_mmu_access(&cpu, KN + ((uint64_t)(8000 + i) << 12), HV_ACC_READ, 1, &got);
+        cpu.pstate_extra |= HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 300; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(13000 + i) << 12), HV_ACC_READ, 1, &got);
+        cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 200; i++) hv_mmu_access(&cpu, UV + ((uint64_t)(6000 + i) << 12), HV_ACC_READ, 0, &got);
+        HvTlbEntry *unnoted = hv_tlb_ent(&cpu, 15000, 1); /* a kernel page in the kernel's table, in a piece nobody noted */
+        unnoted->read_tag = 0xffffffc012345000ull - HV_TLB_ADJ;
+        unnoted->addend = 0;
+        size_t kernel_left = 0, user_left = 0;
+#define KERNEL_AND_USER()                                                                        \
+    do {                                                                                         \
+        kernel_left = user_left = 0;                                                             \
+        for (uint32_t i_ = 0; i_ < HV_TLB_SIZE * 4; i_++) {                                      \
+            const HvTlbEntry *e_ = &cpu.tlb[i_];                                                 \
+            if (e_ == unnoted || (e_->read_tag == HV_TLB_INVALID && e_->exec_tag == HV_TLB_INVALID && e_->write_tag == HV_TLB_INVALID)) continue; \
+            uint64_t va_ = e_->read_tag != HV_TLB_INVALID ? e_->read_tag + HV_TLB_ADJ : e_->exec_tag != HV_TLB_INVALID ? hv_exec_key(e_->exec_tag, e_->addend) : e_->write_tag + HV_TLB_ADJ; \
+            if ((va_ >> 55) & 1) kernel_left++;                                                  \
+            else user_left++;                                                                    \
+        }                                                                                        \
+    } while (0)
+        KERNEL_AND_USER();
+        CHECK("kernel entries of every kind are in the TLB, and a process's", kernel_left > 5000 && user_left >= 200);
+        MSR_TTBR1(11ull << 48); /* no kernel table any more */
+        KERNEL_AND_USER();
+        CHECK("every kernel entry is dropped when the kernel table goes", kernel_left == 0);
+        CHECK("the process's entries stay", user_left >= 200);
+        CHECK("and a piece nothing noted is not looked at", unnoted->read_tag != HV_TLB_INVALID);
+        MSR_TTBR1((11ull << 48) | kr);
+        for (uint32_t i = 0; i < 50; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(100 + i) << 12), HV_ACC_READ, 1, &got);
+        hv_knob[HV_K_FLUSH_WHOLE] = 1;
+        MSR_TTBR1(11ull << 48);
+        hv_knob[HV_K_FLUSH_WHOLE] = 0;
+        KERNEL_AND_USER();
+        CHECK("with HV_FLUSH_WHOLE the whole of the tables is looked at, that piece too", kernel_left == 0 && unnoted->read_tag == HV_TLB_INVALID);
+        MSR_TTBR1((11ull << 48) | kr);
+#undef KERNEL_AND_USER
+        hv_tlb_flush(&cpu);
+
+        /* The other layout of the TLB (a slot's tables side by side): the highest slots are then the last
+           pieces of the array, which the layout above leaves to the table nothing uses. */
+        hv_tlb_tmajor = 0;
+        hv_tlb_flush(&cpu);
+        SWITCH_TO(11, ur);
+        cpu.pstate_extra |= HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 84; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(16300 + i) << 12), HV_ACC_READ, 1, &got);
+        cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
+        CHECK("the last entry in use is filled in the other layout", cpu.tlb[HV_TLB_SIZE * 4 - 2].read_tag != HV_TLB_INVALID);
+        MSR_TTBR1(11ull << 48);
+        COUNT(cpu.tlb, sizeof cpu.tlb, HV_TLB_INVALID);
+        CHECK("and dropped with every kernel entry", left == 0);
+        MSR_TTBR1((11ull << 48) | kr);
+        cpu.pstate_extra |= HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 84; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(16300 + i) << 12), HV_ACC_READ, 1, &got);
+        cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
+        hv_tlb_flush(&cpu);
+        ALL_EMPTY("after a flush in the other layout");
+        hv_tlb_tmajor = 1;
+        hv_tlb_flush(&cpu);
+        /* As many ASIDs as are noted singly: a flush clears those and nothing else. One more: all of asid_cid. */
+#define ASIDS_WITH_IDS()                                                         \
+    do {                                                                         \
+        left = 0;                                                                \
+        for (uint32_t a_ = 0; a_ < 65536; a_++) left += cpu.asid_cid[a_] != 0;   \
+    } while (0)
+        for (int more = 0; more < 2; more++) {
+            hv_tlb_flush(&cpu);
+            for (int a = 500; cpu.nasid_notes < HV_ASID_NOTES + (uint32_t)more; a++) SWITCH_TO(a, ur);
+            CHECK(more ? "one ASID more than is noted singly" : "exactly as many ASIDs as are noted singly", cpu.nasid_notes == HV_ASID_NOTES + (uint32_t)more);
+            cpu.asid_cid[60000] = 7; /* nothing noted this one */
+            hv_tlb_flush(&cpu);
+            ASIDS_WITH_IDS();
+            if (!more) CHECK("the noted ones are cleared, and what nothing noted is left", left == 2 && cpu.asid_cid[60000] == 7);
+            else CHECK("with more than fit, all of it is cleared", left == 1 && cpu.asid_cid[60000] == 0);
+            cpu.asid_cid[60000] = 0;
+        }
+        /* The user ids run out while an ASID is given one: everything is emptied first, and that ASID is noted after. */
+        hv_tlb_flush(&cpu);
+        cpu.next_cid = 0x10000;
+        SWITCH_TO(300, ur);
+        CHECK("the ids started over, with ASID 0 (passed through on the way) and this one given the first two", cpu.next_cid == 3 && cpu.asid_cid[0] && cpu.asid_cid[300]);
+        SWITCH_TO(900, ur2);
+        hv_tlb_flush(&cpu);
+        ASIDS_WITH_IDS();
+        CHECK("a flush after that clears the ASID that was given an id as they ran out", left == 1 && cpu.asid_cid[300] == 0 && cpu.asid_cid[0] == 0);
+        /* The set of user code pages is half full while a branch target is cached: the user half starts over
+           inside the fill, which then goes on to record the page. */
+        SWITCH_TO(11, ur);
+        blocks[1] = (HvBlock){.va = UV + 0x222040, .flags = 0, .code = (uint32_t *)(uintptr_t)0x1234};
+        hv_ijc_fill(&cpu, &blocks[1]);
+        p->ucode_count = (1u << HV_UCODE_BITS) / 2;
+        blocks[2] = (HvBlock){.va = UV + 0x333040, .flags = 0, .code = (uint32_t *)(uintptr_t)0x1234};
+        hv_ijc_fill(&cpu, &blocks[2]);
+        CHECK("the user half started over inside the fill, and the page was recorded after", p->ucode_count == 1);
+        hv_tlb_flush(&cpu);
+        ALL_EMPTY("after a flush that follows a restart inside a fill");
+        /* The branch cache's filter is an eighth full: both halves start over inside the fill. */
+        SWITCH_TO(11, ur);
+        blocks[3] = (HvBlock){.va = KG + 0x444080, .flags = HV_BLOCK_EL1, .code = (uint32_t *)(uintptr_t)0x1234};
+        hv_ijc_fill(&cpu, &blocks[3]);
+        p->ijc_keyed_count = 1u << 17;
+        blocks[4] = (HvBlock){.va = UV + 0x555040, .flags = 0, .code = (uint32_t *)(uintptr_t)0x1234};
+        hv_ijc_fill(&cpu, &blocks[4]);
+        CHECK("the filter started over inside the fill", p->ijc_keyed_count <= 1);
+        hv_tlb_flush(&cpu);
+        ALL_EMPTY("after a flush that follows both halves starting over inside a fill");
+        /* The kernel's generations run out: its half of the cache and its hints are cleared whole, notes and all. */
+        blocks[5] = (HvBlock){.va = KG + 0x666080, .flags = HV_BLOCK_EL1, .code = (uint32_t *)(uintptr_t)0x1234};
+        hv_ijc_fill(&cpu, &blocks[5]);
+        cpu.kernel_gen = 0xfffe;
+        hv_tlb_flush(&cpu);
+        CHECK("the kernel's generations started over", cpu.kernel_gen == 1);
+        ALL_EMPTY("after the kernel's generations ran out");
+#undef ASIDS_WITH_IDS
+        hv_knob[HV_K_FLUSH_CHECK] = 1;
+#undef ALL_EMPTY
+#undef COUNT
+#undef SWITCH_TO
 #undef MSR_TTBR0
 #undef MSR_TTBR1
 #undef CHECK

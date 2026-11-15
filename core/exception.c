@@ -165,14 +165,30 @@ static uint64_t psci(HvCpu *cpu, uint64_t fn) {
     case 0x84000003: case 0xc4000003: {                      /* CPU_ON: target, entry point, context id */
         HvCpu *t = cpu_by_mpidr(cpu->m, cpu->x[1]);
         if (!t) return (uint64_t)-2;                         /* INVALID_PARAMETERS */
-        if (!t->off) return (uint64_t)-4;                    /* ALREADY_ON */
-        while (!__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST)) sched_yield(); /* still on its way out of CPU_OFF */
-        uint64_t mpidr = t->mpidr, entry = cpu->x[2], context = cpu->x[3];
+        uint64_t entry = cpu->x[2], context = cpu->x[3];
         if ((uint32_t)fn == 0x84000003) entry = (uint32_t)entry, context = (uint32_t)context;
-        /* As at reset: EL1h, MMU and caches off, everything masked. Its thread
-           waits on wake_mu, so it cannot see the CPU half reset. */
-        pthread_mutex_lock(&t->pc_state->wake_mu);
+        /* The target is reset only while it sleeps in wait_while_off, which it enters and leaves with wake_mu
+           held: off and parked_off, both seen under wake_mu, is a CPU asleep there, which cannot see itself
+           half reset. Off alone is a CPU on its way there (its CPU_OFF was taken and it has not parked yet), also
+           one that another CPU's CPU_ON started a moment ago and that turned itself off again: it is waited
+           for, not reset while it runs. */
         HvPerCpu *pcs = t->pc_state;
+        for (;;) {
+            pthread_mutex_lock(&pcs->wake_mu);
+            if (!t->off) { /* on, or another CPU's CPU_ON for it got here first */
+                pthread_mutex_unlock(&pcs->wake_mu);
+                return (uint64_t)-4;                         /* ALREADY_ON */
+            }
+            if (cpu->halted || t->halted) { /* the machine is stopping: it will not park, or is leaving its wait to stop */
+                pthread_mutex_unlock(&pcs->wake_mu);
+                return (uint64_t)-3;                         /* DENIED */
+            }
+            if (__atomic_load_n(&t->parked_off, __ATOMIC_SEQ_CST)) break;
+            pthread_mutex_unlock(&pcs->wake_mu);
+            sched_yield();
+        }
+        uint64_t mpidr = t->mpidr;
+        /* As at reset: EL1h, MMU and caches off, everything masked. */
         hv_cpu_reset_index(t, cpu->m, t->index);
         t->mpidr = mpidr;
         t->pc = entry;
