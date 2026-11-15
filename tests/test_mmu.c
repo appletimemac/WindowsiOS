@@ -821,6 +821,68 @@ int main(void) {
                                                               p->ijc_pages[1][9] == 0 && cpu.asid_cid[4000] == 0 && *recorded == 0);
         ALL_EMPTY("after a whole flush");
 
+        /* Dropping every kernel entry (the first kernel table, or none any more) looks only at noted pieces
+           too: all of them go, listed or global, the processes' stay, and a piece nothing noted is not read. */
+        SWITCH_TO(11, ur);
+        for (uint32_t i = 0; i < 600; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(2000 + i * 7) << 12), i & 1 ? HV_ACC_WRITE : HV_ACC_EXEC, 1, &got);
+        for (uint32_t i = 0; i < 4200; i++) hv_mmu_access(&cpu, KN + ((uint64_t)(8000 + i) << 12), HV_ACC_READ, 1, &got);
+        cpu.pstate_extra |= HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 300; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(13000 + i) << 12), HV_ACC_READ, 1, &got);
+        cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 200; i++) hv_mmu_access(&cpu, UV + ((uint64_t)(6000 + i) << 12), HV_ACC_READ, 0, &got);
+        HvTlbEntry *unnoted = hv_tlb_ent(&cpu, 15000, 1); /* a kernel page in the kernel's table, in a piece nobody noted */
+        unnoted->read_tag = 0xffffffc012345000ull - HV_TLB_ADJ;
+        unnoted->addend = 0;
+        size_t kernel_left = 0, user_left = 0;
+#define KERNEL_AND_USER()                                                                        \
+    do {                                                                                         \
+        kernel_left = user_left = 0;                                                             \
+        for (uint32_t i_ = 0; i_ < HV_TLB_SIZE * 4; i_++) {                                      \
+            const HvTlbEntry *e_ = &cpu.tlb[i_];                                                 \
+            if (e_ == unnoted || (e_->read_tag == HV_TLB_INVALID && e_->exec_tag == HV_TLB_INVALID && e_->write_tag == HV_TLB_INVALID)) continue; \
+            uint64_t va_ = e_->read_tag != HV_TLB_INVALID ? e_->read_tag + HV_TLB_ADJ : e_->exec_tag != HV_TLB_INVALID ? hv_exec_key(e_->exec_tag, e_->addend) : e_->write_tag + HV_TLB_ADJ; \
+            if ((va_ >> 55) & 1) kernel_left++;                                                  \
+            else user_left++;                                                                    \
+        }                                                                                        \
+    } while (0)
+        KERNEL_AND_USER();
+        CHECK("kernel entries of every kind are in the TLB, and a process's", kernel_left > 5000 && user_left >= 200);
+        MSR_TTBR1(11ull << 48); /* no kernel table any more */
+        KERNEL_AND_USER();
+        CHECK("every kernel entry is dropped when the kernel table goes", kernel_left == 0);
+        CHECK("the process's entries stay", user_left >= 200);
+        CHECK("and a piece nothing noted is not looked at", unnoted->read_tag != HV_TLB_INVALID);
+        MSR_TTBR1((11ull << 48) | kr);
+        for (uint32_t i = 0; i < 50; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(100 + i) << 12), HV_ACC_READ, 1, &got);
+        hv_knob[HV_K_FLUSH_WHOLE] = 1;
+        MSR_TTBR1(11ull << 48);
+        hv_knob[HV_K_FLUSH_WHOLE] = 0;
+        KERNEL_AND_USER();
+        CHECK("with HV_FLUSH_WHOLE the whole of the tables is looked at, that piece too", kernel_left == 0 && unnoted->read_tag == HV_TLB_INVALID);
+        MSR_TTBR1((11ull << 48) | kr);
+#undef KERNEL_AND_USER
+        hv_tlb_flush(&cpu);
+
+        /* The other layout of the TLB (a slot's tables side by side): the highest slots are then the last
+           pieces of the array, which the layout above leaves to the table nothing uses. */
+        hv_tlb_tmajor = 0;
+        hv_tlb_flush(&cpu);
+        SWITCH_TO(11, ur);
+        cpu.pstate_extra |= HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 84; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(16300 + i) << 12), HV_ACC_READ, 1, &got);
+        cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
+        CHECK("the last entry in use is filled in the other layout", cpu.tlb[HV_TLB_SIZE * 4 - 2].read_tag != HV_TLB_INVALID);
+        MSR_TTBR1(11ull << 48);
+        COUNT(cpu.tlb, sizeof cpu.tlb, HV_TLB_INVALID);
+        CHECK("and dropped with every kernel entry", left == 0);
+        MSR_TTBR1((11ull << 48) | kr);
+        cpu.pstate_extra |= HV_PSTATE_PAN;
+        for (uint32_t i = 0; i < 84; i++) hv_mmu_access(&cpu, KG + ((uint64_t)(16300 + i) << 12), HV_ACC_READ, 1, &got);
+        cpu.pstate_extra &= ~(uint64_t)HV_PSTATE_PAN;
+        hv_tlb_flush(&cpu);
+        ALL_EMPTY("after a flush in the other layout");
+        hv_tlb_tmajor = 1;
+        hv_tlb_flush(&cpu);
         /* As many ASIDs as are noted singly: a flush clears those and nothing else. One more: all of asid_cid. */
 #define ASIDS_WITH_IDS()                                                         \
     do {                                                                         \

@@ -1192,11 +1192,29 @@ static void drop_kernel_fills(HvCpu *cpu) {
         }
         return;
     }
-    for (int t = 0; t < 3; t++)
-        for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
-            HvTlbEntry *e = hv_tlb_ent(cpu, i, t);
-            if (kernel_entry(e)) memset(e, 0x80, sizeof *e);
-        }
+    /* Every kernel entry, listed or not (the global ones are not). Each valid entry is in a noted piece of the
+       TLB (hv_tlb_note), so only those are looked at: a boot loader that swaps its tables around every firmware
+       call comes here thousands of times a second with a handful of entries filled. */
+    if (!cpu->tlb_noted || hv_knob[HV_K_FLUSH_WHOLE]) {
+        for (int t = 0; t < 3; t++)
+            for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
+                HvTlbEntry *e = hv_tlb_ent(cpu, i, t);
+                if (kernel_entry(e)) memset(e, 0x80, sizeof *e);
+            }
+    } else {
+        for (size_t w = 0; w < sizeof cpu->tlb_dirty / 8; w++)
+            for (uint64_t bits = cpu->tlb_dirty[w]; bits; bits &= bits - 1) {
+                HvTlbEntry *e = &cpu->tlb[(w * 64 + (size_t)__builtin_ctzll(bits)) << HV_TLB_PIECE_BITS];
+                for (int k = 0; k < 1 << HV_TLB_PIECE_BITS; k++)
+                    if (kernel_entry(&e[k])) memset(&e[k], 0x80, sizeof e[k]);
+            }
+    }
+    if (hv_knob[HV_K_FLUSH_CHECK])
+        for (uint32_t i = 0; i < HV_TLB_SIZE * 4; i++)
+            if (kernel_entry(&cpu->tlb[i])) {
+                fprintf(stderr, "winvm: flush check: a kernel entry is left at %u after every kernel entry was dropped\n", i);
+                abort();
+            }
 }
 
 int hv_tlb_drop_kernel_asid(HvCpu *cpu) {
