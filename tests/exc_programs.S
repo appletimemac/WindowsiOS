@@ -200,6 +200,18 @@ PROGRAM p_psci
     mov x2, x0
 END p_psci
 
+// PSCI CPU_ON for the CPU with MPIDR 1, entry point 0x4000, context 0x55: the result in x5.
+PROGRAM p_cpu_on
+    SETUP
+    movz x0, #0xc400, lsl #16
+    movk x0, #0x0003
+    mov x1, #1
+    movz x2, #0x4000
+    mov x3, #0x55
+    hvc #0
+    mov x5, x0
+END p_cpu_on
+
 // Copied into writable RAM by the test: rewrites its own subroutine.
 PROGRAM p_smc
     mov x1, #0

@@ -1,7 +1,9 @@
 #include "harness.h"
 
 #include <mach/mach_time.h>
+#include <pthread.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 DECLARE_PROGRAM(p_svc);
 DECLARE_PROGRAM(p_brk_undef);
@@ -11,6 +13,7 @@ DECLARE_PROGRAM(p_sysregs);
 DECLARE_PROGRAM(p_irq);
 DECLARE_PROGRAM(p_fptrap);
 DECLARE_PROGRAM(p_psci);
+DECLARE_PROGRAM(p_cpu_on);
 DECLARE_PROGRAM(p_smc);
 DECLARE_PROGRAM(p_smc_nomaint);
 DECLARE_PROGRAM(p_smc_byte);
@@ -21,6 +24,17 @@ extern const char exc_programs_begin[], exc_programs_finish[];
 static HvMachine m;
 static uint8_t *stack;
 static int failures, checks;
+
+/* A CPU whose CPU_OFF was taken a moment ago: it goes on writing its own state until it parks. */
+static void *park_later(void *arg) {
+    HvCpu *t = arg;
+    usleep(50000);
+    t->x[7] = 0x77;
+    pthread_mutex_lock(&t->pc_state->wake_mu);
+    __atomic_store_n(&t->parked_off, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&t->pc_state->wake_mu);
+    return NULL;
+}
 
 static void ack_write(void *opaque, uint64_t off, uint64_t val, unsigned size) {
     (void)off, (void)val, (void)size;
@@ -171,6 +185,59 @@ int main(void) {
         hv_ram_written(&m, ADDR(code), len); /* a host write, like a device's: blocks left from the program before go */
         TestProgram copy = {p->name, NULL, code, code + ((const char *)p->end - (const char *)p->start)};
         if (!run(&copy, &c, 0)) check(p->name, "1 then 2 after patching", c.x[1], 3);
+    }
+
+    /* PSCI CPU_ON resets its target only while that CPU sleeps in its power-off wait: it is seen parked under
+       the lock it parks with. (Last here: a second CPU is in the machine from now on.) */
+    {
+        static HvCpu t;
+        static const TestProgram on = TEST_PROGRAM(p_cpu_on);
+        hv_cpu_reset_index(&t, &m, 1);
+        t.mpidr = 1;
+        t.off = 1;
+        t.parked_off = 1;
+        t.x[7] = 0x77;
+        if (!run(&on, &c, 0)) {
+            check("cpu_on", "a parked CPU is started", c.x[5], 0);
+            check("cpu_on", "it is on", (uint64_t)t.off, 0);
+            check("cpu_on", "at the entry point", t.pc, 0x4000);
+            check("cpu_on", "with the context", t.x[0], 0x55);
+            check("cpu_on", "from the reset state", t.x[7], 0);
+            check("cpu_on", "and still the same CPU", t.mpidr, 1);
+        }
+        t.x[7] = 0x77;
+        if (!run(&on, &c, 0)) {
+            check("cpu_on", "a CPU that is on is refused", c.x[5], (uint64_t)-4);
+            check("cpu_on", "and left as it is", t.x[7], 0x77);
+        }
+        /* Off but not parked yet: it is waited for, and reset once it sleeps, not while it still runs. */
+        t.off = 1;
+        t.parked_off = 0;
+        t.x[7] = 0;
+        pthread_t th;
+        pthread_create(&th, NULL, park_later, &t);
+        int ran = !run(&on, &c, 0);
+        pthread_join(th, NULL); /* what it wrote while it still ran is there now, if the reset came before it */
+        if (ran) {
+            check("cpu_on", "a CPU on its way to parking is started", c.x[5], 0);
+            check("cpu_on", "once it had parked, not while it ran", t.x[7], 0);
+        }
+        /* Off, not parked, and the machine is stopping: no reset, and no wait for a park that will not come. */
+        t.off = 1;
+        t.parked_off = 0;
+        t.halted = 3;
+        t.x[7] = 0x77;
+        if (!run(&on, &c, 0)) {
+            check("cpu_on", "refused while the machine stops", c.x[5], (uint64_t)-3);
+            check("cpu_on", "and the CPU is left as it is", t.x[7], 0x77);
+        }
+        /* Parked, and leaving its wait to stop: not started again either. */
+        t.parked_off = 1;
+        if (!run(&on, &c, 0)) {
+            check("cpu_on", "refused for a parked CPU that is stopping", c.x[5], (uint64_t)-3);
+            check("cpu_on", "which stays stopping", (uint64_t)t.halted, 3);
+        }
+        t.halted = 0;
     }
 
     printf("%d checks, %d failures\n", checks, failures);
