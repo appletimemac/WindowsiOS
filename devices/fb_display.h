@@ -108,6 +108,13 @@ typedef struct HvFbRect {
 /* Where a tex_w by tex_h picture goes when it is fitted into `content` of a draw_w by draw_h pixel drawable:
    aspect kept, centred, as large as fits. */
 HvFbRect hv_fb_fit(double draw_w, double draw_h, uint32_t tex_w, uint32_t tex_h, HvFbRect content);
+/* How a picture is drawn at `scale` drawable pixels to the guest pixel. A whole number: every guest pixel as it
+   is. Any other enlargement: a drawable pixel takes the guest pixels it covers, each by its share of it, so a
+   guest pixel stays solid with at most one mixed pixel along each edge. A reduction: smoothed. */
+typedef enum HvFbDraw { HV_FB_DRAW_EXACT, HV_FB_DRAW_COVER, HV_FB_DRAW_SMOOTH } HvFbDraw;
+HvFbDraw hv_fb_draw_for(double scale);
+/* The presenter's shaders (Metal source), for the tests that draw with them. */
+const char *hv_fb_metal_shader_source(void);
 
 /* Metal layer presentation & PNG screenshot helpers (implemented in devices/fb_metal.m) */
 void hv_fb_metal_set_layer(HvFbDisplay *fb, void *ca_metal_layer);
