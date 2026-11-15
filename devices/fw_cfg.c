@@ -210,6 +210,19 @@ HvFwCfg *hv_fw_cfg_create(HvMachine *m, uint64_t pa, uint16_t ncpus) {
     fc->fixed_len[0x05] = 2;
     memcpy(fc->fixed[0x0f], &ncpus, 2);
     fc->fixed_len[0x0f] = 2;
+    /* 0x000e and etc/boot-menu-wait: the boot menu "on" with a wait of 0 ms, as QEMU's -boot menu=on,splash-time=0.
+       The firmware's boot manager then starts the first boot option at once; without them it waits its default
+       of five seconds for a key, on every boot, and nobody presses one on a phone. HV_BOOT_MENU_WAIT_MS asks for
+       another wait (the firmware counts whole seconds, rounded up), for one who wants its menu. A negative one
+       leaves it to the firmware, which keeps the last wait it was given in its NVRAM (the Timeout variable). */
+    const char *wait = getenv("HV_BOOT_MENU_WAIT_MS");
+    long wait_ms = wait ? strtol(wait, NULL, 10) : 0;
+    if (wait_ms >= 0) {
+        uint16_t menu = 1, ms = wait_ms > 0xffff ? 0xffff : (uint16_t)wait_ms;
+        memcpy(fc->fixed[0x0e], &menu, 2);
+        fc->fixed_len[0x0e] = 2;
+        hv_fw_cfg_add_file(fc, "etc/boot-menu-wait", &ms, 2);
+    }
 
     rebuild_dir(fc);
     hv_machine_add_mmio(m, pa, 0x1000, fc, fw_cfg_read, fw_cfg_write, "fw_cfg");
