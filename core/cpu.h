@@ -74,7 +74,7 @@ typedef struct HvCpu {
     uint64_t ijc_salt[2];    /* 0x3d8: tags are VA ^ salt, [0] for user (EL0) tables, [1] kernel (see hv_ijc_* in mmu.c) */
     uint64_t miss_site;      /* 0x3e8: --stats: guest PC of the branch whose cache lookup just missed */
     uint64_t excl_addr;      /* 0x3f0: exclusive monitor: guest VA, or ~0 when clear */
-    uint32_t excl_size;      /* 0x3f8: bytes the LDXR read */
+    uint32_t excl_size;      /* 0x3f8: bytes the LDXR read, with HV_EXCL_PAIR if it was a pair's load */
     uint32_t spsel;          /* 0x3fc: SPSel (translated MSR SPSel writes it) */
     uint64_t excl_val[2];    /* 0x400: what it read (a pair's two halves) */
     uint64_t host_sp;        /* 0x410: the host's stack while blocks run: they keep the guest SP in the SP register */
@@ -100,6 +100,11 @@ typedef struct HvCpu {
     uint64_t mdscr_el1;        /* 0x538 */
     uint64_t mem_sites;        /* 0x540: HvMachine.mem_sites: a load or store's slow path names its HvMemSite by number */
     uint64_t jit_base;         /* 0x548: the JIT region's start, which an HvMemSite counts words from */
+    /* The other half of the exclusive monitor (hv_excl_bucket in machine.h says what the versions are for). */
+    uint64_t excl_ver;         /* 0x550: the version the place's bucket had when the exclusive load read it */
+    uint64_t excl_tab;         /* 0x558: HvMachine.excl_ver, every CPU's */
+    uint64_t excl_tmp[2];      /* 0x560: a translated exclusive store's host pointer and bucket while it holds the bucket */
+    uint64_t excl_host;        /* 0x570: the host address the exclusive load read (0: a device's) */
     /* 0x580: [0] EL0 and unprivileged accesses, [1] EL1, [2] EL1 with PSTATE.PAN set,
        so toggling PAN (the kernel does it around every user copy) flushes nothing.
        [slot][EL0, EL1, EL1 with PAN, unused]: a slot's three in one 128-byte cache line. */
@@ -114,9 +119,12 @@ typedef struct HvCpu {
     struct HvMachine *m;
     uint32_t el;
 
-    /* The exclusive monitor is excl_addr, excl_size and excl_val above: STXR is a
-       compare-and-swap against the value the LDXR saw, the way QEMU does it, so
-       another CPU's store in between makes it fail. */
+    /* The exclusive monitor is excl_addr, excl_size and excl_val above, and excl_ver and excl_host:
+       STXR is a compare-and-swap against the value the LDXR saw, which fails after another CPU's
+       store of another value, made only to the host address the LDXR read (the guest address can
+       have been mapped elsewhere since) and only while that place's bucket still has the version the
+       LDXR saw, which fails after any other exclusive store there, one that put the same value back
+       included. */
 
     uint64_t tcr_el1;
     uint64_t mair_el1;
@@ -238,6 +246,13 @@ typedef struct HvCpu {
 #define HV_CPU_MEM_THUNK   0x4f8
 #define HV_CPU_MEM_SITES   0x540
 #define HV_CPU_JIT_BASE    0x548
+/* In excl_size: the load was LDXP. Two words of 32 bits and one of 64 are both 8 bytes, and a store of the one
+   form after a load of the other is not that load's store. */
+#define HV_EXCL_PAIR       0x20
+#define HV_CPU_EXCL_VER    0x550
+#define HV_CPU_EXCL_TAB    0x558
+#define HV_CPU_EXCL_TMP    0x560
+#define HV_CPU_EXCL_HOST   0x570
 
 /* Indirect-branch cache: one table per block-flags value, 64K entries of 16 bytes,
    indexed by ((va ^ va >> 16) >> 2) so code at the same offset in different pages spreads out. */
@@ -272,6 +287,10 @@ _Static_assert(offsetof(HvCpu, slot_targets) == HV_CPU_SLOT_TARGETS, "HvCpu layo
 _Static_assert(offsetof(HvCpu, mem_thunk) == HV_CPU_MEM_THUNK, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, mem_sites) == HV_CPU_MEM_SITES, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, jit_base) == HV_CPU_JIT_BASE, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, excl_ver) == HV_CPU_EXCL_VER, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, excl_tab) == HV_CPU_EXCL_TAB, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, excl_tmp) == HV_CPU_EXCL_TMP, "HvCpu layout");
+_Static_assert(offsetof(HvCpu, excl_host) == HV_CPU_EXCL_HOST, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, tpidr_el0) == HV_CPU_TPIDR_EL0, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, daif) == HV_CPU_DAIF, "HvCpu layout");
 _Static_assert(offsetof(HvCpu, far_el1) == HV_CPU_FAR_EL1, "HvCpu layout");

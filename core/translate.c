@@ -842,9 +842,92 @@ static void translate_branch_reg(Emit *e, uint32_t insn, uint64_t pc) {
    for x18/x28 operands. A miss goes out of line to hv_mem_emulate, which does
    the whole instruction (writeback included) and comes back to the join. */
 static void translate_mem(Emit *e, uint32_t insn, uint64_t pc);
-static void translate_mem_impl(Emit *e, uint32_t insn, uint64_t pc, int from_excl);
 static void put_load_field(Emit *e, int rt, uint32_t off);
 static void put_store_field(Emit *e, int rt, uint32_t off);
+
+/* Exclusive loads and stores, in translated code. The load notes the place's address, size, value and the
+   version of its bucket (hv_excl_bucket, machine.h); the store is made only if all four still hold: it takes the
+   bucket from that version, compares and swaps the value, and gives the bucket back, two on if it stored.
+   Nothing between taking the bucket and giving it back can fault or leave the block.
+
+   x6 = the bucket of the host pointer in x15. Clobbers x7. */
+static void put_excl_bucket(Emit *e) {
+    put(e, LDR_X(6, 28, HV_CPU_EXCL_TAB));
+    put(e, UBFM_X(7, 15, 4, 4 + HV_EXCL_BITS - 1)); /* ubfx x7, x15, #4, #HV_EXCL_BITS */
+    put(e, ADD_LSL(6, 6, 7, HV_EXCL_STRIDE_BITS));
+}
+
+/* An exclusive load, before it reads: the host pointer in x15, and the version of the place there. Clobbers x6
+   and x7. */
+static void put_excl_seen(Emit *e) {
+    put(e, STR_X(15, 28, HV_CPU_EXCL_HOST));
+    put_excl_bucket(e);
+    put(e, 0xc8dffc00u | 6u << 5 | 6u); /* ldar x6, [x6] */
+    put(e, STR_X(6, 28, HV_CPU_EXCL_VER));
+}
+
+typedef struct {
+    uint32_t fail[3]; /* the store is not of what the load read: no bucket taken, the monitor still to clear */
+    uint32_t lost[2]; /* another exclusive store came first: no bucket taken */
+} ExclOut;
+
+/* An exclusive store's first part, with the guest address in x6 and the host pointer in x15: checks the load's
+   address, size (`noted`: what its load put in excl_size) and host address, clears the monitor, and takes the
+   bucket. Falls through holding it, x15 as it was; x6 and x7 are free. */
+static void put_excl_take(Emit *e, uint32_t noted, ExclOut *o) {
+    put(e, LDR_X(7, 28, HV_CPU_EXCL_ADDR));
+    put(e, 0xca000000u | 6u << 16 | 7u << 5 | 7u); /* eor x7, x7, x6 */
+    o->fail[0] = e->n;
+    put(e, CBNZ_X(7));
+    put(e, 0xb9400000u | (HV_CPU_EXCL_SIZE / 4) << 10 | 28 << 5 | 7); /* ldr w7, [x28, #excl_size] */
+    put(e, 0xd1000000u | noted << 10 | 7u << 5 | 7u);                 /* sub x7, x7, #noted */
+    o->fail[1] = e->n;
+    put(e, CBNZ_X(7));
+    put(e, LDR_X(7, 28, HV_CPU_EXCL_HOST));
+    put(e, 0xca000000u | 15u << 16 | 7u << 5 | 7u); /* eor x7, x7, x15 */
+    o->fail[2] = e->n;
+    put(e, CBNZ_X(7));
+    put(e, 0x92800007u); /* movn x7, #0: the monitor clears whatever comes of the store */
+    put(e, STR_X(7, 28, HV_CPU_EXCL_ADDR));
+    put(e, STR_X(15, 28, HV_CPU_EXCL_TMP));
+    put_excl_bucket(e);
+    put(e, STR_X(6, 28, HV_CPU_EXCL_TMP + 8));
+    put(e, LDR_X(7, 28, HV_CPU_EXCL_VER));
+    o->lost[0] = e->n;
+    put(e, 0x37000007u);                             /* tbnz w7, #0: the load read while a store held the bucket */
+    put(e, 0xb24000efu);                             /* orr x15, x7, #1 */
+    put(e, 0xc8e0fc00u | 7u << 16 | 6u << 5 | 15u);  /* casal x7, x15, [x6]: held, if it still had that version */
+    put(e, LDR_X(15, 28, HV_CPU_EXCL_VER));
+    put(e, 0xca000000u | 15u << 16 | 7u << 5 | 7u);  /* eor x7, x7, x15 */
+    o->lost[1] = e->n;
+    put(e, CBNZ_X(7));
+    put(e, LDR_X(15, 28, HV_CPU_EXCL_TMP));
+}
+
+/* Its last part: x6 is zero if the value's compare-and-swap stored. Gives the bucket back and writes the
+   status to rs. Clobbers x6, x7 and x15. */
+static void put_excl_give(Emit *e, int rs, const ExclOut *o) {
+    put(e, LDR_X(7, 28, HV_CPU_EXCL_TMP + 8));
+    put(e, LDR_X(15, 28, HV_CPU_EXCL_VER));
+    uint32_t to_same = e->n;
+    put(e, CBNZ_X(6));
+    put(e, 0x91000000u | 2u << 10 | 15u << 5 | 15u); /* add x15, x15, #2 */
+    put(e, 0xc89ffc00u | 7u << 5 | 15u);             /* stlr x15, [x7] */
+    put_const_to(e, rs, 0);
+    uint32_t to_done = e->n;
+    put(e, B_OP);
+    for (int i = 0; i < 3; i++) patch_branch(&e->w[o->fail[i]], (int64_t)e->n - o->fail[i]);
+    put(e, 0x92800007u);
+    put(e, STR_X(7, 28, HV_CPU_EXCL_ADDR));
+    uint32_t to_one = e->n;
+    put(e, B_OP);
+    patch_branch(&e->w[to_same], (int64_t)e->n - to_same);
+    put(e, 0xc89ffc00u | 7u << 5 | 15u);             /* stlr x15, [x7]: nothing was stored, the version stays */
+    patch_branch(&e->w[to_one], (int64_t)e->n - to_one);
+    for (int i = 0; i < 2; i++) patch_branch(&e->w[o->lost[i]], (int64_t)e->n - o->lost[i]);
+    put_const_to(e, rs, 1);
+    patch_branch(&e->w[to_done], (int64_t)e->n - to_done);
+}
 
 /* LDXP/LDAXP and STXP/STLXP (64-bit or 128-bit exclusive pairs): Windows 11
    SLISTs (ExInterlockedPopEntrySList / PushEntrySList) execute these 400K+/s.
@@ -852,7 +935,7 @@ static void put_store_field(Emit *e, int rt, uint32_t off);
    and native host LDP / CASAL / CASPAL after a single aligned TLB check. */
 static void translate_excl_pair(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t sz = (insn >> 30) & 1; /* 0: two 32-bit words (8B), 1: two 64-bit words (16B) */
-    uint32_t bytes = 8u << sz, k = 3u + sz;
+    uint32_t bytes = 8u << sz, k = 3u + sz, noted = bytes | HV_EXCL_PAIR;
     int rn = (insn >> 5) & 0x1f, rt = insn & 0x1f, rt2 = (insn >> 10) & 0x1f, rs = (insn >> 16) & 0x1f;
     int load = (insn >> 22) & 1, acqrel = (insn >> 15) & 1;
     if ((load && rt == rt2 && rt != 31) || (!load && (rs == 31 || rs == rt || rs == rt2 || rs == rn))) {
@@ -878,8 +961,9 @@ static void translate_excl_pair(Emit *e, uint32_t insn, uint64_t pc) {
 
     if (load) {
         put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
-        put(e, 0x52800007u | bytes << 5);
+        put(e, 0x52800007u | noted << 5);
         put(e, 0xb9000000u | (HV_CPU_EXCL_SIZE / 4) << 10 | 28 << 5 | 7);
+        put_excl_seen(e);
         if (!sz) {
             put(e, acqrel ? (0xc8dffc06u | 15u << 5) : LDR_X(6, 15, 0)); /* ldar / ldr x6, [x15] */
             put(e, UBFM_X(7, 6, 32, 63));
@@ -896,17 +980,9 @@ static void translate_excl_pair(Emit *e, uint32_t insn, uint64_t pc) {
         return;
     }
 
-    /* STXP / STLXP: check excl_addr == va && excl_size == bytes */
-    put(e, LDR_X(7, 28, HV_CPU_EXCL_ADDR));
-    put(e, 0xca000000u | 6u << 16 | 7u << 5 | 7u); /* eor x7, x7, x6 */
-    uint32_t to_fail1 = e->n;
-    put(e, CBNZ_X(7));
-    put(e, 0xb9400000u | (HV_CPU_EXCL_SIZE / 4) << 10 | 28 << 5 | 7); /* ldr w7, [x28, #excl_size] */
-    put(e, 0xd1000000u | bytes << 10 | 7u << 5 | 7u);                 /* sub x7, x7, #bytes */
-    uint32_t to_fail2 = e->n;
-    put(e, CBNZ_X(7));
-    put(e, 0x92800007u); /* movn x7, #0 */
-    put(e, STR_X(7, 28, HV_CPU_EXCL_ADDR));
+    /* STXP / STLXP */
+    ExclOut out;
+    put_excl_take(e, noted, &out);
 
     /* Borrow an even non-stolen pair (p0, p1) != rs for CASPAL (w6/x6, w7/x7, wp0/xp0, wp1/xp1, [x15]). */
     int p0 = (rs == 0 || rs == 1) ? 2 : 0, p1 = p0 + 1;
@@ -928,59 +1004,49 @@ static void translate_excl_pair(Emit *e, uint32_t insn, uint64_t pc) {
     put(e, 0xca000000u | (uint32_t)p1 << 16 | 7u << 5 | 7u); /* eor x7, x7, xp1 */
     put(e, 0xaa0700c6u);                                      /* orr x6, x6, x7 */
     put(e, LDP_X(p0, p1, 28, HV_CPU_SPILL(0)));
-    uint32_t to_lost = e->n;
-    put(e, CBNZ_X(6));
-    put_const_to(e, rs, 0);
-    uint32_t to_done = e->n;
-    put(e, B_OP);
-    patch_branch(&e->w[to_fail1], (int64_t)e->n - to_fail1);
-    patch_branch(&e->w[to_fail2], (int64_t)e->n - to_fail2);
-    put(e, 0x92800007u);
-    put(e, STR_X(7, 28, HV_CPU_EXCL_ADDR));
-    patch_branch(&e->w[to_lost], (int64_t)e->n - to_lost);
-    put_const_to(e, rs, 1);
-    patch_branch(&e->w[to_done], (int64_t)e->n - to_done);
+    put_excl_give(e, rs, &out);
     e->ool[slow].join = e->n;
 }
 
-/* LDXR/LDAXR and STXR/STLXR (not the pairs), the way QEMU does them: LDXR is
-   an ordinary load that records the address, size and value; STXR, if the
-   address still matches, is a compare-and-swap of that value (CASAL, through
-   the ordinary fast path), and succeeds if memory still held it. Another CPU's
-   store in between makes it fail, and so does an exception (which clears the
-   address), as on hardware; only an ABA change goes unnoticed. */
+/* LDXR/LDAXR and STXR/STLXR (not the pairs). LDXR is a load that notes the address, size, value and the
+   bucket's version; STXR, if address and size still match, takes the bucket from that version and compares
+   and swaps the value (CASAL on the host pointer, after its own TLB check for a writable page). Another CPU's
+   exclusive store in between makes it fail, also one that put the same value back, and so do its plain store
+   of another value and an exception (which clears the address), as on hardware. What goes unnoticed is a
+   plain store, or a CAS instruction, of the value the load saw. */
 static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
     uint32_t size = insn >> 30;
     int rn = (insn >> 5) & 0x1f, rt = insn & 0x1f, rs = (insn >> 16) & 0x1f;
     int load = (insn >> 22) & 1;
-    if (!load && (rs == 31 || rs == rt || rs == rn)) { /* the status register is the CAS's compare value: keep these in C */
+    if (!load && (rs == 31 || rs == rt || rs == rn)) { /* forms nobody writes: in C */
         put_helper(e, pc, insn, HV_OP_MEM);
         return;
     }
+    int g_el = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
+    uint32_t bytes = 1u << size;
+    uint32_t retry = e->n;
+    if (rn == 31) put(e, ADD_SP_TO(6));
+    else if (is_stolen(rn)) put(e, LDR_X(6, 28, slot_of(rn)));
+    else put(e, MOV_X(6, rn));
+    uint32_t tlb = put_tlb_slot(e, 7, 6, g_el);
+    put(e, LDR_X(15, 7, tlb + (load ? 0 : 8)));
+    put(e, SUB_X(15, 6, 15));
+    put(e, 0xd1000000u | HV_TLB_ADJ << 10 | 15 << 5 | 15);
+    if (size == 0)
+        put(e, UBFM_X(15, 15, HV_TLB_PAGE_BITS, 63));
+    else
+        put(e, 0x92400000u | (64u - HV_TLB_PAGE_BITS) << 16 | (63u - HV_TLB_PAGE_BITS + size) << 10 | 15 << 5 | 15);
+    put(e, CBNZ_X(15));
+    uint32_t rflags = 1u << 9 | (size ? 1u << 10 : 0) | (uint32_t)(load ? 0 : 1) | (uint32_t)g_el << 1 | (bytes - 1) << 3;
+    put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .addr = 6, .retry = retry, .rflags = rflags});
+    uint32_t slow = e->nool - 1;
+    put(e, LDR_X(15, 7, tlb + 24));
+    put(e, ADD_LSL(15, 6, 15, 0)); /* x15 = host pointer, x6 = guest VA */
     if (load) {
-        int g_el = !(e->flags & HV_BLOCK_EL1) ? 0 : (e->flags & HV_BLOCK_PAN) ? 2 : 1;
-        uint32_t bytes = 1u << size;
-        uint32_t retry = e->n;
-        if (rn == 31) put(e, ADD_SP_TO(6));
-        else if (is_stolen(rn)) put(e, LDR_X(6, 28, slot_of(rn)));
-        else put(e, MOV_X(6, rn));
-        uint32_t tlb = put_tlb_slot(e, 7, 6, g_el);
-        put(e, LDR_X(15, 7, tlb));
-        put(e, SUB_X(15, 6, 15));
-        put(e, 0xd1000000u | HV_TLB_ADJ << 10 | 15 << 5 | 15);
-        if (size == 0)
-            put(e, UBFM_X(15, 15, HV_TLB_PAGE_BITS, 63));
-        else
-            put(e, 0x92400000u | (64u - HV_TLB_PAGE_BITS) << 16 | (63u - HV_TLB_PAGE_BITS + size) << 10 | 15 << 5 | 15);
-        put(e, CBNZ_X(15));
-        uint32_t rflags = 1u << 9 | (size ? 1u << 10 : 0) | (uint32_t)g_el << 1 | (bytes - 1) << 3;
-        put_ool(e, (Ool){.kind = OOL_SLOW, .pc = pc, .insn = insn, .addr = 6, .retry = retry, .rflags = rflags});
-        uint32_t slow = e->nool - 1;
-        put(e, LDR_X(15, 7, tlb + 24));
-        put(e, ADD_LSL(15, 6, 15, 0));
         put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
         put(e, 0x52800007u | bytes << 5);
         put(e, 0xb9000000u | (HV_CPU_EXCL_SIZE / 4) << 10 | 28 << 5 | 7);
+        put_excl_seen(e);
         if ((insn >> 15) & 1)
             put(e, size << 30 | 0x08dffc06u | 15u << 5); /* ldar{b,h,w,x} w6/x6, [x15] */
         else
@@ -990,45 +1056,20 @@ static void translate_excl(Emit *e, uint32_t insn, uint64_t pc) {
         e->ool[slow].join = e->n;
         return;
     }
-    int a = rn;
-    if (rn == 31) {
-        put(e, ADD_SP_TO(15));
-        a = 15;
-    } else if (is_stolen(rn)) {
-        put(e, LDR_X(15, 28, slot_of(rn)));
-        a = 15;
-    }
-    put(e, LDR_X(6, 28, HV_CPU_EXCL_ADDR));
-    put(e, 0xca000000u | (uint32_t)a << 16 | 6 << 5 | 6); /* eor x6, x6, xa */
-    uint32_t to_fail = e->n;
-    put(e, CBNZ_X(6));
-    put(e, 0x92800006u);                                   /* movn x6, #0: the monitor clears either way */
-    put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
-    put_load_field(e, rs, HV_CPU_EXCL_VAL);                /* rs = the value LDXR saw */
-    translate_mem_impl(e, size << 30 | 0x08e0fc00u | (uint32_t)rs << 16 | (uint32_t)rn << 5 | (uint32_t)rt, pc, 1); /* casal */
-    /* rs now holds what memory held: success if that is what LDXR saw. */
-    if (is_stolen(rs)) put(e, LDR_X(7, 28, slot_of(rs)));
-    else put(e, MOV_X(7, rs));
+    ExclOut out;
+    put_excl_take(e, bytes, &out);
+    if (rt == 31) put(e, 0xd2800007u); /* mov x7, #0 */
+    else if (is_stolen(rt)) put(e, LDR_X(7, 28, slot_of(rt)));
+    else put(e, MOV_X(7, rt));
     put(e, LDR_X(6, 28, HV_CPU_EXCL_VAL));
-    put(e, 0xca000000u | 7 << 16 | 6 << 5 | 6);            /* eor x6, x6, x7 */
-    uint32_t to_lost = e->n;
-    put(e, CBNZ_X(6));
-    put_const_to(e, rs, 0);
-    uint32_t to_done = e->n;
-    put(e, B_OP);
-    patch_branch(&e->w[to_fail], (int64_t)e->n - to_fail);
-    put(e, 0x92800006u);
-    put(e, STR_X(6, 28, HV_CPU_EXCL_ADDR));
-    patch_branch(&e->w[to_lost], (int64_t)e->n - to_lost);
-    put_const_to(e, rs, 1);
-    patch_branch(&e->w[to_done], (int64_t)e->n - to_done);
+    put(e, size << 30 | 0x08e0fc00u | 6u << 16 | 15u << 5 | 7u); /* casal{b,h,w,x} w6/x6, w7/x7, [x15] */
+    put(e, LDR_X(7, 28, HV_CPU_EXCL_VAL));
+    put(e, 0xca000000u | 7u << 16 | 6u << 5 | 6u);               /* eor x6, x6, x7: zero if it stored */
+    put_excl_give(e, rs, &out);
+    e->ool[slow].join = e->n;
 }
 
 static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
-    translate_mem_impl(e, insn, pc, 0);
-}
-
-static void translate_mem_impl(Emit *e, uint32_t insn, uint64_t pc, int from_excl) {
     HvMemOp op;
     if (hv_mem_decode(insn, &op) != 0) {
         put_helper(e, pc, insn, HV_OP_UNDEF);
@@ -1162,8 +1203,8 @@ static void translate_mem_impl(Emit *e, uint32_t insn, uint64_t pc, int from_exc
     }
     put(e, CBNZ_X(U));
     /* Writeback forms change their base, and the retry recomputes it: those
-       (and synthetic excl CAS or vector forms) go straight to the helper. */
-    int can_refill = !vec_kind && (!rmw || !from_excl) && op.mode != HV_ADDR_PRE && op.mode != HV_ADDR_POST && op.bytes <= 64 && !e->slow_mem;
+       (and vector forms) go straight to the helper. */
+    int can_refill = !vec_kind && op.mode != HV_ADDR_PRE && op.mode != HV_ADDR_POST && op.bytes <= 64 && !e->slow_mem;
     /* hv_tlb_refill's flags: bit 9 set (so never 0), bit 10 align, bit 0 write, bits 2..1 the table, 8..3 bytes - 1 */
     uint32_t rflags = can_refill ? 1u << 9 | (uint32_t)(host_align ? 1u << 10 : 0) |
                                    (uint32_t)(op.store ? 1 : 0) | (uint32_t)el_idx << 1 | (op.bytes - 1) << 3 : 0;

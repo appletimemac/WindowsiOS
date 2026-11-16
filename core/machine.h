@@ -313,6 +313,8 @@ typedef struct HvMachine {
        numbered like the slots, and started over with them at a flush. */
     struct HvMemSite *mem_sites;
     uint32_t nmem_sites, max_mem_sites;
+    /* The exclusive stores' versions, one to a cache line (hv_excl_bucket). */
+    uint64_t *excl_ver;
     /* Exits to another page (see put_branch_exit): the host addend the target
        page's TLB entry must hold for the exit to go straight to the chained
        block (0: a same-page exit), and once chained, the target's physical page
@@ -397,6 +399,25 @@ extern uint64_t hv_smc_pages, hv_smc_cpu, hv_smc_dma;
 HvMmio *hv_mmio_lookup(HvMachine *m, uint64_t pa);
 /* Host pointer for `len` bytes of guest RAM at pa, or NULL. */
 void *hv_phys_ptr(HvMachine *m, uint64_t pa, uint64_t len);
+
+/* An exclusive store may succeed only if nothing was stored to the place since this CPU's exclusive load. That
+   the place holds the value the load saw does not say so: it can have been changed and changed back, and code
+   that relies on the store failing then (Windows' interlocked lists have no sequence number on ARM64) hands out
+   a list entry twice (tests/test_excl.c). So every place has a version, by bucket of its host address in pieces
+   of 16 bytes: even while free, odd while an exclusive store holds it. An exclusive load notes the version before
+   it reads, and the host address both came from (a version means nothing for another place's bucket, and the
+   guest address can be mapped elsewhere by the time of the store). An exclusive store to that host address
+   takes the bucket, and only from the version its load noted; makes its
+   compare-and-swap of the value, which still catches plain stores of another value; and gives the bucket back,
+   two on if it stored. Two places in one bucket cost a store that would have succeeded a retry, nothing else.
+   The buckets are 64 bytes apart: on a host with 128-byte lines only two places 16 bytes apart, which share
+   a line of memory anyway, can share a line of versions. */
+#define HV_EXCL_BITS 12
+#define HV_EXCL_STRIDE_BITS 6
+static inline uint64_t *hv_excl_bucket(HvMachine *m, const void *host) {
+    uintptr_t n = ((uintptr_t)host >> 4) & ((1u << HV_EXCL_BITS) - 1);
+    return (uint64_t *)((char *)m->excl_ver + (n << HV_EXCL_STRIDE_BITS));
+}
 
 /* Physical accesses from C (page-table walks, devices doing DMA, slow paths). */
 int hv_phys_read(HvMachine *m, uint64_t pa, void *buf, unsigned len);

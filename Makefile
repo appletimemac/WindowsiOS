@@ -25,7 +25,7 @@ MAC_FRAMEWORKS = -framework Cocoa -framework Foundation -framework QuartzCore -f
 CORE_TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
              $(B)/test_mmu $(B)/test_exc $(B)/test_virtio_gpu $(B)/test_xhci_touch $(B)/test_its $(B)/test_nvme $(B)/test_disk_grow \
              $(B)/test_share $(B)/test_net_restart $(B)/test_board_release $(B)/test_audio_rebind $(B)/test_fw_cfg \
-             $(B)/test_fb_draw
+             $(B)/test_fb_draw $(B)/test_excl
 
 all: $(CORE_TESTS) $(B)/hvsparse $(B)/winvm
 
@@ -85,6 +85,9 @@ $(B)/test_fw_cfg: tests/test_fw_cfg.c $(ENGINE) $(B)/fw_cfg.o
 
 $(B)/test_fb_draw: tests/test_fb_draw.m $(ENGINE) $(DEV)
 	$(CC) $(OBJCFLAGS) tests/test_fb_draw.m $(ENGINE) $(DEV) $(MAC_FRAMEWORKS) -o $@
+
+$(B)/test_excl: tests/test_excl.c tests/excl_programs.S $(ENGINE)
+	$(CC) $(CFLAGS) tests/test_excl.c tests/excl_programs.S $(ENGINE) -o $@
 
 $(B)/test_net_restart: tests/test_net_restart.c $(B)/net_slirp.o
 	$(CC) $(CFLAGS) $(SLIRP_CFLAGS) tests/test_net_restart.c $(B)/net_slirp.o $(SLIRP_LIBS) -o $@

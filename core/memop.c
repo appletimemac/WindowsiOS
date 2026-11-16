@@ -559,12 +559,25 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
     uint32_t bytes = op->bytes;
     int pair = bytes == (2u << op->size); /* LDXP/STXP: decode sets bytes to two registers' worth */
     if (va & (bytes - 1)) return alignment_fault(cpu, va, op->store, pc);
-    uint32_t esize = pair ? 1u << op->size : bytes;
+    uint32_t esize = pair ? 1u << op->size : bytes, noted = bytes | (pair ? HV_EXCL_PAIR : 0);
     if (op->load) {
         uint8_t buf[16];
-        if (hv_vmem_xfer(cpu, va, buf, bytes, 0, el, pc)) return 1;
+        /* RAM: the version and then the value (hv_excl_bucket), both of the one place this translation names;
+           translated again for the value, the address could name another by then. A place with no host
+           pointer (a device, or an address the read below faults on) has no version, and its store makes no
+           use of one. */
+        uint64_t lpa, ver = 0;
+        void *lhost = hv_mmu_access(cpu, va, HV_ACC_READ, el, &lpa) ? NULL : hv_phys_ptr(cpu->m, lpa, bytes);
+        if (lhost) {
+            ver = __atomic_load_n(hv_excl_bucket(cpu->m, lhost), __ATOMIC_ACQUIRE);
+            memcpy(buf, lhost, bytes);
+        } else if (hv_vmem_xfer(cpu, va, buf, bytes, 0, el, pc)) {
+            return 1;
+        }
         cpu->excl_addr = va;
-        cpu->excl_size = bytes;
+        cpu->excl_size = noted;
+        cpu->excl_ver = ver;
+        cpu->excl_host = (uint64_t)(uintptr_t)lhost;
         cpu->excl_val[0] = le(buf, esize);
         cpu->excl_val[1] = pair ? le(buf + esize, esize) : 0;
         set_gpr(cpu, op->rt, cpu->excl_val[0]);
@@ -577,19 +590,26 @@ static int do_exclusive(HvCpu *cpu, const HvMemOp *op, uint64_t va, int el, uint
     uint64_t mask = esize == 8 ? ~0ull : (1ull << (esize * 8)) - 1;
     uint64_t n0 = gpr(cpu, op->rt) & mask, n1 = pair ? gpr(cpu, op->rt2) & mask : 0;
     int ok = 0;
-    if (cpu->excl_addr == va && cpu->excl_size == bytes) {
+    if (cpu->excl_addr == va && cpu->excl_size == noted && cpu->excl_host == (uint64_t)(uintptr_t)host) {
+        uint64_t *bucket = host ? hv_excl_bucket(cpu->m, host) : NULL, ver = cpu->excl_ver;
         if (!host) {
             ok = !hv_phys_write(cpu->m, pa, &n0, esize) && (!pair || !hv_phys_write(cpu->m, pa + esize, &n1, esize));
-        } else if (!pair) {
-            uint64_t expect = cpu->excl_val[0];
-            ok = cas_host(host, op->size, &expect, n0);
-        } else if (esize == 4) {
-            uint64_t expect = cpu->excl_val[0] | cpu->excl_val[1] << 32;
-            ok = cas_host(host, 3, &expect, n0 | n1 << 32);
+        } else if ((ver & 1) || !__atomic_compare_exchange_n(bucket, &ver, ver | 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            /* The load read while a store held the bucket, or an exclusive store was made there since: the
+               place may hold the value the load saw again, and still this store must fail. */
         } else {
-            __uint128_t expect = (__uint128_t)cpu->excl_val[1] << 64 | cpu->excl_val[0];
-            ok = __atomic_compare_exchange_n((__uint128_t *)host, &expect, (__uint128_t)n1 << 64 | n0, 0,
-                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            if (!pair) {
+                uint64_t expect = cpu->excl_val[0];
+                ok = cas_host(host, op->size, &expect, n0);
+            } else if (esize == 4) {
+                uint64_t expect = cpu->excl_val[0] | cpu->excl_val[1] << 32;
+                ok = cas_host(host, 3, &expect, n0 | n1 << 32);
+            } else {
+                __uint128_t expect = (__uint128_t)cpu->excl_val[1] << 64 | cpu->excl_val[0];
+                ok = __atomic_compare_exchange_n((__uint128_t *)host, &expect, (__uint128_t)n1 << 64 | n0, 0,
+                                                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            }
+            __atomic_store_n(bucket, ok ? ver + 2 : ver, __ATOMIC_RELEASE);
         }
         if (ok && host) ram_stored(cpu, pa, bytes);
     }
