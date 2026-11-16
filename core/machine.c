@@ -86,7 +86,10 @@ static int init_rest(HvMachine *m) {
     m->slot_target = calloc(m->max_slots, sizeof *m->slot_target);
     m->max_mem_sites = m->max_slots; /* about one and a half a block: pages nobody touches cost nothing */
     m->mem_sites = calloc(m->max_mem_sites, sizeof *m->mem_sites);
-    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->slot_xnext || !m->slot_target || !m->mem_sites) return -1;
+    size_t excl_bytes = (size_t)1 << (HV_EXCL_BITS + HV_EXCL_STRIDE_BITS);
+    m->excl_ver = aligned_alloc((size_t)1 << HV_EXCL_STRIDE_BITS, excl_bytes);
+    if (m->excl_ver) memset(m->excl_ver, 0, excl_bytes);
+    if (!m->slots || !m->slot_site || !m->slot_stub || !m->slot_cond || !m->slot_xa || !m->slot_xpa || !m->slot_xnext || !m->slot_target || !m->mem_sites || !m->excl_ver) return -1;
     pthread_mutex_init(&m->big_mu, NULL);
     pthread_cond_init(&m->big_cv, NULL);
     pthread_mutexattr_t ra;
@@ -306,6 +309,7 @@ void hv_machine_free(HvMachine *m) {
     free(m->slot_xnext);
     free(m->slot_target);
     free(m->mem_sites);
+    free(m->excl_ver);
     memset(m, 0, sizeof *m); /* nothing of it is left to follow: a machine that is not set up again stays empty */
 }
 
@@ -777,6 +781,7 @@ void hv_cpu_reset_index(HvCpu *cpu, HvMachine *m, uint32_t index) {
     cpu->mem_thunk = (uint64_t)hv_mem_thunk;
     cpu->mem_sites = (uint64_t)(uintptr_t)m->mem_sites;
     cpu->jit_base = (uint64_t)(uintptr_t)m->jit.base;
+    cpu->excl_tab = (uint64_t)(uintptr_t)m->excl_ver;
     cpu->ijc_thunk = (uint64_t)hv_ijc_thunk;
     cpu->xjump_thunk = (uint64_t)hv_xjump_thunk;
     cpu->el = 1;
